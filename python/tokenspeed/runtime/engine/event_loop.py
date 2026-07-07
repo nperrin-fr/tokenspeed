@@ -139,6 +139,7 @@ class DpForwardMetadata:
     global_batch_size: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
+    all_extend: bool
     need_idle_forward: bool
 
 
@@ -662,6 +663,7 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
@@ -676,6 +678,7 @@ class EventLoop:
                     dp_global_num_tokens=dp_global_num_tokens,
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
+                    dp_all_extend=dp_all_extend,
                     grammar_inputs=grammar_inputs,
                     multimodal_context=multimodal_context,
                     **stats,
@@ -706,6 +709,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         multimodal_context=multimodal_context,
                         **stats,
                     ),
@@ -731,6 +735,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
                         capture_next_input_ids=True,
@@ -1213,11 +1218,16 @@ class EventLoop:
             )
             for mode in global_forward_mode
         )
+        # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+        all_extend = all(
+            mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+        )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
+            all_extend=all_extend,
             need_idle_forward=need_idle_forward,
         )
 
