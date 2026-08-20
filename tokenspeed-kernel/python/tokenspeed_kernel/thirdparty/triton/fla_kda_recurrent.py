@@ -717,6 +717,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     conv_out,  # [rows, 3*P, 3] per-position conv windows (verify scratch)
     f_a,  # [N*T, D_FA] low-rank gate input
     w_fb,  # [P, D_FA] f_b weight
+    g_raw,  # [N*T, P] optional precomputed raw f_b gate
     beta,
     A_log,
     dt_bias,
@@ -728,6 +729,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     lower_bound,
     stride_raw_tok: tl.constexpr,
     stride_fa_tok: tl.constexpr,
+    stride_graw_tok: tl.constexpr,
     stride_beta_tok: tl.constexpr,
     scale: tl.constexpr,
     T: tl.constexpr,
@@ -744,6 +746,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     stride_conv_page: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    HAS_PRECOMPUTED_GATE: tl.constexpr,
     STORE_STATES: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
 ):
@@ -821,13 +824,14 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     b_h += tl.load(p_h0, mask=mask_h & read_ok, other=0.0).to(tl.float32)
 
     b_A = tl.load(A_log + i_hv).to(tl.float32)
-    o_fa = tl.arange(0, D_FA)
     gc = i_hv * K + o_k
-    wfb = tl.load(
-        w_fb + gc[:, None] * D_FA + o_fa[None, :],
-        mask=mask_k[:, None],
-        other=0.0,
-    ).to(tl.float32)
+    if not HAS_PRECOMPUTED_GATE:
+        o_fa = tl.arange(0, D_FA)
+        wfb = tl.load(
+            w_fb + gc[:, None] * D_FA + o_fa[None, :],
+            mask=mask_k[:, None],
+            other=0.0,
+        ).to(tl.float32)
     if HAS_DT_BIAS:
         b_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(
             tl.float32
@@ -890,9 +894,13 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
                 cw + vf * 3 + 2, s_v2.to(cw.dtype.element_ty), mask=mask_v & write_ok
             )
 
-        # f_b gate GEMV for this token
-        fa = tl.load(f_a + tok * stride_fa_tok + o_fa).to(tl.float32)
-        b_g = tl.sum(wfb * fa[None, :], axis=1)
+        if HAS_PRECOMPUTED_GATE:
+            b_g = tl.load(
+                g_raw + tok * stride_graw_tok + gc, mask=mask_k, other=0.0
+            ).to(tl.float32)
+        else:
+            fa = tl.load(f_a + tok * stride_fa_tok + o_fa).to(tl.float32)
+            b_g = tl.sum(wfb * fa[None, :], axis=1)
         if HAS_DT_BIAS:
             b_g = b_g + b_bias
         if USE_LOWER_BOUND:
@@ -951,6 +959,9 @@ def fused_recurrent_kda_verify_megafuse(
     scale: float | None = None,
     lower_bound: float | None = None,
     store_states: bool = True,
+    g_raw: torch.Tensor | None = None,
+    bv: int = 32,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     """Target-verify KDA megafusion: conv1d(+silu), f_b gate GEMV, and the
     per-position recurrence in one launch, with per-position conv windows and
@@ -962,6 +973,7 @@ def fused_recurrent_kda_verify_megafuse(
         conv_pool: ``[pages, 3*P, 3]`` committed conv state (read-only).
         conv_out: ``[rows, 3*P, 3]`` verify conv scratch (per-position writes).
         f_a: ``[N*T, D]`` gate input; w_fb: ``[P, D]`` up weight.
+        g_raw: Optional ``[N*T, P]`` precomputed ``f_a @ w_fb.T`` gate.
         beta: ``[N*T, HV]`` raw logits (sigmoid in-kernel).
         h_pool / h_pool_out: committed recurrent slab / verify scratch.
         read_indices: ``[N]`` committed page per request (-1 = fresh).
@@ -985,8 +997,15 @@ def fused_recurrent_kda_verify_megafuse(
     assert total == N * T
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
     assert not store_states or write_indices.numel() == N * T
+    if g_raw is not None:
+        if g_raw.shape != (N * T, P):
+            raise ValueError(f"g_raw must have shape [{N * T}, {P}], got {g_raw.shape}")
+        if g_raw.dtype != f_a.dtype:
+            raise ValueError(f"g_raw must have dtype {f_a.dtype}, got {g_raw.dtype}")
+        if g_raw.stride(-1) != 1:
+            raise ValueError("g_raw must have last-dimension stride 1")
     out = torch.empty(total, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
-    BV = 32
+    BV = bv
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_verify_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
@@ -995,6 +1014,7 @@ def fused_recurrent_kda_verify_megafuse(
         conv_out=conv_out,
         f_a=f_a,
         w_fb=w_fb,
+        g_raw=g_raw,
         beta=beta,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1006,6 +1026,7 @@ def fused_recurrent_kda_verify_megafuse(
         lower_bound=lower_bound,
         stride_raw_tok=qkv_raw.stride(0),
         stride_fa_tok=f_a.stride(0),
+        stride_graw_tok=0 if g_raw is None else g_raw.stride(0),
         stride_beta_tok=beta.stride(0),
         scale=scale,
         T=T,
@@ -1022,8 +1043,9 @@ def fused_recurrent_kda_verify_megafuse(
         stride_conv_page=conv_pool.stride(0),
         stride_conv_out_page=conv_out.stride(0),
         HAS_DT_BIAS=dt_bias is not None,
+        HAS_PRECOMPUTED_GATE=g_raw is not None,
         STORE_STATES=store_states,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out
