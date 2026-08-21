@@ -1662,6 +1662,7 @@ def try_kda_fused_paged_verify(
     replay_conv_q: torch.Tensor | None = None,
     replay_conv_k: torch.Tensor | None = None,
     replay_conv_v: torch.Tensor | None = None,
+    ring_indices: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1694,6 +1695,8 @@ def try_kda_fused_paged_verify(
         raise ValueError("KDA replay verify requires all replay ring and conv tapes")
     if replay_ring and cu_seqlens is None:
         raise ValueError("KDA replay verify requires caller-provided cu_seqlens")
+    if replay_ring and ring_indices is None:
+        raise ValueError("KDA replay verify requires caller-provided ring_indices")
     traits = {
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
@@ -1724,6 +1727,7 @@ def try_kda_fused_paged_verify(
             "replay_conv_q": replay_conv_q,
             "replay_conv_k": replay_conv_k,
             "replay_conv_v": replay_conv_v,
+            "ring_indices": ring_indices,
         }
     return kernel(
         mixed_qkv=mixed_qkv,
@@ -1776,6 +1780,7 @@ def try_kda_replay_commit(
     replay_rawk: torch.Tensor | None = None,
     replay_g: torch.Tensor | None = None,
     replay_beta: torch.Tensor | None = None,
+    ring_indices: torch.Tensor | None = None,
 ) -> bool:
     """Try a registered KDA speculative replay-commit.
 
@@ -1801,6 +1806,8 @@ def try_kda_replay_commit(
     buffers_complete = all(buffer is not None for buffer in replay_buffers)
     if replay_ring != buffers_complete:
         raise ValueError("KDA replay commit requires all four replay rings")
+    if replay_ring and ring_indices is None:
+        raise ValueError("KDA replay commit requires caller-provided ring_indices")
     try:
         kernel = select_kernel(
             "attention",
@@ -1823,6 +1830,7 @@ def try_kda_replay_commit(
             "replay_rawk": replay_rawk,
             "replay_g": replay_g,
             "replay_beta": replay_beta,
+            "ring_indices": ring_indices,
         }
     kernel(
         mixed_qkv=mixed_qkv,

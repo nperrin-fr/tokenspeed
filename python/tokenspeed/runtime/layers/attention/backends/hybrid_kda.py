@@ -150,12 +150,12 @@ class KdaAttnBackend(MambaAttnBackend):
                         if layer_dim != 128:
                             raise RuntimeError("SGL KDA MTP requires head_dim=128")
                         ring_shape = (
-                            ssm.shape[0],
+                            self.max_bs,
                             layer_hv,
                             self.speculative_num_draft_tokens + 1,
                         )
                         tape_shape = (
-                            ssm.shape[0],
+                            self.max_bs,
                             self.speculative_num_draft_tokens,
                             conv.shape[1],
                             conv.shape[2],
@@ -223,7 +223,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 self._batched_replay_ready = False
 
     def _sgl_replay_buffer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
-        """Return one layer's slot-indexed replay rings and convolution tapes."""
+        """Return one layer's batch-indexed replay rings and convolution tapes."""
         assert self._sgl_replay_buffers is not None
         return self._sgl_replay_buffers[layer_id]
 
@@ -584,6 +584,11 @@ class KdaAttnBackend(MambaAttnBackend):
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if self.use_sgl_mtp:
                 rings = self._sgl_replay_buffer(layer_id)
+                ring_indices = torch.arange(
+                    batch_size,
+                    device=state_in_blocks.device,
+                    dtype=state_in_blocks.dtype,
+                )
                 if layer_id not in self._replay_weights:
                     self._replay_weights[layer_id] = (
                         conv_weights.float(),
@@ -645,6 +650,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 replay_conv_q=rings[4] if self.use_sgl_mtp else None,
                 replay_conv_k=rings[5] if self.use_sgl_mtp else None,
                 replay_conv_v=rings[6] if self.use_sgl_mtp else None,
+                ring_indices=ring_indices if self.use_sgl_mtp else None,
             )
             if fused_out is None:
                 raise RuntimeError(
@@ -770,6 +776,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 rows[:bs].gather(1, safe.unsqueeze(1)).squeeze(1).to(torch.int32)
             )
         rows = bs * draft_token_num
+        ring_indices = torch.arange(
+            bs, device=accepted_length.device, dtype=torch.int32
+        )
         if self._batched_replay_ready:
             read_pages = torch.stack(
                 [
@@ -818,6 +827,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 replay_rawk=rings[1] if self.use_sgl_mtp else None,
                 replay_g=rings[2] if self.use_sgl_mtp else None,
                 replay_beta=rings[3] if self.use_sgl_mtp else None,
+                ring_indices=ring_indices if self.use_sgl_mtp else None,
             ):
                 raise RuntimeError(
                     "KDA replay commit kernel vanished after capability probing"

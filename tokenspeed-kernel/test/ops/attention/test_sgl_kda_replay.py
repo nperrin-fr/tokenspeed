@@ -43,11 +43,13 @@ if not is_available():
 H, D, WIDTH, T = 4, 128, 4, 4
 P = H * D
 LOWER_BOUND = -5.0
+MAX_BS = 4
 
 
 def _inputs(n: int) -> dict[str, torch.Tensor]:
     torch.manual_seed(100 + n)
     rows = n * T
+    pool_rows = MAX_BS + 2 * n
 
     def rand(*shape, dtype=torch.bfloat16, scale=1.0):
         return torch.randn(*shape, device="cuda", dtype=dtype) * scale
@@ -55,14 +57,18 @@ def _inputs(n: int) -> dict[str, torch.Tensor]:
     data = {
         "qkv": rand(rows, 3 * P),
         "conv_w": rand(3 * P, WIDTH, scale=0.1),
-        "conv_pool": rand(n, 3 * P, WIDTH - 1, scale=0.1),
+        "conv_pool": rand(pool_rows, 3 * P, WIDTH - 1, scale=0.1),
         "f_a": rand(rows, D),
         "f_b": rand(P, D, scale=0.1),
         "beta": rand(rows, H),
         "A_log": rand(H, dtype=torch.float32, scale=0.2),
         "dt_bias": rand(P, dtype=torch.float32, scale=0.1),
-        "state": rand(n, H, D, D, dtype=torch.float32, scale=0.01),
-        "read": torch.arange(n, device="cuda", dtype=torch.int32),
+        "state": rand(pool_rows, H, D, D, dtype=torch.float32, scale=0.01),
+        "read": torch.arange(MAX_BS, MAX_BS + n, device="cuda", dtype=torch.int32),
+        "commit_write": torch.arange(
+            MAX_BS + n, MAX_BS + 2 * n, device="cuda", dtype=torch.int32
+        ),
+        "ring_indices": torch.arange(n, device="cuda", dtype=torch.int32),
         "write": torch.arange(rows, device="cuda", dtype=torch.int32),
         "cu": torch.arange(0, (n + 1) * T, T, device="cuda", dtype=torch.int32),
     }
@@ -73,12 +79,18 @@ def _inputs(n: int) -> dict[str, torch.Tensor]:
     data["state_scratch"] = torch.empty(
         rows, H, D, D, device="cuda", dtype=torch.float32
     )
-    data["ring_rawv"] = torch.zeros(n, H, T + 1, D, device="cuda", dtype=torch.bfloat16)
+    data["ring_rawv"] = torch.zeros(
+        MAX_BS, H, T + 1, D, device="cuda", dtype=torch.bfloat16
+    )
     data["ring_rawk"] = torch.zeros_like(data["ring_rawv"])
-    data["ring_g"] = torch.zeros(n, H, T + 1, D, device="cuda", dtype=torch.float32)
-    data["ring_beta"] = torch.zeros(n, H, T + 1, device="cuda", dtype=torch.float32)
+    data["ring_g"] = torch.zeros(
+        MAX_BS, H, T + 1, D, device="cuda", dtype=torch.float32
+    )
+    data["ring_beta"] = torch.zeros(
+        MAX_BS, H, T + 1, device="cuda", dtype=torch.float32
+    )
     data["tape_q"] = torch.zeros(
-        n, T, P, WIDTH - 1, device="cuda", dtype=torch.bfloat16
+        MAX_BS, T, P, WIDTH - 1, device="cuda", dtype=torch.bfloat16
     )
     data["tape_k"] = torch.zeros_like(data["tape_q"])
     data["tape_v"] = torch.zeros_like(data["tape_q"])
@@ -145,6 +157,7 @@ def _run_pair(n: int):
         replay_conv_q=data["tape_q"],
         replay_conv_k=data["tape_k"],
         replay_conv_v=data["tape_v"],
+        ring_indices=data["ring_indices"],
     )
     return data, v_major, actual, baseline
 
@@ -176,7 +189,7 @@ def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
         state_pool=checkpoint,
         state_out=checkpoint,
         read_indices=data["read"],
-        write_indices=data["read"],
+        write_indices=data["commit_write"],
         accepted_length=accepted_length,
         num_heads=H,
         head_dim=D,
@@ -187,7 +200,10 @@ def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
         replay_rawk=data["ring_rawk"],
         replay_g=data["ring_g"],
         replay_beta=data["ring_beta"],
+        ring_indices=data["ring_indices"],
     )
     rows = torch.arange(4, device="cuda") * T + accepted - 1
     expected = data["state_scratch"][rows].transpose(-1, -2)
-    torch.testing.assert_close(checkpoint, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        checkpoint[data["commit_write"]], expected, atol=2e-2, rtol=2e-2
+    )

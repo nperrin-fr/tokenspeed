@@ -161,6 +161,7 @@ def kda_decode_mtp_kernel(
     smem_qk_layout: cute.Layout,
     smem_state_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
+    ring_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     scale: cutlass.Constexpr[float],
     NUM_SPEC: cutlass.Constexpr[int],
@@ -282,6 +283,7 @@ def kda_decode_mtp_kernel(
 
     # int64: `slot * stride` overflows int32 on envelope-strided pools.
     slot = cutlass.Int64(slot)
+    ring_slot = cutlass.Int64(ring_indices[i_n])
 
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
@@ -441,7 +443,9 @@ def kda_decode_mtp_kernel(
                     )
                     r_k[i] = r_conv
                     if cutlass.const_expr(CACHE_RING):
-                        ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_conv)
+                        ring_rawk[ring_slot, i_hv, i_t, k_idx] = cutlass.BFloat16(
+                            r_conv
+                        )
                     r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = r_state[
                         (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
                     ]
@@ -474,7 +478,7 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(1.0) + cute.math.exp(-r_b_raw, fastmath=True)
                     )
                     if cutlass.const_expr(CACHE_RING):
-                        ring_beta[slot, i_hv, i_t] = sBeta[i_t]
+                        ring_beta[ring_slot, i_hv, i_t] = sBeta[i_t]
             else:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
@@ -496,7 +500,7 @@ def kda_decode_mtp_kernel(
                         qk_j % 4,
                     ] = cute.math.exp(r_gk, fastmath=True)
                     if cutlass.const_expr(CACHE_RING):
-                        ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                        ring_g[ring_slot, i_hv, i_t, k_idx] = r_gk
             if p1_job == 0:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
@@ -565,7 +569,7 @@ def kda_decode_mtp_kernel(
                 )
                 sVall[_t * HEAD_DIM + _v_idx] = _vconv
                 if cutlass.const_expr(CACHE_RING):
-                    ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
+                    ring_rawv[ring_slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
                         cutlass.BFloat16(_win[_t + 1 + _w])
@@ -758,6 +762,7 @@ def _run_kda_decode_mtp_dspark(
     intermediate_conv_k: cute.Tensor,
     intermediate_conv_v: cute.Tensor,
     ssm_state_indices: cute.Tensor,
+    ring_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     ring_rawv: cute.Tensor,
     ring_rawk: cute.Tensor,
@@ -853,6 +858,7 @@ def _run_kda_decode_mtp_dspark(
         smem_qk_layout,
         smem_state_layout,
         ssm_state_indices,
+        ring_indices,
         cu_seqlens,
         scale,
         NUM_SPEC,
@@ -950,6 +956,7 @@ def fused_kda_decode_mtp_dspark(
     intermediate_conv_k,
     intermediate_conv_v,
     ssm_state_indices,
+    ring_indices=None,
     cu_seqlens,
     lower_bound,
     scale=None,
@@ -979,6 +986,10 @@ def fused_kda_decode_mtp_dspark(
     kernel.
     """
     import torch
+
+    # TokenSpeed divergence: replay rings may use dense batch-local slots.
+    if ring_indices is None:
+        ring_indices = ssm_state_indices
 
     H = x_q.shape[2]
     N = cu_seqlens.numel() - 1
@@ -1089,6 +1100,7 @@ def fused_kda_decode_mtp_dspark(
         intermediate_conv_k,
         intermediate_conv_v,
         ssm_state_indices,
+        ring_indices,
         cu_seqlens,
         # ReplaySSM rings; same placeholder trick when CACHE_RING is off.
         replayssm_rawv if cache_ring else intermediate_conv_q,

@@ -45,6 +45,7 @@ def kda_replayssm_exact_fold_kernel(
     gk_cache,  # [num_slots, HV, L, K]  fp32 per-K log-decay gate
     beta_cache,  # [num_slots, HV, L]     fp32 beta
     ssm_state_indices,  # [B] int  physical slot per request
+    ring_indices,  # [B] int  replay-ring slot per request
     accept_lens,  # [B] int  committed prefix length per request
     mamba_track_indices,  # [B] int  extra_buffer track slot (or NULL) per request
     mamba_steps_to_track,  # [B] int  crossing step (or -1) per request
@@ -59,6 +60,7 @@ def kda_replayssm_exact_fold_kernel(
     stride_gk_layer: tl.constexpr,
     stride_beta_layer: tl.constexpr,
     stride_indices: tl.constexpr,
+    stride_ring_indices: tl.constexpr,
     stride_accept: tl.constexpr,
     stride_track: tl.constexpr,
     stride_steps: tl.constexpr,
@@ -96,6 +98,7 @@ def kda_replayssm_exact_fold_kernel(
     n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
     if n_commit <= 0:
         return
+    ring_idx = tl.load(ring_indices + i_n * stride_ring_indices).to(tl.int64)
 
     # extra_buffer: snapshot the interval-crossing state into the track ping-pong
     # slot on the step it crosses (mask-gated: -1 track step / NULL slot = skip).
@@ -127,7 +130,7 @@ def kda_replayssm_exact_fold_kernel(
         phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + ring_idx * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -135,7 +138,7 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_v = tl.load(
             rawv_cache
-            + state_idx * stride_rawv_slot
+            + ring_idx * stride_rawv_slot
             + (i_hv * MAX_CACHE_LEN + phys) * V
             + o_v,
             mask=mask_v,
@@ -143,14 +146,14 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_gk = tl.load(
             gk_cache
-            + state_idx * stride_gk_slot
+            + ring_idx * stride_gk_slot
             + (i_hv * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            beta_cache + ring_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
         # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
@@ -191,6 +194,8 @@ def commit_kda_replayssm_spec(
     mamba_steps_to_track: torch.Tensor | None = None,  # [B] crossing step (or -1)
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    *,
+    ring_indices: torch.Tensor | None = None,
 ) -> None:
     """Replay each request's accepted window into its fp32 checkpoint in place.
 
@@ -202,6 +207,9 @@ def commit_kda_replayssm_spec(
     """
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
+    # TokenSpeed divergence: replay rings may use dense batch-local slots.
+    if ring_indices is None:
+        ring_indices = ssm_state_indices
     BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 32)
     grid = (triton.cdiv(V, BV), B, HV)
@@ -223,6 +231,7 @@ def commit_kda_replayssm_spec(
         gk_cache,
         beta_cache,
         ssm_state_indices,
+        ring_indices,
         accept_lens,
         track_idx_t,
         steps_t,
@@ -237,6 +246,7 @@ def commit_kda_replayssm_spec(
         0,
         0,
         ssm_state_indices.stride(0),
+        ring_indices.stride(0),
         accept_lens.stride(0),
         stride_track,
         stride_steps,
@@ -269,6 +279,8 @@ def commit_kda_replayssm_spec_all_layers(
     mamba_steps_to_track: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    *,
+    ring_indices: torch.Tensor | None = None,
 ) -> None:
     """Fold every layer's accepted window in a single launch.
 
@@ -281,6 +293,8 @@ def commit_kda_replayssm_spec_all_layers(
     """
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
+    if ring_indices is None:
+        ring_indices = ssm_state_indices
     BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 32)
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
@@ -302,6 +316,7 @@ def commit_kda_replayssm_spec_all_layers(
         gk_cache,
         beta_cache,
         ssm_state_indices,
+        ring_indices,
         accept_lens,
         track_idx_t,
         steps_t,
@@ -316,6 +331,7 @@ def commit_kda_replayssm_spec_all_layers(
         gk_cache.stride(0),
         beta_cache.stride(0),
         ssm_state_indices.stride(0),
+        ring_indices.stride(0),
         accept_lens.stride(0),
         stride_track,
         stride_steps,

@@ -309,11 +309,12 @@ def cutedsl_kda_mtp_verify(
     replay_conv_q: torch.Tensor,
     replay_conv_k: torch.Tensor,
     replay_conv_v: torch.Tensor,
+    ring_indices: torch.Tensor,
 ) -> torch.Tensor:
     """Run CuTe MTP verify with caller-owned replay rings and conv tapes.
 
-    ``replay_rawv/rawk/g/beta`` are slot-indexed replay rings. The three
-    ``replay_conv_*`` tensors are ``[slots, T, H*D, conv_width-1]`` tapes.
+    ``replay_rawv/rawk/g/beta`` are batch-indexed replay rings. The three
+    ``replay_conv_*`` tensors are ``[max_bs, T, H*D, conv_width-1]`` tapes.
     ``conv_weights`` must contain the three FP32 Q/K/V convolution weights,
     and ``state_pool`` must be contiguous ``[slots, H, V, K]`` FP32 storage.
     """
@@ -357,11 +358,12 @@ def cutedsl_kda_mtp_verify(
         dt_bias=dt_bias,
         recurrent_state=state_pool,
         intermediate_ssm=None,
-        intermediate_state_indices=read_indices,
+        intermediate_state_indices=ring_indices,
         intermediate_conv_q=replay_conv_q,
         intermediate_conv_k=replay_conv_k,
         intermediate_conv_v=replay_conv_v,
         ssm_state_indices=read_indices,
+        ring_indices=ring_indices,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
         replayssm_rawv=replay_rawv,
@@ -798,6 +800,7 @@ def triton_sgl_replayssm_fold(
     replay_rawk: torch.Tensor,
     replay_g: torch.Tensor,
     replay_beta: torch.Tensor,
+    ring_indices: torch.Tensor,
 ) -> None:
     """Fold accepted replay-ring prefixes into V-major state in place."""
     del (
@@ -820,12 +823,8 @@ def triton_sgl_replayssm_fold(
         raise ValueError("head_dim must match the V-major state's K dimension")
     if draft_token_num > replay_rawv.shape[2]:
         raise ValueError("replay ring is shorter than draft_token_num")
-    # ReplaySSM uses one index for ring reads and state writes; stage COW pages.
+    # Stage only the persistent state when commit targets a COW page.
     state_pool[write_indices] = state_pool[read_indices]
-    replay_rawv[write_indices] = replay_rawv[read_indices]
-    replay_rawk[write_indices] = replay_rawk[read_indices]
-    replay_g[write_indices] = replay_g[read_indices]
-    replay_beta[write_indices] = replay_beta[read_indices]
     from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold import (
         commit_kda_replayssm_spec,
     )
@@ -841,6 +840,7 @@ def triton_sgl_replayssm_fold(
         max_cache_len=replay_rawv.shape[2],
         num_k_heads=num_heads,
         null_block_id=-1,
+        ring_indices=ring_indices,
     )
 
 
