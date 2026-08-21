@@ -109,6 +109,65 @@ def test_vmajor_prefill_handoff_round_trips_canonical_state(monkeypatch) -> None
     torch.testing.assert_close(final_state, physical)
 
 
+def test_sgl_mtp_verify_selects_replay_ring_traits(monkeypatch) -> None:
+    from tokenspeed_kernel.ops import attention as attention_ops
+
+    backend = object.__new__(KdaAttnBackend)
+    backend._replay_active = True
+    backend.use_sgl_mtp = True
+    backend.kda_recurrent_layout = "v_major"
+    backend._replay_weights = {}
+    backend.forward_metadata = SimpleNamespace(query_start_loc=torch.tensor([0, 2]))
+    rings = (
+        torch.empty(2, 1, 3, 128, dtype=torch.bfloat16),
+        torch.empty(2, 1, 3, 128, dtype=torch.bfloat16),
+        torch.empty(2, 1, 3, 128, dtype=torch.float32),
+        torch.empty(2, 1, 3, dtype=torch.float32),
+        torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
+        torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
+        torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
+    )
+    backend._sgl_replay_buffer = lambda _layer_id: rings
+    selected = {}
+
+    def fake_select_kernel(*_args, **kwargs):
+        selected.update(kwargs["traits"])
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    mixed = torch.empty(2, 384, dtype=torch.bfloat16)
+    out = backend._verify(
+        mixed,
+        torch.empty(384, 4, dtype=torch.bfloat16),
+        torch.empty(2, 384, 3, dtype=torch.bfloat16),
+        torch.empty(2, 384, 3, dtype=torch.bfloat16),
+        torch.empty(2, 1, 128, 128, dtype=torch.float32),
+        None,
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        layer_id=0,
+        bias=None,
+        f_a_out=torch.empty(2, 128, dtype=torch.bfloat16),
+        f_b_weight=torch.empty(128, 128, dtype=torch.bfloat16),
+        beta_raw=torch.empty(2, 1, dtype=torch.bfloat16),
+        A_log=torch.empty(1, dtype=torch.float32),
+        dt_bias=torch.empty(128, dtype=torch.float32),
+        batch_size=1,
+        draft_token_num=2,
+        value_dim=128,
+        attn_tp_size=1,
+        head_v_dim=128,
+        lower_bound=-5.0,
+    )
+    assert out is mixed
+    assert selected == {
+        "paged_state": True,
+        "recurrent_layout": "v_major",
+        "split_producers": False,
+        "replay_ring": True,
+    }
+
+
 def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         device=device,

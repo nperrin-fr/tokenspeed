@@ -87,17 +87,28 @@ class KdaAttnBackend(MambaAttnBackend):
         config: BaseAttnConfig,
         kda_backend: str = "auto",
         kda_recurrent_layout: str = "k_major",
+        use_sgl_mtp: bool = False,
     ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
         self.kda_recurrent_layout = kda_recurrent_layout
+        self.use_sgl_mtp = use_sgl_mtp
+        if self.use_sgl_mtp and self.dtype is not torch.bfloat16:
+            raise ValueError("SGL KDA MTP requires bfloat16 activations")
         self._replay_active = kda_replay_commit_supported(
-            self.dtype, recurrent_layout=self.kda_recurrent_layout
+            self.dtype,
+            recurrent_layout=self.kda_recurrent_layout,
+            replay_ring=self.use_sgl_mtp,
         )
-        self._batched_replay_kernel = resolve_kda_batched_replay_commit(
-            self.dtype, self.kda_recurrent_layout
+        self._batched_replay_kernel = (
+            None
+            if self.use_sgl_mtp
+            else resolve_kda_batched_replay_commit(
+                self.dtype, self.kda_recurrent_layout
+            )
         )
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
+        self._sgl_replay_buffers: dict[int, tuple[torch.Tensor, ...]] | None = None
         self._replay_weights: dict[int, tuple] = {}
         self._replay_descriptors = None
         self._batched_replay_launch = None
@@ -128,12 +139,52 @@ class KdaAttnBackend(MambaAttnBackend):
             self._replay_group_rows = {
                 group_id: row for row, group_id in enumerate(self._replay_group_ids)
             }
+            first_conv, first_ssm = self._state_components(layer_ids[0])
+            hv, head_dim = first_ssm.shape[1:3]
             with torch.inference_mode(False):
-                addresses = torch.zeros(
-                    (len(layer_ids), 10), dtype=torch.uint64, device=self.device
-                )
-                first_conv, first_ssm = self._state_components(layer_ids[0])
-                hv, head_dim = first_ssm.shape[1:3]
+                if self.use_sgl_mtp:
+                    self._sgl_replay_buffers = {}
+                    for layer_id in layer_ids:
+                        conv, ssm = self._state_components(layer_id)
+                        layer_hv, layer_dim = ssm.shape[1:3]
+                        if layer_dim != 128:
+                            raise RuntimeError("SGL KDA MTP requires head_dim=128")
+                        ring_shape = (
+                            ssm.shape[0],
+                            layer_hv,
+                            self.speculative_num_draft_tokens + 1,
+                        )
+                        tape_shape = (
+                            ssm.shape[0],
+                            self.speculative_num_draft_tokens,
+                            conv.shape[1],
+                            conv.shape[2],
+                        )
+                        rawv = torch.empty(
+                            (*ring_shape, layer_dim),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        tape_q = torch.empty(
+                            tape_shape, dtype=torch.bfloat16, device=self.device
+                        )
+                        self._sgl_replay_buffers[layer_id] = (
+                            rawv,
+                            torch.empty_like(rawv),
+                            torch.empty(
+                                (*ring_shape, layer_dim),
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
+                            torch.empty(
+                                ring_shape, dtype=torch.float32, device=self.device
+                            ),
+                            tape_q,
+                            torch.empty_like(tape_q),
+                            torch.empty_like(tape_q),
+                        )
+                    self._replay_weights.clear()
+                    return
                 for layer_id in layer_ids[1:]:
                     conv, ssm = self._state_components(layer_id)
                     if (
@@ -143,6 +194,9 @@ class KdaAttnBackend(MambaAttnBackend):
                         raise RuntimeError(
                             "batched KDA replay requires uniform layer pools"
                         )
+                addresses = torch.zeros(
+                    (len(layer_ids), 10), dtype=torch.uint64, device=self.device
+                )
                 payload_shape = (len(layer_ids), rows)
                 self._replay_payloads = (
                     torch.empty(
@@ -167,6 +221,11 @@ class KdaAttnBackend(MambaAttnBackend):
                 self._replay_weights.clear()
                 self._batched_replay_launch = None
                 self._batched_replay_ready = False
+
+    def _sgl_replay_buffer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Return one layer's slot-indexed replay rings and convolution tapes."""
+        assert self._sgl_replay_buffers is not None
+        return self._sgl_replay_buffers[layer_id]
 
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer row from the stacked replay workspaces."""
@@ -331,6 +390,11 @@ class KdaAttnBackend(MambaAttnBackend):
         self._ensure_verify_scratch(max_bs, draft_token_num)
         conv_bytes = sum(pair[0].nbytes for pair in self._verify_scratch.values())
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
+        payload_bytes += sum(
+            payload.nbytes
+            for buffers in (self._sgl_replay_buffers or {}).values()
+            for payload in buffers
+        )
         return conv_bytes + payload_bytes
 
     def _kda_gate(
@@ -516,12 +580,26 @@ class KdaAttnBackend(MambaAttnBackend):
                 raise RuntimeError(
                     "KDA eager replay requires f_a_out and a bias-free convolution"
                 )
-            qkv, f_a, beta, _ = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
-            qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
-            f_a[:rows, : f_a_out.shape[-1]].copy_(f_a_out[:rows])
-            beta[:rows, : beta_raw.shape[-1]].copy_(beta_raw[:rows])
             num_value_heads = value_dim // attn_tp_size // head_v_dim
+            if self.use_sgl_mtp:
+                rings = self._sgl_replay_buffer(layer_id)
+                if layer_id not in self._replay_weights:
+                    self._replay_weights[layer_id] = (
+                        conv_weights.float(),
+                        f_b_weight,
+                        A_log,
+                        dt_bias,
+                        num_value_heads,
+                        head_v_dim,
+                        lower_bound,
+                    )
+                conv_weights = self._replay_weights[layer_id][0]
+            else:
+                qkv, f_a, beta, _ = self._replay_payload(layer_id)
+                qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
+                f_a[:rows, : f_a_out.shape[-1]].copy_(f_a_out[:rows])
+                beta[:rows, : beta_raw.shape[-1]].copy_(beta_raw[:rows])
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
                 # their storage, so binding their pointers once cannot stale.
@@ -555,7 +633,18 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bound=lower_bound,
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
-                split_producers=True,
+                split_producers=not self.use_sgl_mtp,
+                replay_ring=self.use_sgl_mtp,
+                cu_seqlens=(
+                    self.forward_metadata.query_start_loc if self.use_sgl_mtp else None
+                ),
+                replay_rawv=rings[0] if self.use_sgl_mtp else None,
+                replay_rawk=rings[1] if self.use_sgl_mtp else None,
+                replay_g=rings[2] if self.use_sgl_mtp else None,
+                replay_beta=rings[3] if self.use_sgl_mtp else None,
+                replay_conv_q=rings[4] if self.use_sgl_mtp else None,
+                replay_conv_k=rings[5] if self.use_sgl_mtp else None,
+                replay_conv_v=rings[6] if self.use_sgl_mtp else None,
             )
             if fused_out is None:
                 raise RuntimeError(
@@ -698,7 +787,11 @@ class KdaAttnBackend(MambaAttnBackend):
             conv_w, f_b, A_log, dt_bias, num_heads, head_dim, lower_bound = weights
             group_id = self._state_group_for(layer_id)
             conv, state = self._state_components(layer_id)
-            qkv, f_a, beta, gate = self._replay_payload(layer_id)
+            if self.use_sgl_mtp:
+                rings = self._sgl_replay_buffer(layer_id)
+                qkv = f_a = beta = gate = conv_w
+            else:
+                qkv, f_a, beta, gate = self._replay_payload(layer_id)
             if not try_kda_replay_commit(
                 qkv[:rows, : conv_w.shape[0]],
                 conv_w,
@@ -720,6 +813,11 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bound=lower_bound,
                 gate_scratch=gate[:rows, : num_heads * head_dim],
                 recurrent_layout=self.kda_recurrent_layout,
+                replay_ring=self.use_sgl_mtp,
+                replay_rawv=rings[0] if self.use_sgl_mtp else None,
+                replay_rawk=rings[1] if self.use_sgl_mtp else None,
+                replay_g=rings[2] if self.use_sgl_mtp else None,
+                replay_beta=rings[3] if self.use_sgl_mtp else None,
             ):
                 raise RuntimeError(
                     "KDA replay commit kernel vanished after capability probing"

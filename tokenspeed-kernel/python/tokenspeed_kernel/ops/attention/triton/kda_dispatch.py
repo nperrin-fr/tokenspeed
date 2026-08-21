@@ -277,7 +277,7 @@ def _nvidia_fused_verify(
     traits={
         "paged_state": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
-        "split_producers": frozenset({True}),
+        "split_producers": frozenset({False}),
         "replay_ring": frozenset({True}),
     },
     tags={"nvidia", "cute_dsl", "paged_cache", "speculative", "replay_ring"},
@@ -337,16 +337,10 @@ def cutedsl_kda_mtp_verify(
         value.reshape(1, rows, num_heads, head_dim)
         for value in mixed_qkv.split((projection, projection, projection), dim=-1)
     )
-    w_q, w_k, w_v = conv_weights.split(
-        (projection, projection, projection), dim=0
-    )
+    w_q, w_k, w_v = conv_weights.split((projection, projection, projection), dim=0)
     conv_state = conv_states.transpose(-1, -2)
-    cs_q, cs_k, cs_v = conv_state.split(
-        (projection, projection, projection), dim=-1
-    )
-    gate = torch.mm(f_a_out, f_b_weight.t()).reshape(
-        1, rows, num_heads, head_dim
-    )
+    cs_q, cs_k, cs_v = conv_state.split((projection, projection, projection), dim=-1)
+    gate = torch.mm(f_a_out, f_b_weight.t()).reshape(1, rows, num_heads, head_dim)
     out = fused_kda_decode_mtp_dspark(
         x_q=x_q,
         x_k=x_k,
@@ -391,6 +385,7 @@ def cutedsl_kda_mtp_verify(
         "store_states": frozenset({False}),
         "recurrent_layout": frozenset({"k_major"}),
         "split_producers": frozenset({False}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
@@ -451,6 +446,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         "store_states": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
         "split_producers": frozenset({False}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
@@ -510,6 +506,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store_vmajor(
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
         "split_producers": frozenset({True}),
+        "replay_ring": frozenset({False}),
         "recurrent_layout": frozenset({"k_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
@@ -571,6 +568,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
         "split_producers": frozenset({True}),
+        "replay_ring": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
@@ -813,7 +811,6 @@ def triton_sgl_replayssm_fold(
         A_log,
         dt_bias,
         state_out,
-        write_indices,
         lower_bound,
         gate_scratch,
     )
@@ -823,6 +820,12 @@ def triton_sgl_replayssm_fold(
         raise ValueError("head_dim must match the V-major state's K dimension")
     if draft_token_num > replay_rawv.shape[2]:
         raise ValueError("replay ring is shorter than draft_token_num")
+    # ReplaySSM uses one index for ring reads and state writes; stage COW pages.
+    state_pool[write_indices] = state_pool[read_indices]
+    replay_rawv[write_indices] = replay_rawv[read_indices]
+    replay_rawk[write_indices] = replay_rawk[read_indices]
+    replay_g[write_indices] = replay_g[read_indices]
+    replay_beta[write_indices] = replay_beta[read_indices]
     from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold import (
         commit_kda_replayssm_spec,
     )
@@ -833,7 +836,7 @@ def triton_sgl_replayssm_fold(
         rawk_cache=replay_rawk,
         gk_cache=replay_g,
         beta_cache=replay_beta,
-        ssm_state_indices=read_indices,
+        ssm_state_indices=write_indices,
         accept_lens=accepted_length,
         max_cache_len=replay_rawv.shape[2],
         num_k_heads=num_heads,
@@ -852,6 +855,7 @@ def triton_sgl_replayssm_fold(
     traits={
         "flat_state": frozenset({True}),
         "recurrent_layout": frozenset({"k_major"}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "flat_kv", "fusion", "speculative"},
 )
@@ -965,6 +969,7 @@ def _nvidia_kda_replay_commit(
     traits={
         "flat_state": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "flat_kv", "fusion", "speculative"},
 )
@@ -986,6 +991,7 @@ def triton_nvidia_kda_replay_commit_vmajor(*args, **kwargs) -> None:
         "flat_state": frozenset({True}),
         "batched_layers": frozenset({True}),
         "recurrent_layout": frozenset({"k_major"}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "flat_kv", "fusion", "speculative", "batched_layers"},
 )
@@ -1091,6 +1097,7 @@ def _nvidia_kda_batched_replay_commit(
         "flat_state": frozenset({True}),
         "batched_layers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
+        "replay_ring": frozenset({False}),
     },
     tags={"nvidia", "flat_kv", "fusion", "speculative", "batched_layers"},
 )

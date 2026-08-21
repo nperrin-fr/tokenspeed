@@ -147,9 +147,9 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "paged_state": True,
         "store_states": store_states,
         "recurrent_layout": recurrent_layout,
+        "split_producers": split_producers,
+        "replay_ring": False,
     }
-    if split_producers:
-        expected["split_producers"] = True
     assert selected == expected
 
 
@@ -167,6 +167,7 @@ def test_kda_split_verify_registration_traits(kernel_name, recurrent_layout) -> 
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
         "split_producers": frozenset({True}),
+        "replay_ring": frozenset({False}),
         "recurrent_layout": frozenset({recurrent_layout}),
     }
 
@@ -197,6 +198,8 @@ def test_nvidia_kda_state_consumer_layout_traits(
     assert spec is not None
     expected = {key: frozenset({value}) for key, value in extra_traits.items()}
     expected["recurrent_layout"] = frozenset({recurrent_layout})
+    if "replay_commit" in kernel_name:
+        expected["replay_ring"] = frozenset({False})
     assert spec.traits == expected
 
 

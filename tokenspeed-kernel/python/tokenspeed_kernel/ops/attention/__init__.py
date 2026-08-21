@@ -1653,6 +1653,7 @@ def try_kda_fused_paged_verify(
     solution: str | None = None,
     store_states: bool = True,
     split_producers: bool = False,
+    replay_ring: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     replay_rawv: torch.Tensor | None = None,
     replay_rawk: torch.Tensor | None = None,
@@ -1669,9 +1670,8 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. Returns ``None`` only when no
     implementation supports the current platform.
 
-    Supplying replay mode requires all four ``replay_*`` rings, all three
-    ``replay_conv_*`` tapes, and ``cu_seqlens``. These buffers are caller-owned
-    and are never allocated by dispatch.
+    Setting ``replay_ring`` requires all four ``replay_*`` rings, all three
+    ``replay_conv_*`` tapes, and ``cu_seqlens``. These buffers are caller-owned.
     """
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
@@ -1689,19 +1689,18 @@ def try_kda_fused_paged_verify(
         replay_conv_k,
         replay_conv_v,
     )
-    replay_ring = all(buffer is not None for buffer in replay_buffers)
-    if any(buffer is not None for buffer in replay_buffers) and not replay_ring:
+    buffers_complete = all(buffer is not None for buffer in replay_buffers)
+    if replay_ring != buffers_complete:
         raise ValueError("KDA replay verify requires all replay ring and conv tapes")
     if replay_ring and cu_seqlens is None:
         raise ValueError("KDA replay verify requires caller-provided cu_seqlens")
     traits = {
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
-        **({"split_producers": True} if split_producers else {}),
+        "split_producers": split_producers,
+        "replay_ring": replay_ring,
     }
-    if replay_ring:
-        traits["replay_ring"] = True
-    else:
+    if not replay_ring:
         traits["store_states"] = store_states
     try:
         kernel = select_kernel(
@@ -1772,6 +1771,7 @@ def try_kda_replay_commit(
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
     recurrent_layout: str = "k_major",
+    replay_ring: bool = False,
     replay_rawv: torch.Tensor | None = None,
     replay_rawk: torch.Tensor | None = None,
     replay_g: torch.Tensor | None = None,
@@ -1785,8 +1785,8 @@ def try_kda_replay_commit(
     ``gate_scratch`` is transient fp32 scratch for the hoisted gate
     (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
     kernel-module buffer.
-    Supplying all four ``replay_*`` rings selects the exact ReplaySSM fold,
-    which mutates the V-major checkpoint slots named by ``read_indices``.
+    Setting ``replay_ring`` with all four rings selects the exact ReplaySSM
+    fold, which commits from ``read_indices`` into ``write_indices``.
 
     Returns:
         ``True`` when a kernel ran, ``False`` when none supports the current
@@ -1798,8 +1798,8 @@ def try_kda_replay_commit(
         v=mixed_qkv,
     )
     replay_buffers = (replay_rawv, replay_rawk, replay_g, replay_beta)
-    replay_ring = all(buffer is not None for buffer in replay_buffers)
-    if any(buffer is not None for buffer in replay_buffers) and not replay_ring:
+    buffers_complete = all(buffer is not None for buffer in replay_buffers)
+    if replay_ring != buffers_complete:
         raise ValueError("KDA replay commit requires all four replay rings")
     try:
         kernel = select_kernel(
@@ -1809,7 +1809,7 @@ def try_kda_replay_commit(
             traits={
                 "flat_state": True,
                 "recurrent_layout": recurrent_layout,
-                **({"replay_ring": True} if replay_ring else {}),
+                "replay_ring": replay_ring,
             },
             solution=solution,
             override=override,
@@ -1895,6 +1895,7 @@ def kda_replay_commit_supported(
     *,
     solution: str | None = None,
     recurrent_layout: str = "k_major",
+    replay_ring: bool = False,
 ) -> bool:
     """Whether this platform can run the KDA speculative replay path.
 
@@ -1917,7 +1918,11 @@ def kda_replay_commit_supported(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                "replay_ring": replay_ring,
+            },
             solution=solution,
         )
         select_kernel(
@@ -1928,6 +1933,8 @@ def kda_replay_commit_supported(
                 "paged_state": True,
                 "store_states": False,
                 "recurrent_layout": recurrent_layout,
+                "split_producers": not replay_ring,
+                "replay_ring": replay_ring,
             },
             solution=solution,
         )

@@ -73,16 +73,10 @@ def _inputs(n: int) -> dict[str, torch.Tensor]:
     data["state_scratch"] = torch.empty(
         rows, H, D, D, device="cuda", dtype=torch.float32
     )
-    data["ring_rawv"] = torch.zeros(
-        n, H, T + 1, D, device="cuda", dtype=torch.bfloat16
-    )
+    data["ring_rawv"] = torch.zeros(n, H, T + 1, D, device="cuda", dtype=torch.bfloat16)
     data["ring_rawk"] = torch.zeros_like(data["ring_rawv"])
-    data["ring_g"] = torch.zeros(
-        n, H, T + 1, D, device="cuda", dtype=torch.float32
-    )
-    data["ring_beta"] = torch.zeros(
-        n, H, T + 1, device="cuda", dtype=torch.float32
-    )
+    data["ring_g"] = torch.zeros(n, H, T + 1, D, device="cuda", dtype=torch.float32)
+    data["ring_beta"] = torch.zeros(n, H, T + 1, device="cuda", dtype=torch.float32)
     data["tape_q"] = torch.zeros(
         n, T, P, WIDTH - 1, device="cuda", dtype=torch.bfloat16
     )
@@ -168,9 +162,7 @@ def test_mtp_verify_matches_kmajor_baseline_and_populates_rings(n: int) -> None:
 @pytest.mark.parametrize("accepted", [T - 1, T])
 def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
     data, checkpoint, _, _ = _run_pair(4)
-    accepted_length = torch.full(
-        (4,), accepted, device="cuda", dtype=torch.int32
-    )
+    accepted_length = torch.full((4,), accepted, device="cuda", dtype=torch.int32)
     triton_sgl_replayssm_fold(
         data["qkv"],
         data["conv_w"],
@@ -184,7 +176,7 @@ def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
         state_pool=checkpoint,
         state_out=checkpoint,
         read_indices=data["read"],
-        write_indices=data["write"],
+        write_indices=data["read"],
         accepted_length=accepted_length,
         num_heads=H,
         head_dim=D,
