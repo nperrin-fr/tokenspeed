@@ -28,6 +28,7 @@ plane's byte width so no parent is wasted.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from functools import cached_property
 
@@ -294,13 +295,24 @@ class KimiK3Recipe(CacheRecipe):
     # ---- extras ----
 
     @cached_property
+    def use_sgl_mtp(self) -> bool:
+        # Temporary A/B scaffolding; keep this paired with registry selection.
+        return os.getenv("TOKENSPEED_KDA_MTP", "").strip().lower() == "sgl"
+
+    @cached_property
     def replay_kda(self) -> bool:
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
         from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
 
-        return bool(kda_replay_commit_supported(self.attn_config.dtype))
+        return bool(
+            kda_replay_commit_supported(
+                self.attn_config.dtype,
+                recurrent_layout="v_major" if self.use_sgl_mtp else "k_major",
+                replay_ring=self.use_sgl_mtp,
+            )
+        )
 
     @override
     def workspace_bytes(self) -> int:
@@ -329,6 +341,36 @@ class KimiK3Recipe(CacheRecipe):
                 if spec.group_id != FULL_ATTENTION
                 for field in fields
             )
+            if self.use_sgl_mtp:
+                draft_tokens = int(self.server_args.speculative_num_draft_tokens)
+                conv_placeholder_bytes = sum(
+                    field.payload_bytes
+                    for spec, fields in self.groups()
+                    if spec.group_id != FULL_ATTENTION
+                    for field in fields
+                    if field.field_id.endswith(".conv_state")
+                )
+                ring_len = draft_tokens + 1
+                ring_bytes_per_layer = (
+                    self.attn_config.max_bs
+                    * heads
+                    * ring_len
+                    * (
+                        head_dim * torch.bfloat16.itemsize * 2
+                        + head_dim * torch.float32.itemsize
+                        + torch.float32.itemsize
+                    )
+                )
+                tape_bytes_per_layer = (
+                    3
+                    * draft_tokens
+                    * conv_shape[0]
+                    * conv_shape[1]
+                    * torch.bfloat16.itemsize
+                )
+                return conv_placeholder_bytes + layer_count * (
+                    ring_bytes_per_layer + tape_bytes_per_layer
+                )
             payload_bytes_per_row = (
                 conv_shape[0] * torch.bfloat16.itemsize
                 + head_dim * torch.bfloat16.itemsize

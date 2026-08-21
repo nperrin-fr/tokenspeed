@@ -501,14 +501,14 @@ def kda_decode_mtp_kernel(
                     ] = cute.math.exp(r_gk, fastmath=True)
                     if cutlass.const_expr(CACHE_RING):
                         ring_g[ring_slot, i_hv, i_t, k_idx] = r_gk
-            if p1_job == 0:
+            if cutlass.const_expr(not CACHE_RING) and p1_job == 0:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
                     for w in range(KERNEL_WIDTH - 1):
                         intermediate_conv_q[scratch_row, i_t, head_off + k_idx, w] = (
                             cutlass.BFloat16(r_state[w * VEC_SIZE + i])
                         )
-            elif p1_job == 1:
+            elif cutlass.const_expr(not CACHE_RING) and p1_job == 1:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
                     for w in range(KERNEL_WIDTH - 1):
@@ -570,10 +570,11 @@ def kda_decode_mtp_kernel(
                 sVall[_t * HEAD_DIM + _v_idx] = _vconv
                 if cutlass.const_expr(CACHE_RING):
                     ring_rawv[ring_slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
-                for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
-                    intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
-                        cutlass.BFloat16(_win[_t + 1 + _w])
-                    )
+                if cutlass.const_expr(not CACHE_RING):
+                    for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
+                        intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
+                            cutlass.BFloat16(_win[_t + 1 + _w])
+                        )
 
     k_grp = in_warp_tid % P2_LANES_K
     row_grp = in_warp_tid // P2_LANES_K

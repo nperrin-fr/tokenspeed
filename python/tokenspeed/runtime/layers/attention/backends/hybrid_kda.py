@@ -155,7 +155,7 @@ class KdaAttnBackend(MambaAttnBackend):
                             self.speculative_num_draft_tokens + 1,
                         )
                         tape_shape = (
-                            self.max_bs,
+                            1,
                             self.speculative_num_draft_tokens,
                             conv.shape[1],
                             conv.shape[2],
@@ -361,7 +361,7 @@ class KdaAttnBackend(MambaAttnBackend):
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
         if not self._replay_active:
             return super()._ensure_verify_scratch(bs, draft_token_num)
-        rows = max(len(self.query_start_loc_list), bs)
+        rows = 1 if self.use_sgl_mtp else max(len(self.query_start_loc_list), bs)
         scratch = self._verify_scratch
         if scratch is not None:
             # Allocated once at its maximum; graphs may hold its addresses, so
