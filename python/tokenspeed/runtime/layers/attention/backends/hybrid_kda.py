@@ -798,7 +798,9 @@ class KdaAttnBackend(MambaAttnBackend):
             conv, state = self._state_components(layer_id)
             if self.use_sgl_mtp:
                 rings = self._sgl_replay_buffer(layer_id)
-                qkv = f_a = beta = gate = conv_w
+                # rawv is bf16: selection signatures must see the model dtype,
+                # not the fp32 conv cache.
+                qkv = f_a = beta = gate = rings[0]
             else:
                 qkv, f_a, beta, gate = self._replay_payload(layer_id)
             if not try_kda_replay_commit(
