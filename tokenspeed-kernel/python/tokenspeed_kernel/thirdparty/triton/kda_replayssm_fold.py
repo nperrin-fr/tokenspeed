@@ -39,27 +39,32 @@ import triton.language as tl
 
 @triton.jit
 def kda_replayssm_exact_fold_kernel(
-    h0,  # [num_slots, HV, V, K] fp32 checkpoint (folded in place)
+    h0,  # [num_slots, HV, V, K] fp32 source checkpoint
+    dst_h0,  # [num_slots, HV, V, K] fp32 destination checkpoint
     rawv_cache,  # [num_slots, HV, L, V]  raw v
     rawk_cache,  # [num_slots, H,  L, K]  raw pre-norm k
     gk_cache,  # [num_slots, HV, L, K]  fp32 per-K log-decay gate
     beta_cache,  # [num_slots, HV, L]     fp32 beta
     ssm_state_indices,  # [B] int  physical slot per request
+    dst_state_indices,  # [B] int  destination slot per request
     ring_indices,  # [B] int  replay-ring slot per request
     accept_lens,  # [B] int  committed prefix length per request
     mamba_track_indices,  # [B] int  extra_buffer track slot (or NULL) per request
     mamba_steps_to_track,  # [B] int  crossing step (or -1) per request
     stride_state_slot: tl.constexpr,
+    stride_dst_state_slot: tl.constexpr,
     stride_rawv_slot: tl.constexpr,
     stride_rawk_slot: tl.constexpr,
     stride_gk_slot: tl.constexpr,
     stride_beta_slot: tl.constexpr,
     stride_state_layer: tl.constexpr,
+    stride_dst_state_layer: tl.constexpr,
     stride_rawv_layer: tl.constexpr,
     stride_rawk_layer: tl.constexpr,
     stride_gk_layer: tl.constexpr,
     stride_beta_layer: tl.constexpr,
     stride_indices: tl.constexpr,
+    stride_dst_indices: tl.constexpr,
     stride_ring_indices: tl.constexpr,
     stride_accept: tl.constexpr,
     stride_track: tl.constexpr,
@@ -87,6 +92,7 @@ def kda_replayssm_exact_fold_kernel(
     i_h = i_hv // (HV // H)
     # Shift the layer-indexed bases once; every pointer below is layer-relative.
     h0 = h0 + i_layer * stride_state_layer
+    dst_h0 = dst_h0 + i_layer * stride_dst_state_layer
     rawv_cache = rawv_cache + i_layer * stride_rawv_layer
     rawk_cache = rawk_cache + i_layer * stride_rawk_layer
     gk_cache = gk_cache + i_layer * stride_gk_layer
@@ -94,6 +100,9 @@ def kda_replayssm_exact_fold_kernel(
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
+        return
+    dst_state_idx = tl.load(dst_state_indices + i_n * stride_dst_indices).to(tl.int64)
+    if dst_state_idx <= NULL_BLOCK_ID:
         return
     n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
     if n_commit <= 0:
@@ -168,20 +177,27 @@ def kda_replayssm_exact_fold_kernel(
         if HAS_TRACK:
             if (t == track_step) and (track_idx > NULL_BLOCK_ID):
                 tl.store(
-                    h0
-                    + track_idx * stride_state_slot
+                    dst_h0
+                    + track_idx * stride_dst_state_slot
                     + i_hv * V * K
                     + o_v[None, :] * K
                     + o_k[:, None],
-                    b_h.to(h0.dtype.element_ty),
+                    b_h.to(dst_h0.dtype.element_ty),
                     mask=mask_h,
                 )
 
-    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+    p_dst_h0 = (
+        dst_h0
+        + dst_state_idx * stride_dst_state_slot
+        + i_hv * V * K
+        + o_v[None, :] * K
+        + o_k[:, None]
+    )
+    tl.store(p_dst_h0, b_h.to(p_dst_h0.dtype.element_ty), mask=mask_h)
 
 
 def commit_kda_replayssm_spec(
-    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K] fp32, folded in place
+    checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K] fp32 checkpoint pool
     rawv_cache: torch.Tensor,  # [num_slots, HV, L, V]
     rawk_cache: torch.Tensor,  # [num_slots, H,  L, K]
     gk_cache: torch.Tensor,  # [num_slots, HV, L, K] fp32
@@ -196,8 +212,9 @@ def commit_kda_replayssm_spec(
     null_block_id: int = 0,
     *,
     ring_indices: torch.Tensor | None = None,
+    dst_state_indices: torch.Tensor | None = None,
 ) -> None:
-    """Replay each request's accepted window into its fp32 checkpoint in place.
+    """Replay each accepted window from its checkpoint into a destination page.
 
     Tiling clones the recurrent kernel (full-K rows, BV = min(np2(V), 32) cols,
     num_warps=1) so the folded checkpoint is bit-identical to the recurrent
@@ -207,6 +224,9 @@ def commit_kda_replayssm_spec(
     """
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
+    # TokenSpeed divergence: the fold can write native COW destination pages.
+    if dst_state_indices is None:
+        dst_state_indices = ssm_state_indices
     # TokenSpeed divergence: replay rings may use dense batch-local slots.
     if ring_indices is None:
         ring_indices = ssm_state_indices
@@ -226,15 +246,18 @@ def commit_kda_replayssm_spec(
         stride_steps = 0
     kda_replayssm_exact_fold_kernel[grid](
         checkpoint_state,
+        checkpoint_state,
         rawv_cache,
         rawk_cache,
         gk_cache,
         beta_cache,
         ssm_state_indices,
+        dst_state_indices,
         ring_indices,
         accept_lens,
         track_idx_t,
         steps_t,
+        checkpoint_state.stride(0),
         checkpoint_state.stride(0),
         rawv_cache.stride(0),
         rawk_cache.stride(0),
@@ -245,7 +268,9 @@ def commit_kda_replayssm_spec(
         0,
         0,
         0,
+        0,
         ssm_state_indices.stride(0),
+        dst_state_indices.stride(0),
         ring_indices.stride(0),
         accept_lens.stride(0),
         stride_track,
@@ -266,7 +291,7 @@ def commit_kda_replayssm_spec(
 
 
 def commit_kda_replayssm_spec_all_layers(
-    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
+    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32 pool
     rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
     rawk_cache: torch.Tensor,  # [num_layers, num_slots, H,  L, K]
     gk_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, K] fp32
@@ -281,6 +306,7 @@ def commit_kda_replayssm_spec_all_layers(
     null_block_id: int = 0,
     *,
     ring_indices: torch.Tensor | None = None,
+    dst_state_indices: torch.Tensor | None = None,
 ) -> None:
     """Fold every layer's accepted window in a single launch.
 
@@ -293,6 +319,8 @@ def commit_kda_replayssm_spec_all_layers(
     """
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
+    if dst_state_indices is None:
+        dst_state_indices = ssm_state_indices
     if ring_indices is None:
         ring_indices = ssm_state_indices
     BK = triton.next_power_of_2(K)
@@ -311,26 +339,31 @@ def commit_kda_replayssm_spec_all_layers(
         stride_steps = 0
     kda_replayssm_exact_fold_kernel[grid](
         checkpoint_state,
+        checkpoint_state,
         rawv_cache,
         rawk_cache,
         gk_cache,
         beta_cache,
         ssm_state_indices,
+        dst_state_indices,
         ring_indices,
         accept_lens,
         track_idx_t,
         steps_t,
+        checkpoint_state.stride(1),
         checkpoint_state.stride(1),
         rawv_cache.stride(1),
         rawk_cache.stride(1),
         gk_cache.stride(1),
         beta_cache.stride(1),
         checkpoint_state.stride(0),
+        checkpoint_state.stride(0),
         rawv_cache.stride(0),
         rawk_cache.stride(0),
         gk_cache.stride(0),
         beta_cache.stride(0),
         ssm_state_indices.stride(0),
+        dst_state_indices.stride(0),
         ring_indices.stride(0),
         accept_lens.stride(0),
         stride_track,

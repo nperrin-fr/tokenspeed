@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from functools import cached_property
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -295,9 +296,17 @@ class KimiK3Recipe(CacheRecipe):
     # ---- extras ----
 
     @cached_property
-    def use_sgl_mtp(self) -> bool:
+    def kda_decode_backend(self) -> str:
         # Temporary A/B scaffolding; keep this paired with registry selection.
-        return os.getenv("TOKENSPEED_KDA_MTP", "").strip().lower() == "sgl"
+        return (
+            "sgl_mtp"
+            if os.getenv("TOKENSPEED_KDA_MTP", "").strip().lower() == "sgl"
+            else "triton"
+        )
+
+    @cached_property
+    def use_sgl_mtp(self) -> bool:
+        return self.kda_decode_backend == "sgl_mtp"
 
     @cached_property
     def replay_kda(self) -> bool:
@@ -309,7 +318,11 @@ class KimiK3Recipe(CacheRecipe):
         return bool(
             kda_replay_commit_supported(
                 self.attn_config.dtype,
-                recurrent_layout="v_major" if self.use_sgl_mtp else "k_major",
+                recurrent_layout=(
+                    "v_major"
+                    if current_platform().is_cdna4 or self.use_sgl_mtp
+                    else "k_major"
+                ),
                 replay_ring=self.use_sgl_mtp,
             )
         )

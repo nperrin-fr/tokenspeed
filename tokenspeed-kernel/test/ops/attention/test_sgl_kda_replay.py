@@ -175,6 +175,7 @@ def test_mtp_verify_matches_kmajor_baseline_and_populates_rings(n: int) -> None:
 @pytest.mark.parametrize("accepted", [T - 1, T])
 def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
     data, checkpoint, _, _ = _run_pair(4)
+    read_before = checkpoint[data["read"]].clone()
     accepted_length = torch.full((4,), accepted, device="cuda", dtype=torch.int32)
     triton_sgl_replayssm_fold(
         data["qkv"],
@@ -207,3 +208,4 @@ def test_replayssm_fold_matches_committed_baseline_state(accepted: int) -> None:
     torch.testing.assert_close(
         checkpoint[data["commit_write"]], expected, atol=2e-2, rtol=2e-2
     )
+    torch.testing.assert_close(checkpoint[data["read"]], read_before)

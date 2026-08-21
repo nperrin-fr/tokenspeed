@@ -802,7 +802,7 @@ def triton_sgl_replayssm_fold(
     replay_beta: torch.Tensor,
     ring_indices: torch.Tensor,
 ) -> None:
-    """Fold accepted replay-ring prefixes into V-major state in place."""
+    """Fold accepted replay-ring prefixes into V-major destination pages."""
     del (
         mixed_qkv,
         conv_weights,
@@ -823,8 +823,6 @@ def triton_sgl_replayssm_fold(
         raise ValueError("head_dim must match the V-major state's K dimension")
     if draft_token_num > replay_rawv.shape[2]:
         raise ValueError("replay ring is shorter than draft_token_num")
-    # Stage only the persistent state when commit targets a COW page.
-    state_pool[write_indices] = state_pool[read_indices]
     from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold import (
         commit_kda_replayssm_spec,
     )
@@ -835,7 +833,8 @@ def triton_sgl_replayssm_fold(
         rawk_cache=replay_rawk,
         gk_cache=replay_g,
         beta_cache=replay_beta,
-        ssm_state_indices=write_indices,
+        ssm_state_indices=read_indices,
+        dst_state_indices=write_indices,
         accept_lens=accepted_length,
         max_cache_len=replay_rawv.shape[2],
         num_k_heads=num_heads,

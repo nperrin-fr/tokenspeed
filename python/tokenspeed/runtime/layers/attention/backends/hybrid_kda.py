@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -49,6 +50,14 @@ if TYPE_CHECKING:
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+KDA_DECODE_BACKENDS = ("triton", "sgl_mtp")
+
+
+def kda_recurrent_layout(kda_decode_backend: str) -> str:
+    """Derive the recurrent pool layout from platform and decode backend."""
+    if current_platform().is_cdna4:
+        return "v_major"
+    return "v_major" if kda_decode_backend == "sgl_mtp" else "k_major"
 
 
 def _slice_kda_prefill_inputs(
@@ -86,13 +95,17 @@ class KdaAttnBackend(MambaAttnBackend):
         self,
         config: BaseAttnConfig,
         kda_backend: str = "auto",
-        kda_recurrent_layout: str = "k_major",
-        use_sgl_mtp: bool = False,
+        kda_decode_backend: str = "triton",
     ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
-        self.kda_recurrent_layout = kda_recurrent_layout
-        self.use_sgl_mtp = use_sgl_mtp
+        self.kda_decode_backend = (kda_decode_backend or "triton").strip().lower()
+        if self.kda_decode_backend not in KDA_DECODE_BACKENDS:
+            raise ValueError(
+                "kda_decode_backend must be one of "
+                f"{', '.join(KDA_DECODE_BACKENDS)}; got {self.kda_decode_backend!r}"
+            )
+        self.kda_recurrent_layout = kda_recurrent_layout(self.kda_decode_backend)
         if self.use_sgl_mtp and self.dtype is not torch.bfloat16:
             raise ValueError("SGL KDA MTP requires bfloat16 activations")
         self._replay_active = kda_replay_commit_supported(
@@ -121,10 +134,16 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"got {self.kda_backend!r}"
             )
         logger.info(
-            "KDA prefill routes through %s; decode remains on the "
-            "platform-selected kernels",
+            "KDA prefill routes through %s; decode routes through %s with %s state",
             self.kda_backend,
+            self.kda_decode_backend,
+            self.kda_recurrent_layout,
         )
+
+    @property
+    def use_sgl_mtp(self) -> bool:
+        """Whether decode/verify uses the vendored SGL MTP kernel pair."""
+        return self.kda_decode_backend == "sgl_mtp"
 
     @override
     def set_kv_pool(self, kv_pool) -> None:
