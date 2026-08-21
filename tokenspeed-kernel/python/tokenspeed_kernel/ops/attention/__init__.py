@@ -1653,6 +1653,14 @@ def try_kda_fused_paged_verify(
     solution: str | None = None,
     store_states: bool = True,
     split_producers: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    replay_rawv: torch.Tensor | None = None,
+    replay_rawk: torch.Tensor | None = None,
+    replay_g: torch.Tensor | None = None,
+    replay_beta: torch.Tensor | None = None,
+    replay_conv_q: torch.Tensor | None = None,
+    replay_conv_k: torch.Tensor | None = None,
+    replay_conv_v: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1660,6 +1668,10 @@ def try_kda_fused_paged_verify(
     per-position conv windows and recurrent states land in the verify
     scratches for partial-accept commit. Returns ``None`` only when no
     implementation supports the current platform.
+
+    Supplying replay mode requires all four ``replay_*`` rings, all three
+    ``replay_conv_*`` tapes, and ``cu_seqlens``. These buffers are caller-owned
+    and are never allocated by dispatch.
     """
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
@@ -1668,22 +1680,52 @@ def try_kda_fused_paged_verify(
         k=mixed_qkv,
         v=mixed_qkv,
     )
+    replay_buffers = (
+        replay_rawv,
+        replay_rawk,
+        replay_g,
+        replay_beta,
+        replay_conv_q,
+        replay_conv_k,
+        replay_conv_v,
+    )
+    replay_ring = all(buffer is not None for buffer in replay_buffers)
+    if any(buffer is not None for buffer in replay_buffers) and not replay_ring:
+        raise ValueError("KDA replay verify requires all replay ring and conv tapes")
+    if replay_ring and cu_seqlens is None:
+        raise ValueError("KDA replay verify requires caller-provided cu_seqlens")
+    traits = {
+        "paged_state": True,
+        "recurrent_layout": recurrent_layout,
+        **({"split_producers": True} if split_producers else {}),
+    }
+    if replay_ring:
+        traits["replay_ring"] = True
+    else:
+        traits["store_states"] = store_states
     try:
         kernel = select_kernel(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={
-                "paged_state": True,
-                "store_states": store_states,
-                "recurrent_layout": recurrent_layout,
-                **({"split_producers": True} if split_producers else {}),
-            },
+            traits=traits,
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         return None
+    replay_kwargs = {}
+    if replay_ring:
+        replay_kwargs = {
+            "cu_seqlens": cu_seqlens,
+            "replay_rawv": replay_rawv,
+            "replay_rawk": replay_rawk,
+            "replay_g": replay_g,
+            "replay_beta": replay_beta,
+            "replay_conv_q": replay_conv_q,
+            "replay_conv_k": replay_conv_k,
+            "replay_conv_v": replay_conv_v,
+        }
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1702,6 +1744,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        **replay_kwargs,
     )
 
 
@@ -1729,6 +1772,10 @@ def try_kda_replay_commit(
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
     recurrent_layout: str = "k_major",
+    replay_rawv: torch.Tensor | None = None,
+    replay_rawk: torch.Tensor | None = None,
+    replay_g: torch.Tensor | None = None,
+    replay_beta: torch.Tensor | None = None,
 ) -> bool:
     """Try a registered KDA speculative replay-commit.
 
@@ -1738,6 +1785,8 @@ def try_kda_replay_commit(
     ``gate_scratch`` is transient fp32 scratch for the hoisted gate
     (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
     kernel-module buffer.
+    Supplying all four ``replay_*`` rings selects the exact ReplaySSM fold,
+    which mutates the V-major checkpoint slots named by ``read_indices``.
 
     Returns:
         ``True`` when a kernel ran, ``False`` when none supports the current
@@ -1748,17 +1797,33 @@ def try_kda_replay_commit(
         k=mixed_qkv,
         v=mixed_qkv,
     )
+    replay_buffers = (replay_rawv, replay_rawk, replay_g, replay_beta)
+    replay_ring = all(buffer is not None for buffer in replay_buffers)
+    if any(buffer is not None for buffer in replay_buffers) and not replay_ring:
+        raise ValueError("KDA replay commit requires all four replay rings")
     try:
         kernel = select_kernel(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                **({"replay_ring": True} if replay_ring else {}),
+            },
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         return False
+    replay_kwargs = {}
+    if replay_ring:
+        replay_kwargs = {
+            "replay_rawv": replay_rawv,
+            "replay_rawk": replay_rawk,
+            "replay_g": replay_g,
+            "replay_beta": replay_beta,
+        }
     kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1780,6 +1845,7 @@ def try_kda_replay_commit(
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
         recurrent_layout=recurrent_layout,
+        **replay_kwargs,
     )
     return True
 

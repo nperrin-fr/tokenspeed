@@ -15,7 +15,7 @@ from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -262,6 +262,120 @@ def _nvidia_fused_verify(
         g_raw=g_raw,
         conv_qkv=conv_qkv,
     ).view(1, -1, num_heads, head_dim)
+
+
+@register_kernel(
+    "attention",
+    "kda_fused_paged_verify",
+    name="cutedsl_kda_mtp_verify",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
+    ),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({True}),
+        "replay_ring": frozenset({True}),
+    },
+    tags={"nvidia", "cute_dsl", "paged_cache", "speculative", "replay_ring"},
+)
+def cutedsl_kda_mtp_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor | None,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    cu_seqlens: torch.Tensor,
+    replay_rawv: torch.Tensor,
+    replay_rawk: torch.Tensor,
+    replay_g: torch.Tensor,
+    replay_beta: torch.Tensor,
+    replay_conv_q: torch.Tensor,
+    replay_conv_k: torch.Tensor,
+    replay_conv_v: torch.Tensor,
+) -> torch.Tensor:
+    """Run CuTe MTP verify with caller-owned replay rings and conv tapes.
+
+    ``replay_rawv/rawk/g/beta`` are slot-indexed replay rings. The three
+    ``replay_conv_*`` tensors are ``[slots, T, H*D, conv_width-1]`` tapes.
+    ``conv_weights`` must contain the three FP32 Q/K/V convolution weights,
+    and ``state_pool`` must be contiguous ``[slots, H, V, K]`` FP32 storage.
+    """
+    del conv_scratch, state_scratch, write_indices
+    if head_dim != 128:
+        raise ValueError("the vendored KDA MTP kernel requires head_dim=128")
+    if conv_weights.dtype is not torch.float32:
+        raise ValueError("cutedsl KDA MTP requires FP32 convolution weights")
+    from tokenspeed_kernel.thirdparty.cute_dsl.kda_mtp import (
+        fused_kda_decode_mtp_dspark,
+    )
+
+    rows = mixed_qkv.shape[0]
+    requests = cu_seqlens.numel() - 1
+    if requests <= 0 or rows != requests * draft_token_num:
+        raise ValueError("rows must equal requests * draft_token_num")
+    if lower_bound is None:
+        raise ValueError("the vendored KDA MTP kernel requires lower_bound")
+    projection = num_heads * head_dim
+    x_q, x_k, x_v = (
+        value.reshape(1, rows, num_heads, head_dim)
+        for value in mixed_qkv.split((projection, projection, projection), dim=-1)
+    )
+    w_q, w_k, w_v = conv_weights.split(
+        (projection, projection, projection), dim=0
+    )
+    conv_state = conv_states.transpose(-1, -2)
+    cs_q, cs_k, cs_v = conv_state.split(
+        (projection, projection, projection), dim=-1
+    )
+    gate = torch.mm(f_a_out, f_b_weight.t()).reshape(
+        1, rows, num_heads, head_dim
+    )
+    out = fused_kda_decode_mtp_dspark(
+        x_q=x_q,
+        x_k=x_k,
+        x_v=x_v,
+        w_q=w_q,
+        w_k=w_k,
+        w_v=w_v,
+        cs_q=cs_q.transpose(-1, -2),
+        cs_k=cs_k.transpose(-1, -2),
+        cs_v=cs_v.transpose(-1, -2),
+        g=gate,
+        beta=beta_logits.reshape(1, rows, num_heads),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=state_pool,
+        intermediate_ssm=None,
+        intermediate_state_indices=read_indices,
+        intermediate_conv_q=replay_conv_q,
+        intermediate_conv_k=replay_conv_k,
+        intermediate_conv_v=replay_conv_v,
+        ssm_state_indices=read_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        replayssm_rawv=replay_rawv,
+        replayssm_rawk=replay_rawk,
+        replayssm_g=replay_g,
+        replayssm_beta=replay_beta,
+    )
+    return out.view(1, -1, num_heads, head_dim)
 
 
 @register_kernel(
@@ -643,6 +757,88 @@ def _nvidia_kda_prefill(
         **hint,
     )
     return KdaPrefillResult(out, final_state)
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="triton_sgl_replayssm_fold",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "flat_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "replay_ring": frozenset({True}),
+    },
+    tags={"nvidia", "flat_kv", "speculative", "replay_ring"},
+)
+def triton_sgl_replayssm_fold(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    gate_scratch: torch.Tensor | None = None,
+    recurrent_layout: str = "v_major",
+    replay_rawv: torch.Tensor,
+    replay_rawk: torch.Tensor,
+    replay_g: torch.Tensor,
+    replay_beta: torch.Tensor,
+) -> None:
+    """Fold accepted replay-ring prefixes into V-major state in place."""
+    del (
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_out,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_out,
+        write_indices,
+        lower_bound,
+        gate_scratch,
+    )
+    if recurrent_layout != "v_major":
+        raise ValueError("ReplaySSM fold requires V-major recurrent state")
+    if head_dim != state_pool.shape[-1]:
+        raise ValueError("head_dim must match the V-major state's K dimension")
+    if draft_token_num > replay_rawv.shape[2]:
+        raise ValueError("replay ring is shorter than draft_token_num")
+    from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold import (
+        commit_kda_replayssm_spec,
+    )
+
+    commit_kda_replayssm_spec(
+        checkpoint_state=state_pool,
+        rawv_cache=replay_rawv,
+        rawk_cache=replay_rawk,
+        gk_cache=replay_g,
+        beta_cache=replay_beta,
+        ssm_state_indices=read_indices,
+        accept_lens=accepted_length,
+        max_cache_len=replay_rawv.shape[2],
+        num_k_heads=num_heads,
+        null_block_id=-1,
+    )
 
 
 @register_kernel(
