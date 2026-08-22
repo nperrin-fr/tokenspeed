@@ -113,12 +113,10 @@ class KdaAttnBackend(MambaAttnBackend):
             recurrent_layout=self.kda_recurrent_layout,
             replay_ring=self.use_sgl_mtp,
         )
-        self._batched_replay_kernel = (
-            None
-            if self.use_sgl_mtp
-            else resolve_kda_batched_replay_commit(
-                self.dtype, self.kda_recurrent_layout
-            )
+        self._batched_replay_kernel = resolve_kda_batched_replay_commit(
+            self.dtype,
+            self.kda_recurrent_layout,
+            replay_ring=self.use_sgl_mtp,
         )
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._sgl_replay_buffers: dict[int, tuple[torch.Tensor, ...]] | None = None
@@ -202,7 +200,22 @@ class KdaAttnBackend(MambaAttnBackend):
                             torch.empty_like(tape_q),
                             torch.empty_like(tape_q),
                         )
+                    self._replay_descriptors = torch.tensor(
+                        [
+                            [
+                                self._state_components(layer_id)[1].data_ptr(),
+                                *(
+                                    buffer.data_ptr()
+                                    for buffer in self._sgl_replay_buffer(layer_id)[:4]
+                                ),
+                            ]
+                            for layer_id in layer_ids
+                        ],
+                        dtype=torch.uint64,
+                        device=self.device,
+                    )
                     self._replay_weights.clear()
+                    self._bind_sgl_batched_replay(layer_ids)
                     return
                 for layer_id in layer_ids[1:]:
                     conv, ssm = self._state_components(layer_id)
@@ -240,6 +253,61 @@ class KdaAttnBackend(MambaAttnBackend):
                 self._replay_weights.clear()
                 self._batched_replay_launch = None
                 self._batched_replay_ready = False
+
+    def _bind_sgl_batched_replay(self, layer_ids: tuple[int, ...]) -> None:
+        """Bind the stable state/ring descriptor table allocated by set_kv_pool."""
+        if self._batched_replay_kernel is None:
+            return
+        first_state = self._state_components(layer_ids[0])[1]
+        first_rings = self._sgl_replay_buffer(layer_ids[0])
+        geometry = first_state.shape[1:]
+        strides = (first_state.stride(0), *(ring.stride(0) for ring in first_rings[:4]))
+        for layer_id in layer_ids[1:]:
+            state = self._state_components(layer_id)[1]
+            rings = self._sgl_replay_buffer(layer_id)
+            if (
+                state.shape[1:] != geometry
+                or (state.stride(0), *(ring.stride(0) for ring in rings[:4])) != strides
+            ):
+                raise RuntimeError("batched ReplaySSM fold requires uniform layers")
+        layers_per_group = len(layer_ids) // len(self._replay_group_ids)
+        expected_groups = tuple(
+            group_id
+            for group_id in self._replay_group_ids
+            for _ in range(layers_per_group)
+        )
+        if (
+            tuple(self._state_group_for(layer_id) for layer_id in layer_ids)
+            != expected_groups
+        ):
+            raise RuntimeError(
+                "batched ReplaySSM fold requires contiguous layer groups"
+            )
+        descriptors = self._replay_descriptors
+        draft_tokens = self.speculative_num_draft_tokens
+        hv, _value_dim, head_dim = geometry
+
+        def launch(read_indices, write_indices, accepted_length, ring_indices):
+            self._batched_replay_kernel(
+                descriptors=descriptors,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                ring_indices=ring_indices,
+                accepted_length=accepted_length,
+                draft_token_num=draft_tokens,
+                num_heads=hv,
+                num_value_heads=hv,
+                head_dim=head_dim,
+                state_stride=strides[0],
+                rawv_stride=strides[1],
+                rawk_stride=strides[2],
+                gate_stride=strides[3],
+                beta_stride=strides[4],
+                layers_per_group=layers_per_group,
+            )
+
+        self._batched_replay_launch = launch
+        self._batched_replay_ready = True
 
     def _sgl_replay_buffer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer's batch-indexed replay rings and convolution tapes."""
@@ -808,7 +876,11 @@ class KdaAttnBackend(MambaAttnBackend):
             write_pages = torch.stack(
                 [pages_by_group[group_id] for group_id in self._replay_group_ids]
             )
-            self._batched_replay_launch(read_pages, write_pages, steps.to(torch.int32))
+            launch_args = (read_pages, write_pages, steps.to(torch.int32))
+            if self.use_sgl_mtp:
+                self._batched_replay_launch(*launch_args, ring_indices)
+            else:
+                self._batched_replay_launch(*launch_args)
             self._verify_commit_ctx = None
             return
         for layer_id, weights in self._replay_weights.items():

@@ -846,6 +846,64 @@ def triton_sgl_replayssm_fold(
 @register_kernel(
     "attention",
     "kda_replay_commit",
+    name="triton_sgl_replayssm_fold_batched",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "flat_state": frozenset({True}),
+        "batched_layers": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "replay_ring": frozenset({True}),
+    },
+    tags={"nvidia", "flat_kv", "speculative", "replay_ring", "batched_layers"},
+)
+def triton_sgl_replayssm_fold_batched(
+    descriptors: torch.Tensor,
+    *,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    ring_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    num_heads: int,
+    num_value_heads: int,
+    head_dim: int,
+    state_stride: int,
+    rawv_stride: int,
+    rawk_stride: int,
+    gate_stride: int,
+    beta_stride: int,
+    layers_per_group: int,
+) -> None:
+    """Fold all ReplaySSM descriptor rows into V-major state in one launch."""
+    from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold_batched import (
+        commit_kda_replayssm_spec_batched,
+    )
+
+    commit_kda_replayssm_spec_batched(
+        descriptors,
+        read_indices,
+        write_indices,
+        ring_indices,
+        accepted_length,
+        max_cache_len=draft_token_num + 1,
+        num_heads=num_heads,
+        num_value_heads=num_value_heads,
+        head_dim=head_dim,
+        state_stride=state_stride,
+        rawv_stride=rawv_stride,
+        rawk_stride=rawk_stride,
+        gate_stride=gate_stride,
+        beta_stride=beta_stride,
+        layers_per_group=layers_per_group,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
     name="triton_nvidia_kda_replay_commit",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),

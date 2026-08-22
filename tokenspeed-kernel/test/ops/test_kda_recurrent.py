@@ -203,6 +203,17 @@ def test_nvidia_kda_state_consumer_layout_traits(
     assert spec.traits == expected
 
 
+def test_batched_replayssm_fold_registration_traits() -> None:
+    spec = KernelRegistry.get().get_by_name("triton_sgl_replayssm_fold_batched")
+    assert spec is not None
+    assert spec.traits == {
+        "flat_state": frozenset({True}),
+        "batched_layers": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "replay_ring": frozenset({True}),
+    }
+
+
 @pytest.mark.parametrize("recurrent_layout", ["k_major", "v_major"])
 def test_kda_decode_and_replay_select_layout_trait(
     monkeypatch, recurrent_layout

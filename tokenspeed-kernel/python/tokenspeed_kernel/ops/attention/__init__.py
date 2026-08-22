@@ -1861,6 +1861,7 @@ def try_kda_replay_commit(
 def resolve_kda_batched_replay_commit(
     dtype: torch.dtype = torch.bfloat16,
     recurrent_layout: str = "k_major",
+    replay_ring: bool = False,
 ):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
@@ -1882,11 +1883,16 @@ def resolve_kda_batched_replay_commit(
                 "flat_state": True,
                 "batched_layers": True,
                 "recurrent_layout": recurrent_layout,
+                "replay_ring": replay_ring,
             },
             override=(
-                "triton_nvidia_kda_batched_replay_commit_vmajor"
-                if recurrent_layout == "v_major"
-                else "triton_nvidia_kda_batched_replay_commit"
+                "triton_sgl_replayssm_fold_batched"
+                if replay_ring
+                else (
+                    "triton_nvidia_kda_batched_replay_commit_vmajor"
+                    if recurrent_layout == "v_major"
+                    else "triton_nvidia_kda_batched_replay_commit"
+                )
             ),
         )
     except NoKernelFoundError:

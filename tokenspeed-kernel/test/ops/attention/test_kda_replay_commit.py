@@ -43,12 +43,86 @@ from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E40
     fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
 )
+from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold import (  # noqa: E402
+    commit_kda_replayssm_spec,
+)
+from tokenspeed_kernel.thirdparty.triton.kda_replayssm_fold_batched import (  # noqa: E402
+    commit_kda_replayssm_spec_batched,
+)
 
 # K3 TP8 rank geometry, trimmed to 4 heads to keep the reference loop quick.
 HV, K, V, D_FA = 4, 128, 128, 128
 P = HV * K
 LOWER_BOUND = -5.0
 DEV = "cuda"
+
+
+def test_batched_replayssm_fold_matches_distinct_layer_loop():
+    layers, slots, batch, heads, dim, ring_len = 3, 12, 4, 2, 32, 5
+    generator = torch.Generator(device="cpu").manual_seed(8128)
+
+    def rand(*shape, dtype=torch.float32):
+        return torch.randn(*shape, generator=generator).to(DEV, dtype=dtype)
+
+    states = [rand(slots, heads, dim, dim) for _ in range(layers)]
+    rings = [
+        (
+            rand(slots, heads, ring_len, dim, dtype=torch.bfloat16),
+            rand(slots, heads, ring_len, dim, dtype=torch.bfloat16),
+            rand(slots, heads, ring_len, dim),
+            rand(slots, heads, ring_len),
+        )
+        for _ in range(layers)
+    ]
+    expected = [state.clone() for state in states]
+    actual = [state.clone() for state in states]
+    reads = torch.tensor([1, 3, 5, 7], device=DEV, dtype=torch.int32)
+    writes = torch.tensor([2, 4, 6, 8], device=DEV, dtype=torch.int32)
+    ring_slots = torch.tensor([9, 0, 10, 3], device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([1, 4, 2, 3], device=DEV, dtype=torch.int32)
+    for state, (rawv, rawk, gate, beta) in zip(expected, rings, strict=True):
+        commit_kda_replayssm_spec(
+            state,
+            rawv,
+            rawk,
+            gate,
+            beta,
+            reads,
+            accepted,
+            ring_len,
+            heads,
+            ring_indices=ring_slots,
+            dst_state_indices=writes,
+            null_block_id=-1,
+        )
+    descriptors = torch.tensor(
+        [
+            [state.data_ptr(), *(buffer.data_ptr() for buffer in layer_rings)]
+            for state, layer_rings in zip(actual, rings, strict=True)
+        ],
+        device=DEV,
+        dtype=torch.uint64,
+    )
+    commit_kda_replayssm_spec_batched(
+        descriptors,
+        reads.unsqueeze(0),
+        writes.unsqueeze(0),
+        ring_slots,
+        accepted,
+        max_cache_len=ring_len,
+        num_heads=heads,
+        num_value_heads=heads,
+        head_dim=dim,
+        state_stride=actual[0].stride(0),
+        rawv_stride=rings[0][0].stride(0),
+        rawk_stride=rings[0][1].stride(0),
+        gate_stride=rings[0][2].stride(0),
+        beta_stride=rings[0][3].stride(0),
+        layers_per_group=layers,
+    )
+    for loop_state, batched_state in zip(expected, actual, strict=True):
+        # Grid order differs between the folds; fp32 noise only.
+        torch.testing.assert_close(batched_state, loop_state, atol=5e-5, rtol=2e-3)
 
 
 def _window(n, t, pages=32, seed=0):
