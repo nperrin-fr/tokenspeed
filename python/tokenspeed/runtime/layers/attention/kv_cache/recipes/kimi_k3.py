@@ -28,7 +28,6 @@ plane's byte width so no parent is wasted.
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Mapping
 from functools import cached_property
 
@@ -36,6 +35,9 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.kda_backend import (
+    default_kda_decode_backend,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -297,12 +299,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def kda_decode_backend(self) -> str:
-        # Temporary A/B scaffolding; keep this paired with registry selection.
-        return (
-            "sgl_mtp"
-            if os.getenv("TOKENSPEED_KDA_MTP", "").strip().lower() == "sgl"
-            else "triton"
-        )
+        return default_kda_decode_backend()
 
     @cached_property
     def use_sgl_mtp(self) -> bool:

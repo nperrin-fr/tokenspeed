@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +33,9 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
+)
+from tokenspeed.runtime.layers.attention.kda_backend import (
+    default_kda_decode_backend,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
@@ -428,16 +430,10 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        # Temporary A/B scaffold: the env flag selects only the decode backend.
-        kda_decode_backend = (
-            "sgl_mtp"
-            if (os.getenv("TOKENSPEED_KDA_MTP", "").strip().lower() == "sgl")
-            else "triton"
-        )
         linear_attn_backend = KdaAttnBackend(
             config,
             kda_backend=kda_backend,
-            kda_decode_backend=kda_decode_backend,
+            kda_decode_backend=default_kda_decode_backend(),
         )
     else:
         linear_attn_backend = MambaAttnBackend(config)

@@ -114,7 +114,7 @@ def test_sgl_mtp_verify_selects_replay_ring_traits(monkeypatch) -> None:
 
     backend = object.__new__(KdaAttnBackend)
     backend._replay_active = True
-    backend.use_sgl_mtp = True
+    backend.kda_decode_backend = "sgl_mtp"
     backend.kda_recurrent_layout = "v_major"
     backend._replay_weights = {}
     backend.forward_metadata = SimpleNamespace(query_start_loc=torch.tensor([0, 2]))
@@ -166,6 +166,21 @@ def test_sgl_mtp_verify_selects_replay_ring_traits(monkeypatch) -> None:
         "split_producers": False,
         "replay_ring": True,
     }
+
+
+def test_sgl_mtp_decode_backend_derives_vmajor_layout(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hybrid_kda, "kda_replay_commit_supported", lambda *_a, **_k: False
+    )
+    backend = KdaAttnBackend(
+        _backend_config("cuda"),
+        kda_backend="fla",
+        kda_decode_backend="sgl_mtp",
+    )
+
+    assert backend.kda_decode_backend == "sgl_mtp"
+    assert backend.use_sgl_mtp
+    assert backend.kda_recurrent_layout == "v_major"
 
 
 def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:

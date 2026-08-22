@@ -97,18 +97,12 @@ def kda_replayssm_exact_fold_batched_kernel(
             other=0.0,
         ).to(tl.float32)
         b_g = tl.load(
-            gate
-            + ring_page * stride_g_slot
-            + (i_hv * MAX_CACHE_LEN + phys) * K
-            + o_k,
+            gate + ring_page * stride_g_slot + (i_hv * MAX_CACHE_LEN + phys) * K + o_k,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta
-            + ring_page * stride_beta_slot
-            + i_hv * MAX_CACHE_LEN
-            + phys
+            beta + ring_page * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
         b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
         b_h *= tl.exp(b_g[:, None])

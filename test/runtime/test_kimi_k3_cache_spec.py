@@ -84,7 +84,7 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
-        lambda dtype: False,
+        lambda dtype, **kwargs: False,
     )
     recipe, _, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -111,7 +111,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
-        lambda dtype: True,
+        lambda dtype, **kwargs: True,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -119,6 +119,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=8,
     )
+    recipe.__dict__["kda_decode_backend"] = "triton"
     conv_row_bytes = 4 * sum(
         field.payload_bytes
         for spec, fields in groups
@@ -140,6 +141,37 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         recipe.cache_budget_bytes - expected_workspace_bytes
     ) // layout.lcm_block_bytes - 1
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_sgl_replay_workspace_reserves_rings_and_placeholders(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype, **kwargs: True,
+    )
+    recipe, groups, _ = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    recipe.__dict__["kda_decode_backend"] = "sgl_mtp"
+    conv_fields = [
+        field
+        for spec, fields in groups
+        if spec.group_id != "full_attention"
+        for field in fields
+        if field.field_id.endswith(".conv_state")
+    ]
+    layer_count = len(conv_fields)
+    conv_placeholder_bytes = sum(field.payload_bytes for field in conv_fields)
+    ring_bytes_per_layer = 4 * 12 * 9 * (128 * 2 * 2 + 128 * 4 + 4)
+    tape_bytes_per_layer = 3 * 8 * (3 * 12 * 128) * 3 * 2
+
+    expected_workspace_bytes = conv_placeholder_bytes + layer_count * (
+        ring_bytes_per_layer + tape_bytes_per_layer
+    )
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+    assert recipe.setup().fixed_workspace_bytes == expected_workspace_bytes
 
 
 def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
