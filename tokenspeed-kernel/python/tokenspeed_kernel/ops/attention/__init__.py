@@ -1662,6 +1662,7 @@ def try_kda_fused_paged_verify(
     replay_conv_q: torch.Tensor | None = None,
     replay_conv_k: torch.Tensor | None = None,
     replay_conv_v: torch.Tensor | None = None,
+    replay_final_state: torch.Tensor | None = None,
     ring_indices: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
@@ -1728,6 +1729,7 @@ def try_kda_fused_paged_verify(
             "replay_conv_k": replay_conv_k,
             "replay_conv_v": replay_conv_v,
             "ring_indices": ring_indices,
+            "replay_final_state": replay_final_state,
         }
     return kernel(
         mixed_qkv=mixed_qkv,

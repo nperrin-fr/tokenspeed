@@ -78,7 +78,7 @@ def test_batched_replayssm_fold_matches_distinct_layer_loop():
     actual = [state.clone() for state in states]
     reads = torch.tensor([1, 3, 5, 7], device=DEV, dtype=torch.int32)
     writes = torch.tensor([2, 4, 6, 8], device=DEV, dtype=torch.int32)
-    ring_slots = torch.tensor([9, 0, 10, 3], device=DEV, dtype=torch.int32)
+    ring_slots = torch.tensor([9, 0, 10, 11], device=DEV, dtype=torch.int32)
     accepted = torch.tensor([1, 4, 2, 3], device=DEV, dtype=torch.int32)
     for state, (rawv, rawk, gate, beta) in zip(expected, rings, strict=True):
         commit_kda_replayssm_spec(
@@ -95,10 +95,33 @@ def test_batched_replayssm_fold_matches_distinct_layer_loop():
             dst_state_indices=writes,
             null_block_id=-1,
         )
+    final_states = [state.clone() for state in states]
+    full = torch.full_like(accepted, ring_len - 1)
+    for final_state, (rawv, rawk, gate, beta) in zip(final_states, rings, strict=True):
+        commit_kda_replayssm_spec(
+            final_state,
+            rawv,
+            rawk,
+            gate,
+            beta,
+            reads,
+            full,
+            ring_len,
+            heads,
+            ring_indices=ring_slots,
+            dst_state_indices=ring_slots,
+            null_block_id=-1,
+        )
     descriptors = torch.tensor(
         [
-            [state.data_ptr(), *(buffer.data_ptr() for buffer in layer_rings)]
-            for state, layer_rings in zip(actual, rings, strict=True)
+            [
+                state.data_ptr(),
+                *(buffer.data_ptr() for buffer in layer_rings),
+                final_state.data_ptr(),
+            ]
+            for state, layer_rings, final_state in zip(
+                actual, rings, final_states, strict=True
+            )
         ],
         device=DEV,
         dtype=torch.uint64,
@@ -121,7 +144,7 @@ def test_batched_replayssm_fold_matches_distinct_layer_loop():
         layers_per_group=layers,
     )
     for loop_state, batched_state in zip(expected, actual, strict=True):
-        # Grid order differs between the folds; fp32 noise only.
+        # Covers one full-accept request and three partial requests.
         torch.testing.assert_close(batched_state, loop_state, atol=5e-5, rtol=2e-3)
 
 

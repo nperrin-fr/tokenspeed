@@ -310,6 +310,7 @@ def cutedsl_kda_mtp_verify(
     replay_conv_k: torch.Tensor,
     replay_conv_v: torch.Tensor,
     ring_indices: torch.Tensor,
+    replay_final_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run CuTe MTP verify with caller-owned replay rings and conv tapes.
 
@@ -370,6 +371,7 @@ def cutedsl_kda_mtp_verify(
         replayssm_rawk=replay_rawk,
         replayssm_g=replay_g,
         replayssm_beta=replay_beta,
+        replayssm_final_state=replay_final_state,
     )
     return out.view(1, -1, num_heads, head_dim)
 

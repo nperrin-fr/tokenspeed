@@ -126,6 +126,7 @@ def test_sgl_mtp_verify_selects_replay_ring_traits(monkeypatch) -> None:
         torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
         torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
         torch.empty(2, 2, 128, 3, dtype=torch.bfloat16),
+        torch.empty(2, 1, 128, 128, dtype=torch.float32),
     )
     backend._sgl_replay_buffer = lambda _layer_id: rings
     selected = {}

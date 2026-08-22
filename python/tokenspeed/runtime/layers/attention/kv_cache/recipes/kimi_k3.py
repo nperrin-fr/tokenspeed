@@ -378,8 +378,17 @@ class KimiK3Recipe(CacheRecipe):
                     * conv_shape[1]
                     * torch.bfloat16.itemsize
                 )
+                final_state_bytes_per_layer = (
+                    self.attn_config.max_bs
+                    * heads
+                    * head_dim
+                    * head_dim
+                    * torch.float32.itemsize
+                )
                 return conv_placeholder_bytes + layer_count * (
-                    ring_bytes_per_layer + tape_bytes_per_layer
+                    ring_bytes_per_layer
+                    + tape_bytes_per_layer
+                    + final_state_bytes_per_layer
                 )
             payload_bytes_per_row = (
                 conv_shape[0] * torch.bfloat16.itemsize

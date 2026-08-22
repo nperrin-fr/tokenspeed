@@ -166,9 +166,10 @@ def test_sgl_replay_workspace_reserves_rings_and_placeholders(monkeypatch) -> No
     conv_placeholder_bytes = sum(field.payload_bytes for field in conv_fields)
     ring_bytes_per_layer = 4 * 12 * 9 * (128 * 2 * 2 + 128 * 4 + 4)
     tape_bytes_per_layer = 3 * 8 * (3 * 12 * 128) * 3 * 2
+    final_state_bytes_per_layer = 4 * 12 * 128 * 128 * 4
 
     expected_workspace_bytes = conv_placeholder_bytes + layer_count * (
-        ring_bytes_per_layer + tape_bytes_per_layer
+        ring_bytes_per_layer + tape_bytes_per_layer + final_state_bytes_per_layer
     )
     assert recipe.workspace_bytes() == expected_workspace_bytes
     assert recipe.setup().fixed_workspace_bytes == expected_workspace_bytes

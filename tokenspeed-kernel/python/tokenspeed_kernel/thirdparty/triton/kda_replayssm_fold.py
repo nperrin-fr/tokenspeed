@@ -216,6 +216,8 @@ def commit_kda_replayssm_spec(
 ) -> None:
     """Replay each accepted window from its checkpoint into a destination page.
 
+    The serving-only final-state shortcut lives in the batched descriptor path.
+
     Tiling clones the recurrent kernel (full-K rows, BV = min(np2(V), 32) cols,
     num_warps=1) so the folded checkpoint is bit-identical to the recurrent
     baseline's committed state. With extra_buffer (mamba_track_indices given) the

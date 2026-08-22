@@ -199,6 +199,11 @@ class KdaAttnBackend(MambaAttnBackend):
                             tape_q,
                             torch.empty_like(tape_q),
                             torch.empty_like(tape_q),
+                            torch.empty(
+                                (self.max_bs, layer_hv, layer_dim, layer_dim),
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
                         )
                     self._replay_descriptors = torch.tensor(
                         [
@@ -208,6 +213,7 @@ class KdaAttnBackend(MambaAttnBackend):
                                     buffer.data_ptr()
                                     for buffer in self._sgl_replay_buffer(layer_id)[:4]
                                 ),
+                                self._sgl_replay_buffer(layer_id)[7].data_ptr(),
                             ]
                             for layer_id in layer_ids
                         ],
@@ -737,6 +743,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 replay_conv_q=rings[4] if self.use_sgl_mtp else None,
                 replay_conv_k=rings[5] if self.use_sgl_mtp else None,
                 replay_conv_v=rings[6] if self.use_sgl_mtp else None,
+                replay_final_state=rings[7] if self.use_sgl_mtp else None,
                 ring_indices=ring_indices if self.use_sgl_mtp else None,
             )
             if fused_out is None:

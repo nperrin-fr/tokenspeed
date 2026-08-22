@@ -53,12 +53,13 @@ def kda_replayssm_exact_fold_batched_kernel(
     i_v, i_n, i_lh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_l, i_hv = i_lh // HV, i_lh % HV
     i_h = i_hv // (HV // H)
-    ab = i_l * 5
+    ab = i_l * 6
     state = tl.load(addresses + ab).to(tl.pointer_type(tl.float32))
     rawv = tl.load(addresses + ab + 1).to(tl.pointer_type(tl.bfloat16))
     rawk = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
     gate = tl.load(addresses + ab + 3).to(tl.pointer_type(tl.float32))
     beta = tl.load(addresses + ab + 4).to(tl.pointer_type(tl.float32))
+    final_state = tl.load(addresses + ab + 5).to(tl.pointer_type(tl.float32))
     group = i_l // layers_per_group
     read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
     write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
@@ -73,6 +74,18 @@ def kda_replayssm_exact_fold_batched_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
     state_off = i_hv * V * K + o_v[None, :] * K + o_k[:, None]
+    if steps == MAX_CACHE_LEN - 1:
+        b_h = tl.load(
+            final_state + ring_page * HV * V * K + state_off,
+            mask=mask_h,
+            other=0.0,
+        ).to(tl.float32)
+        tl.store(
+            state + write_page * stride_state_slot + state_off,
+            b_h,
+            mask=mask_h,
+        )
+        return
     b_h = tl.load(
         state + read_page * stride_state_slot + state_off,
         mask=mask_h,
@@ -135,7 +148,12 @@ def commit_kda_replayssm_spec_batched(
     layers_per_group: int,
     null_block_id: int = -1,
 ) -> None:
-    """Fold all descriptor-table layers in one launch with SGLang-equivalent math."""
+    """Fold all descriptor-table layers in one launch with SGLang-equivalent math.
+
+    ``addresses`` has rows ``[state, rawv, rawk, gate, beta, final_state]``.
+    """
+    if addresses.ndim != 2 or addresses.shape[1] != 6:
+        raise ValueError("expected ReplaySSM address table shape [layers, 6]")
     layers = addresses.shape[0]
     batch = accept_lens.numel()
     block_v = min(triton.next_power_of_2(head_dim), 32)
