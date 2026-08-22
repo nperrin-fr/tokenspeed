@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
-from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -44,6 +43,7 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
     logger,
 )
+from tokenspeed.runtime.layers.attention.kda_backend import resolve_kda_state_layout
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -53,11 +53,11 @@ KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
 KDA_DECODE_BACKENDS = ("triton", "sgl_mtp")
 
 
-def kda_recurrent_layout(kda_decode_backend: str) -> str:
-    """Derive the recurrent pool layout from platform and decode backend."""
-    if current_platform().is_cdna4:
-        return "v_major"
-    return "v_major" if kda_decode_backend == "sgl_mtp" else "k_major"
+def kda_recurrent_layout(
+    kda_decode_backend: str, speculative_num_draft_tokens: int = 1
+) -> str:
+    """Derive the recurrent pool layout from registered KDA kernels."""
+    return resolve_kda_state_layout(kda_decode_backend, speculative_num_draft_tokens)
 
 
 def _slice_kda_prefill_inputs(
@@ -105,7 +105,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 "kda_decode_backend must be one of "
                 f"{', '.join(KDA_DECODE_BACKENDS)}; got {self.kda_decode_backend!r}"
             )
-        self.kda_recurrent_layout = kda_recurrent_layout(self.kda_decode_backend)
+        self.kda_recurrent_layout = kda_recurrent_layout(
+            self.kda_decode_backend, self.speculative_num_draft_tokens
+        )
         if self.use_sgl_mtp and self.dtype is not torch.bfloat16:
             raise ValueError("SGL KDA MTP requires bfloat16 activations")
         self._replay_active = kda_replay_commit_supported(

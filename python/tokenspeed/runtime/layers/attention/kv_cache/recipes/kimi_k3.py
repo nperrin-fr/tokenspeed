@@ -32,11 +32,11 @@ from collections.abc import Mapping
 from functools import cached_property
 
 import torch
-from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kda_backend import (
     default_kda_decode_backend,
+    resolve_kda_state_layout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
@@ -306,6 +306,13 @@ class KimiK3Recipe(CacheRecipe):
         return self.kda_decode_backend == "sgl_mtp"
 
     @cached_property
+    def kda_recurrent_layout(self) -> str:
+        return resolve_kda_state_layout(
+            self.kda_decode_backend,
+            int(getattr(self.server_args, "speculative_num_draft_tokens", 1)),
+        )
+
+    @cached_property
     def replay_kda(self) -> bool:
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
@@ -315,11 +322,7 @@ class KimiK3Recipe(CacheRecipe):
         return bool(
             kda_replay_commit_supported(
                 self.attn_config.dtype,
-                recurrent_layout=(
-                    "v_major"
-                    if current_platform().is_cdna4 or self.use_sgl_mtp
-                    else "k_major"
-                ),
+                recurrent_layout=self.kda_recurrent_layout,
                 replay_ring=self.use_sgl_mtp,
             )
         )
