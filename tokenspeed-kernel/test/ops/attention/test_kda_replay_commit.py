@@ -183,6 +183,7 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             STRIDE_CONV=xs[0]["conv_pool"].stride(0),
             CONV_DIM=conv_dim,
             LAYERS_PER_GROUP=1,
+            COLS=10,
             BLOCK=block_size,
             num_warps=min(8, max(1, block_size // 128)),
         )
@@ -700,6 +701,155 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         lower_bound=LOWER_BOUND,
     )
     assert not torch.equal(wrong, no_store)
+
+
+def _recover_descriptor(xs, corrs, kns):
+    """The twelve-column table: the recovery commit reads 8..11."""
+    rows = []
+    for x, corr, kn in zip(xs, corrs, kns, strict=True):
+        rows.append(
+            [
+                x["qkv_raw"].data_ptr(),
+                x["conv_w"].data_ptr(),
+                x["conv_pool"].data_ptr(),
+                x["f_a"].data_ptr(),
+                x["w_fb"].data_ptr(),
+                x["beta"].data_ptr(),
+                x["A_log"].data_ptr(),
+                x["dt_bias"].data_ptr(),
+                x["h_pool"].data_ptr(),
+                x["gate_scratch"].data_ptr(),
+                corr.data_ptr(),
+                kn.data_ptr(),
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.uint64, device=DEV)
+
+
+def _fold_reference(h0, corr, kn, gate, accepted, n, t):
+    """The forward recurrence the backward fold has to reproduce, in float64.
+
+    ``kn`` is the already-normalised k: verify stores it after its own
+    normalisation, so the commit -- and this reference -- must not repeat it.
+    """
+    h = h0.double().clone()
+    for step in range(accepted):
+        tok = n * t + step
+        k = kn[tok].double().view(HV, K)
+        c = corr[tok].double().view(HV, K)
+        g = gate[tok].double().view(HV, K)
+        h = h * g.exp()[:, None, :] + c[:, :, None] * k[:, None, :]
+    return h
+
+
+@pytest.mark.parametrize(
+    ("accepted", "t"),
+    [
+        ([0, 0, 0], 4),
+        ([4, 4, 4], 4),
+        ([0, 2, 4], 4),
+        ([8, 0, 3], 8),
+    ],
+    ids=["none-accepted", "all-accepted", "mixed", "mixed-t8"],
+)
+def test_recover_fold_reproduces_the_recurrence_it_replaces(accepted, t):
+    """Folding backwards must equal scanning forwards, at every accept length."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        batched_recurrent_kda_recover_commit,
+    )
+
+    layers, n = 2, len(accepted)
+    pages = 32
+    torch.manual_seed(4021 + t)
+    xs = [_window(n, t, pages=pages, seed=311 + layer) for layer in range(layers)]
+    corrs, kns = [], []
+    for x in xs:
+        # fp32 because both enter the fold multiplicatively: verify holds them
+        # in registers at this width and rounding here would be new error, not
+        # inherited error.
+        corrs.append(torch.randn(n * t, P, device=DEV, dtype=torch.float32))
+        raw_k = torch.randn(n * t, HV, K, device=DEV, dtype=torch.float32)
+        kns.append(
+            (raw_k / (raw_k.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()).view(n * t, P)
+        )
+        x["gate_scratch"].copy_(
+            -0.5 * torch.rand(n * t, P, device=DEV, dtype=torch.float32)
+        )
+    # Distinct read and write pages, so a fold that wrote in place would show.
+    reads = torch.arange(1, n + 1, device=DEV, dtype=torch.int32)
+    writes = torch.arange(pages - n, pages, device=DEV, dtype=torch.int32)
+    before = [x["h_pool"].clone() for x in xs]
+    acc = torch.tensor(accepted, device=DEV, dtype=torch.int32)
+
+    batched_recurrent_kda_recover_commit(
+        _recover_descriptor(xs, corrs, kns),
+        reads.view(1, n),
+        writes.view(1, n),
+        acc,
+        draft_token_num=t,
+        num_heads=HV,
+        head_dim=K,
+        corr_stride=P,
+        kn_stride=P,
+        gate_stride=P,
+        state_stride=xs[0]["h_pool"].stride(0),
+        conv_stride=xs[0]["conv_pool"].stride(0),
+        qkv_stride=xs[0]["qkv_raw"].stride(0),
+        layers_per_group=layers,
+    )
+    torch.cuda.synchronize()
+
+    for x, corr, kn, h0 in zip(xs, corrs, kns, before, strict=True):
+        for i in range(n):
+            want = _fold_reference(
+                h0[int(reads[i])], corr, kn, x["gate_scratch"], accepted[i], i, t
+            )
+            got = x["h_pool"][int(writes[i])].double()
+            torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_recover_fold_actually_reads_the_correction_cache():
+    """A fold that ignored its cache would pass every agreement check above."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        batched_recurrent_kda_recover_commit,
+    )
+
+    layers, n, t, pages = 2, 3, 4, 32
+    torch.manual_seed(77)
+    reads = torch.arange(1, n + 1, device=DEV, dtype=torch.int32)
+    writes = torch.arange(pages - n, pages, device=DEV, dtype=torch.int32)
+    acc = torch.full((n,), t, device=DEV, dtype=torch.int32)
+
+    def run(scale):
+        xs = [_window(n, t, pages=pages, seed=909 + layer) for layer in range(layers)]
+        corrs = [
+            scale * torch.randn(n * t, P, device=DEV, dtype=torch.float32) for _ in xs
+        ]
+        kns = [torch.randn(n * t, P, device=DEV, dtype=torch.float32) for _ in xs]
+        for x in xs:
+            x["gate_scratch"].copy_(
+                -0.5 * torch.rand(n * t, P, device=DEV, dtype=torch.float32)
+            )
+        batched_recurrent_kda_recover_commit(
+            _recover_descriptor(xs, corrs, kns),
+            reads.view(1, n),
+            writes.view(1, n),
+            acc,
+            draft_token_num=t,
+            num_heads=HV,
+            head_dim=K,
+            corr_stride=P,
+            kn_stride=P,
+            gate_stride=P,
+            state_stride=xs[0]["h_pool"].stride(0),
+            conv_stride=xs[0]["conv_pool"].stride(0),
+            qkv_stride=xs[0]["qkv_raw"].stride(0),
+            layers_per_group=layers,
+        )
+        torch.cuda.synchronize()
+        return torch.stack([x["h_pool"][writes.long()] for x in xs])
+
+    assert not torch.allclose(run(1.0), run(4.0))
 
 
 @requires_registered_replay

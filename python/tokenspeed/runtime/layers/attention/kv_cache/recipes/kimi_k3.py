@@ -341,6 +341,11 @@ class KimiK3Recipe(CacheRecipe):
                 + head_dim * torch.bfloat16.itemsize
                 + heads * torch.bfloat16.itemsize
                 + heads * head_dim * torch.float32.itemsize
+                # The rank-1 correction and its normalised k, which verify
+                # hands the commit instead of it re-deriving them. Reserved
+                # unconditionally so enabling the path cannot move the
+                # allocation out from under the cache arena.
+                + 2 * heads * head_dim * torch.float32.itemsize
             )
             return conv_bytes + layer_count * rows * payload_bytes_per_row
         verify_rows = self.attn_config.max_bs * (

@@ -29,7 +29,7 @@ DEV = "cuda"
 
 
 class _Harness:
-    def __init__(self, *, eager_replay: bool, seed: int = 0):
+    def __init__(self, *, eager_replay: bool, seed: int = 0, recover: bool = False):
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(DEV, usable_pages=24)
         self.contract = self.pool.arena.runtime_contract
@@ -45,6 +45,13 @@ class _Harness:
             max_bs=8,
         )
         self.backend = KdaAttnBackend(config)
+        # The recovery commit folds verify's own cached corrections, so what it
+        # commits carries the split producers' bfloat16 convolution -- the same
+        # arithmetic the accepted tokens came from, but not what the
+        # inline-producer scratch arm recomputes in fp32. Arms compared against
+        # that one pin the replay commit so they compare like with like.
+        if not recover:
+            self.backend._recover_active = False
         self.backend.set_kv_pool(self.pool)
         if eager_replay and not self.backend._replay_active:
             pytest.skip("KDA replay commit kernel unavailable")

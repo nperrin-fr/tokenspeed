@@ -704,6 +704,8 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     A_log,
     dt_bias,
     o,
+    corr_out,  # [N*T, HV*V] optional rank-1 correction per position
+    kn_out,  # [N*T, HV*K] optional normalised k per position
     h_pool,  # committed recurrent state (read-only here)
     h_pool_out,  # per-position recurrent states (verify scratch)
     read_indices,  # [N] committed page per request (-1 = fresh)
@@ -714,6 +716,8 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     stride_graw_tok: tl.constexpr,
     stride_conv_qkv_tok: tl.constexpr,
     stride_beta_tok: tl.constexpr,
+    stride_corr_tok: tl.constexpr,
+    stride_kn_tok: tl.constexpr,
     scale: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -729,6 +733,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     stride_conv_page: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    HAS_RECOVER_SINKS: tl.constexpr,
     HAS_PRECOMPUTED_GATE: tl.constexpr,
     HAS_PRECOMPUTED_CONV: tl.constexpr,
     STORE_STATES: tl.constexpr,
@@ -889,6 +894,21 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
         b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
         b_beta = tl.sigmoid(b_beta)
         b_v *= b_beta
+        if HAS_RECOVER_SINKS:
+            # The rank-1 correction is the one term a recovery commit cannot
+            # rebuild for itself: it is a function of the running state.
+            tl.store(
+                corr_out + tok * stride_corr_tok + i_hv * V + o_v,
+                b_v.to(corr_out.dtype.element_ty),
+                mask=mask_v,
+            )
+            # Every V tile normalises the same k, so one of them owns the row.
+            if i_v == 0:
+                tl.store(
+                    kn_out + tok * stride_kn_tok + i_hv * K + o_k,
+                    b_k.to(kn_out.dtype.element_ty),
+                    mask=mask_k,
+                )
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], axis=1)
         tl.store(
@@ -1101,6 +1121,8 @@ def fused_recurrent_kda_verify_megafuse(
     bv: int | None = None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
+    corr_out: torch.Tensor | None = None,
+    kn_out: torch.Tensor | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> torch.Tensor:
@@ -1146,6 +1168,12 @@ def fused_recurrent_kda_verify_megafuse(
             raise ValueError(f"g_raw must have dtype {f_a.dtype}, got {g_raw.dtype}")
         if g_raw.stride(-1) != 1:
             raise ValueError("g_raw must have last-dimension stride 1")
+    # One contract: a half-specified pair would alias the spare sink onto the
+    # attention output. (K == V is structural here -- both are ``head_dim`` --
+    # which is what lets the recovery commit share one row index across the
+    # correction and k caches.)
+    if (corr_out is None) != (kn_out is None):
+        raise ValueError("corr_out and kn_out are one contract: pass both or neither")
     if conv_qkv is not None:
         if store_states:
             raise ValueError("conv_qkv requires store_states=False")
@@ -1186,6 +1214,8 @@ def fused_recurrent_kda_verify_megafuse(
         A_log=A_log,
         dt_bias=dt_bias,
         o=out,
+        corr_out=out if corr_out is None else corr_out,
+        kn_out=out if kn_out is None else kn_out,
         h_pool=h_pool,
         h_pool_out=h_pool_out,
         read_indices=read_indices,
@@ -1196,6 +1226,8 @@ def fused_recurrent_kda_verify_megafuse(
         stride_graw_tok=0 if g_raw is None else g_raw.stride(0),
         stride_conv_qkv_tok=0 if conv_qkv is None else conv_qkv.stride(0),
         stride_beta_tok=beta.stride(0),
+        stride_corr_tok=0 if corr_out is None else corr_out.stride(0),
+        stride_kn_tok=0 if kn_out is None else kn_out.stride(0),
         scale=scale,
         T=T,
         H=HV,
@@ -1211,6 +1243,7 @@ def fused_recurrent_kda_verify_megafuse(
         stride_conv_page=conv_pool.stride(0),
         stride_conv_out_page=conv_out.stride(0),
         HAS_DT_BIAS=dt_bias is not None,
+        HAS_RECOVER_SINKS=corr_out is not None,
         HAS_PRECOMPUTED_GATE=g_raw is not None,
         HAS_PRECOMPUTED_CONV=conv_qkv is not None,
         STORE_STATES=store_states,
@@ -2231,11 +2264,12 @@ def batched_kda_commit_conv_window_kernel(
     STRIDE_CONV: tl.constexpr,
     CONV_DIM: tl.constexpr,
     LAYERS_PER_GROUP: tl.constexpr,
+    COLS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Publish convolution windows after every recurrent program has read."""
     i_l, i_n, i_cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    ab = i_l * 10
+    ab = i_l * COLS
     qkv = tl.load(addresses + ab).to(tl.pointer_type(tl.bfloat16))
     conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
     group = i_l // LAYERS_PER_GROUP
@@ -2434,6 +2468,178 @@ def kda_gate_project_dual(
     return g_raw_out
 
 
+@triton.jit
+def batched_recurrent_kda_recover_commit_kernel(
+    addresses,
+    read_indices,
+    write_indices,
+    accepted_length,
+    B,
+    T: tl.constexpr,
+    STRIDE_CORR: tl.constexpr,
+    STRIDE_KN: tl.constexpr,
+    STRIDE_GATE: tl.constexpr,
+    STRIDE_STATE: tl.constexpr,
+    LAYERS_PER_GROUP: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    COLS: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Commit the accepted prefix by folding verify's rank-1 corrections back.
+
+    The replay form re-derives every position from raw inputs, which forces the
+    running state through a ``[BV, BK] -> [BV]`` reduction each step because the
+    correction depends on it. Verify has already computed those corrections, so
+    reading them back turns the whole window into a decayed sum: one fused
+    multiply-add per element per step and no cross-lane reduction. Folding
+    backwards is what makes the decay a single running product.
+    """
+    i_l, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    ab = i_l * COLS
+    gate = tl.load(addresses + ab + 9).to(tl.pointer_type(tl.float32))
+    corr = tl.load(addresses + ab + 10).to(tl.pointer_type(tl.float32))
+    kn = tl.load(addresses + ab + 11).to(tl.pointer_type(tl.float32))
+    state = tl.load(addresses + ab + 8).to(tl.pointer_type(tl.float32))
+    group = i_l // LAYERS_PER_GROUP
+
+    read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
+    write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
+    steps = tl.load(accepted_length + i_n).to(tl.int32)
+    steps = tl.minimum(tl.maximum(steps, 0), T)
+    read_ok, write_ok = read_page >= 0, write_page >= 0
+
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+    kf = i_hv * K + o_k
+
+    for i_v in tl.range(0, K, BV, loop_unroll_factor=1):
+        o_v = i_v + tl.arange(0, BV)
+        mask_v = o_v < K
+        mask_h = mask_v[:, None] & mask_k[None, :]
+        state_off = o_v[:, None] * K + o_k[None, :]
+        ph = state + read_page * STRIDE_STATE + i_hv * K * K + state_off
+        b_h = tl.load(
+            ph, mask=mask_h & read_ok, other=0.0, eviction_policy="evict_first"
+        ).to(tl.float32)
+
+        fold = tl.zeros([BV, BK], dtype=tl.float32)
+        decay = tl.full([BK], 1.0, tl.float32)
+        for back in range(steps):
+            tok = i_n * T + (steps - 1 - back)
+            b_k = tl.load(kn + tok * STRIDE_KN + kf, mask=mask_k, other=0.0)
+            b_c = tl.load(
+                corr + tok * STRIDE_CORR + i_hv * K + o_v, mask=mask_v, other=0.0
+            )
+            b_g = tl.load(gate + tok * STRIDE_GATE + kf, mask=mask_k, other=0.0)
+            # Decay folded into k first, so the tile costs one fma per element.
+            b_kd = b_k * decay
+            fold += b_c[:, None] * b_kd[None, :]
+            decay *= tl.exp(b_g)
+
+        b_h = b_h * decay[None, :] + fold
+        po = state + write_page * STRIDE_STATE + i_hv * K * K + state_off
+        tl.store(po, b_h, mask=mask_h & write_ok, eviction_policy="evict_first")
+
+
+def batched_recurrent_kda_recover_commit(
+    addresses: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    corr_stride: int,
+    kn_stride: int,
+    gate_stride: int,
+    state_stride: int,
+    conv_stride: int,
+    qkv_stride: int,
+    layers_per_group: int,
+) -> None:
+    """Commit every descriptor-table layer from verify's cached corrections.
+
+    Args:
+        addresses: ``[layers, 12]`` device pointer table; columns 8, 9, 10 and
+            11 are the state pool, the activated gate, the correction and the
+            normalised k, all fp32. The raw-input columns are unread here and
+            stay for the convolution window. The caches are fp32 because both
+            enter the fold multiplicatively: in bfloat16 the committed state
+            lands 1e-2 off the recurrence it is meant to reproduce, which is
+            four orders worse than the path it replaces.
+        read_indices: ``[groups, batch]`` committed page per request.
+        write_indices: ``[groups, batch]`` destination page per request.
+        accepted_length: ``[batch]`` accepted draft positions.
+        draft_token_num: draft positions per request.
+        num_heads: value heads on this rank.
+        head_dim: per-head channel count.
+        corr_stride: row stride of the correction cache.
+        kn_stride: row stride of the normalised-k cache.
+        gate_stride: row stride of the activated gate.
+        state_stride: page stride of the recurrent state pool.
+        conv_stride: page stride of the convolution pool.
+        qkv_stride: row stride of the raw q|k|v payload.
+        layers_per_group: layers sharing one cache group.
+    """
+    if head_dim != 128:
+        raise ValueError("batched KDA recovery currently requires head_dim=128")
+    if addresses.shape[1] != 12:
+        raise ValueError(
+            f"recovery needs a 12-column descriptor table, got {addresses.shape[1]}"
+        )
+    layers = addresses.shape[0]
+    batch = accepted_length.numel()
+    if layers != read_indices.shape[0] * layers_per_group:
+        raise ValueError(
+            f"{layers} layers cannot split into {read_indices.shape[0]} groups "
+            f"of {layers_per_group}"
+        )
+    batched_recurrent_kda_recover_commit_kernel[(layers, batch, num_heads)](
+        addresses,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_CORR=corr_stride,
+        STRIDE_KN=kn_stride,
+        STRIDE_GATE=gate_stride,
+        STRIDE_STATE=state_stride,
+        LAYERS_PER_GROUP=layers_per_group,
+        NUM_GROUPS=read_indices.shape[0],
+        COLS=12,
+        HV=num_heads,
+        K=head_dim,
+        BK=triton.next_power_of_2(head_dim),
+        BV=32,
+        num_warps=1,
+        num_stages=2,
+    )
+    conv_dim = 3 * num_heads * head_dim
+    conv_block = 128
+    batched_kda_commit_conv_window_kernel[
+        (layers, batch, triton.cdiv(conv_dim, conv_block))
+    ](
+        addresses,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_QKV=qkv_stride,
+        STRIDE_CONV=conv_stride,
+        CONV_DIM=conv_dim,
+        LAYERS_PER_GROUP=layers_per_group,
+        COLS=12,
+        BLOCK=conv_block,
+        num_warps=1,
+    )
+
+
 def batched_recurrent_kda_replay_commit(
     addresses: torch.Tensor,
     read_indices: torch.Tensor,
@@ -2531,6 +2737,7 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_CONV=conv_stride,
         CONV_DIM=conv_dim,
         LAYERS_PER_GROUP=layers_per_group,
+        COLS=10,
         BLOCK=conv_block,
         num_warps=1,
     )

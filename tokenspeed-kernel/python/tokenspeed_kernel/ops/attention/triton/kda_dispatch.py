@@ -111,6 +111,8 @@ def _nvidia_fused_verify(
     store_states: bool,
     split_producers: bool = False,
     gate_out: torch.Tensor | None = None,
+    corr_out: torch.Tensor | None = None,
+    kn_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_kda_verify_conv_update,
@@ -178,6 +180,8 @@ def _nvidia_fused_verify(
         store_states=store_states,
         g_raw=g_raw,
         conv_qkv=conv_qkv,
+        corr_out=corr_out,
+        kn_out=kn_out,
     ).view(1, -1, num_heads, head_dim)
 
 
@@ -314,6 +318,9 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         # Only this arrangement runs the producers, so only it can fill a
         # gate sink for replay; callers ask for the trait before relying on it.
         "emits_gate": frozenset({True}),
+        # The rank-1 correction is an intermediate of the scan, so a kernel
+        # that does not run the scan cannot hand it over.
+        "emits_correction": frozenset({True}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
@@ -337,6 +344,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
     draft_token_num: int,
     lower_bound: float | None,
     gate_out: torch.Tensor | None = None,
+    corr_out: torch.Tensor | None = None,
+    kn_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers."""
     return _nvidia_fused_verify(
@@ -360,6 +369,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
         store_states=False,
         split_producers=True,
         gate_out=gate_out,
+        corr_out=corr_out,
+        kn_out=kn_out,
     )
 
 
@@ -570,6 +581,64 @@ def triton_nvidia_kda_batched_replay_commit(
         layers_per_group=layers_per_group,
         lower_bound=lower_bound,
         gate_ready=gate_ready,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="triton_nvidia_kda_batched_recover_commit",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    # Reached only by name: the resolver overrides, so ranking below the
+    # replay kernels keeps a bare flat_state request from ever landing here.
+    priority=Priority.PERFORMANT,
+    traits={
+        "flat_state": frozenset({True}),
+        "batched_layers": frozenset({True}),
+        "cached_correction": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "flat_kv", "fusion", "speculative", "batched_layers"},
+)
+def triton_nvidia_kda_batched_recover_commit(
+    descriptors: torch.Tensor,
+    *,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    corr_stride: int,
+    kn_stride: int,
+    gate_stride: int,
+    state_stride: int,
+    conv_stride: int,
+    qkv_stride: int,
+    layers_per_group: int,
+) -> None:
+    """Fold verify's cached corrections into every layer's committed state."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        batched_recurrent_kda_recover_commit,
+    )
+
+    batched_recurrent_kda_recover_commit(
+        descriptors,
+        read_indices,
+        write_indices,
+        accepted_length,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        corr_stride=corr_stride,
+        kn_stride=kn_stride,
+        gate_stride=gate_stride,
+        state_stride=state_stride,
+        conv_stride=conv_stride,
+        qkv_stride=qkv_stride,
+        layers_per_group=layers_per_group,
     )
 
 

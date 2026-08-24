@@ -142,7 +142,9 @@ __all__ = [
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
     "kda_replay_commit_supported",
+    "kda_verify_emits_correction",
     "kda_verify_emits_gate",
+    "resolve_kda_batched_recover_commit",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1659,7 +1661,11 @@ def try_kda_fused_paged_decode(
 
 
 def _kda_fused_paged_verify_traits(
-    *, store_states: bool, recurrent_layout: str, emits_gate: bool = False
+    *,
+    store_states: bool,
+    recurrent_layout: str,
+    emits_gate: bool = False,
+    emits_correction: bool = False,
 ) -> dict[str, object]:
     """The trait set the verify entry point and its probes both select on.
 
@@ -1674,6 +1680,8 @@ def _kda_fused_paged_verify_traits(
     }
     if emits_gate:
         traits["emits_gate"] = True
+    if emits_correction:
+        traits["emits_correction"] = True
     return traits
 
 
@@ -1701,6 +1709,8 @@ def try_kda_fused_paged_verify(
     solution: str | None = None,
     store_states: bool = True,
     gate_out: torch.Tensor | None = None,
+    corr_out: torch.Tensor | None = None,
+    kn_out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1737,6 +1747,7 @@ def try_kda_fused_paged_verify(
                 store_states=store_states,
                 recurrent_layout=recurrent_layout,
                 emits_gate=gate_out is not None,
+                emits_correction=corr_out is not None,
             ),
             solution=solution,
             override=override,
@@ -1745,6 +1756,7 @@ def try_kda_fused_paged_verify(
         return None
     return kernel(
         **({} if gate_out is None else {"gate_out": gate_out}),
+        **({} if corr_out is None else {"corr_out": corr_out, "kn_out": kn_out}),
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
@@ -1920,6 +1932,76 @@ def kda_replay_commit_supported(
     except NoKernelFoundError:
         return False
     return True
+
+
+def kda_verify_emits_correction(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+    recurrent_layout: str | None = None,
+) -> bool:
+    """Whether fused verify can hand the recovery commit its rank-1 corrections.
+
+    The correction is an intermediate of the scan -- what the running state
+    contributes at each position -- so only a kernel that runs the scan can
+    produce it. Ask once at setup: the recovery commit is only correct when
+    every layer's correction is this round's.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+        recurrent_layout: Layout of the committed state; the platform default
+            when omitted.
+
+    Returns:
+        ``True`` when a registered verify kernel fills the correction sinks.
+    """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits=_kda_fused_paged_verify_traits(
+                store_states=False,
+                recurrent_layout=recurrent_layout,
+                emits_gate=True,
+                emits_correction=True,
+            ),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def resolve_kda_batched_recover_commit(dtype: torch.dtype = torch.bfloat16):
+    """Resolve the all-layer recovery commit once, or return ``None``.
+
+    Mirrors ``resolve_kda_batched_replay_commit``: the batched kernels
+    dereference raw descriptor addresses as bfloat16, so other dtypes stay on
+    the per-layer path.
+    """
+    if dtype is not torch.bfloat16:
+        return None
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        return select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={
+                "flat_state": True,
+                "batched_layers": True,
+                "cached_correction": True,
+            },
+            override="triton_nvidia_kda_batched_recover_commit",
+        )
+    except NoKernelFoundError:
+        return None
 
 
 def kda_verify_emits_gate(
