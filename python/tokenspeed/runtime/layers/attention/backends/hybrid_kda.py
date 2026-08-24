@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
+    kda_verify_emits_gate,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
@@ -106,6 +107,13 @@ class KdaAttnBackend(MambaAttnBackend):
             self.dtype, recurrent_layout=self.kda_recurrent_layout
         )
         self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
+        # Verify already reduces f_a against f_b; asked for a sink it keeps the
+        # activated gate too, and replay stops reprojecting what it just saw.
+        # Resolved here because the answer is a property of the registry, not
+        # of the batch, and a per-step probe would guess under graph capture.
+        self._verify_emits_gate = self._replay_active and kda_verify_emits_gate(
+            self.dtype, recurrent_layout=self.kda_recurrent_layout
+        )
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
         self._replay_descriptors = None
@@ -302,6 +310,7 @@ class KdaAttnBackend(MambaAttnBackend):
                         conv_width=conv_width,
                         layers_per_group=layers_per_group,
                         lower_bound=next(iter(lower_bounds)),
+                        gate_ready=self._verify_emits_gate,
                     )
 
                 self._batched_replay_launch = launch
@@ -525,7 +534,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 raise RuntimeError(
                     "KDA eager replay requires f_a_out and a bias-free convolution"
                 )
-            qkv, f_a, beta, _ = self._replay_payload(layer_id)
+            qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             capture_replay_payload(
                 (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
@@ -570,6 +579,20 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bound=lower_bound,
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
+                # The bound is what makes an activated gate well defined, and
+                # it is also what admits a layer to the batched commit that
+                # reads the sink -- one fact, so the two cannot disagree.
+                # The commit reads one row per accepted position of the batch
+                # this same forward produced, and the graph wrapper runs the
+                # forward at the padded batch size, so these rows are always a
+                # superset of the ones it will read. Narrowing the forward to
+                # the real batch without narrowing the accept lengths with it
+                # would leave the padded tail on a previous round's gate.
+                gate_out=(
+                    gate[:rows, : num_value_heads * head_v_dim]
+                    if self._verify_emits_gate and lower_bound is not None
+                    else None
+                ),
             )
             if fused_out is None:
                 raise RuntimeError(

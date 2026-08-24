@@ -110,10 +110,12 @@ def _nvidia_fused_verify(
     lower_bound: float | None,
     store_states: bool,
     split_producers: bool = False,
+    gate_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_kda_verify_conv_update,
         fused_recurrent_kda_verify_megafuse,
+        kda_gate_project_dual,
     )
 
     conv_qkv = None
@@ -128,7 +130,31 @@ def _nvidia_fused_verify(
             head_dim=head_dim,
             draft_token_num=draft_token_num,
         )
-        g_raw = torch.mm(f_a_out, f_b_weight.t())
+        if gate_out is None:
+            # Nothing downstream wants the activated copy, so the GEMM stands:
+            # it is the faster way to get the bare projection on its own.
+            g_raw = torch.mm(f_a_out, f_b_weight.t())
+        elif lower_bound is None:
+            raise ValueError(
+                "KDA verify fills a gate sink only for the bounded gate; "
+                "the softplus form leaves replay to reproject"
+            )
+        else:
+            # One fp32 reduction serves both the scan and the replay: the
+            # activated copy it leaves behind is what the commit would
+            # otherwise spend a second projection rebuilding.
+            g_raw = f_a_out.new_empty((f_a_out.shape[0], num_heads * head_dim))
+            kda_gate_project_dual(
+                f_a_out,
+                f_b_weight,
+                A_log,
+                dt_bias,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                lower_bound=lower_bound,
+                g_raw_out=g_raw,
+                gate_out=gate_out,
+            )
 
     return fused_recurrent_kda_verify_megafuse(
         mixed_qkv,
@@ -285,6 +311,9 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
+        # Only this arrangement runs the producers, so only it can fill a
+        # gate sink for replay; callers ask for the trait before relying on it.
+        "emits_gate": frozenset({True}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
@@ -307,6 +336,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    gate_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers."""
     return _nvidia_fused_verify(
@@ -329,6 +359,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
         lower_bound=lower_bound,
         store_states=False,
         split_producers=True,
+        gate_out=gate_out,
     )
 
 
@@ -513,6 +544,7 @@ def triton_nvidia_kda_batched_replay_commit(
     conv_width: int,
     layers_per_group: int,
     lower_bound: float,
+    gate_ready: bool = False,
 ) -> None:
     """Replay every KDA layer described by stable device pointer tables."""
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
@@ -537,6 +569,7 @@ def triton_nvidia_kda_batched_replay_commit(
         conv_width=conv_width,
         layers_per_group=layers_per_group,
         lower_bound=lower_bound,
+        gate_ready=gate_ready,
     )
 
 

@@ -19,6 +19,8 @@ the kernel is unchanged.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -2260,6 +2262,178 @@ def batched_kda_commit_conv_window_kernel(
     tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
 
 
+@functools.lru_cache(maxsize=None)
+def _dual_gate_tiling(rows: int, head_dim: int) -> tuple[int, int, int]:
+    """Rows and channels per program, and the warps to run them with.
+
+    Swept over every row count the decode graphs are captured at, with both
+    crossings measured from either side: the narrow tile wins by 7-8% under
+    three requests, the wide channel block by 7-13% from forty up, and between
+    them the two agree to within 2%. The row block cannot go below the 16 a
+    tensor-core ``tl.dot`` needs, so the smallest batches pay for padding
+    instead of falling back to an FMA reduction -- that form ties here but
+    costs 4.5x at thirty-two requests and 5.6x at sixty-four. Memoized because
+    this sits in front of every launch, once per layer per step.
+    """
+    block_k = 16 if rows <= 16 else 32 if rows <= 256 else 64
+    return (
+        16 if rows <= 16 else 32,
+        min(block_k, triton.next_power_of_2(head_dim)),
+        4 if rows <= 16 else 8,
+    )
+
+
+@triton.jit
+def kda_gate_project_dual_kernel(
+    f_a,
+    w_fb,
+    A_log,
+    dt_bias,
+    g_raw_out,
+    gate_out,
+    rows,
+    stride_fa: tl.constexpr,
+    stride_graw: tl.constexpr,
+    stride_gate: tl.constexpr,
+    lower_bound: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    D_FA: tl.constexpr,
+    BK: tl.constexpr,
+    BT: tl.constexpr,
+    HAS_GATE_OUT: tl.constexpr,
+):
+    """Project the f_b gate once and emit both forms the round needs.
+
+    Verify wants the bare projection in bf16, which it biases and activates
+    itself; replay wants the activated fp32 gate. Today those are two passes --
+    a per-layer GEMM and a second full projection during the commit -- and the
+    second one exists only because the first threw the fp32 accumulator away.
+    Keeping it costs one extra store on a reduction that has to happen anyway.
+    """
+    i_hv, i_tb, i_kb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    o_t = i_tb * BT + tl.arange(0, BT)
+    o_k = i_kb * BK + tl.arange(0, BK)
+    o_fa = tl.arange(0, D_FA)
+    mask_t = o_t < rows
+    mask_k = o_k < K
+    gc = i_hv * K + o_k
+    fa = tl.load(
+        f_a + o_t[:, None] * stride_fa + o_fa[None, :],
+        mask=mask_t[:, None],
+        other=0.0,
+    )
+    # Transposed so the contraction is the contiguous axis of both operands;
+    # f_b is a few hundred KB and every row block rereads it out of L2.
+    wfb = tl.load(
+        w_fb + gc[None, :] * D_FA + o_fa[:, None], mask=mask_k[None, :], other=0.0
+    )
+    proj = tl.dot(fa, wfb)
+    store_mask = mask_t[:, None] & mask_k[None, :]
+    tl.store(
+        g_raw_out + o_t[:, None] * stride_graw + gc[None, :],
+        proj.to(g_raw_out.dtype.element_ty),
+        mask=store_mask,
+    )
+    if HAS_GATE_OUT:
+        b_A = tl.load(A_log + i_hv).to(tl.float32)
+        b_bias = tl.load(dt_bias + gc, mask=mask_k, other=0.0).to(tl.float32)
+        gate = lower_bound * tl.sigmoid(tl.exp(b_A) * (proj + b_bias[None, :]))
+        tl.store(
+            gate_out + o_t[:, None] * stride_gate + gc[None, :],
+            gate,
+            mask=store_mask,
+        )
+
+
+def kda_gate_project_dual(
+    f_a: torch.Tensor,
+    w_fb: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    lower_bound: float,
+    g_raw_out: torch.Tensor,
+    gate_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project one layer's gate, writing the bf16 raw and fp32 activated forms.
+
+    ``gate_out`` is optional so the projection can stand in for the plain GEMM
+    wherever the activated copy is not wanted.
+
+    Args:
+        f_a: ``[rows, D_FA]`` low-rank gate input.
+        w_fb: ``[HV * K, D_FA]`` gate weight.
+        A_log: ``[HV]`` per-head log decay scale.
+        dt_bias: ``[HV * K]`` per-channel bias.
+        num_heads: value heads on this rank.
+        head_dim: per-head channel count.
+        lower_bound: the bounded-gate scale.
+        g_raw_out: ``[rows, HV * K]`` destination for the bare projection.
+        gate_out: optional ``[rows, HV * K]`` fp32 destination for the
+            activated gate.
+
+    Returns:
+        ``g_raw_out``, so callers can use this exactly like the GEMM it
+        replaces.
+
+    Raises:
+        ValueError: if any operand disagrees with ``num_heads``/``head_dim``,
+            or if the contraction is too short for a tensor-core dot. The
+            kernel indexes from these arguments rather than from strides, so a
+            wrong shape would otherwise write past the end of a sink.
+    """
+    rows, d_fa = f_a.shape
+    channels = num_heads * head_dim
+    if d_fa < 16:
+        raise ValueError(f"tensor-core gate projection needs D_FA >= 16, got {d_fa}")
+    if tuple(w_fb.shape) != (channels, d_fa):
+        raise ValueError(
+            f"expected f_b weight [{channels}, {d_fa}], got {tuple(w_fb.shape)}"
+        )
+    if tuple(g_raw_out.shape) != (rows, channels):
+        raise ValueError(
+            f"expected raw sink [{rows}, {channels}], got {tuple(g_raw_out.shape)}"
+        )
+    if gate_out is not None:
+        if tuple(gate_out.shape) != (rows, channels):
+            raise ValueError(
+                f"expected gate sink [{rows}, {channels}], got {tuple(gate_out.shape)}"
+            )
+        if gate_out.dtype is not torch.float32:
+            raise ValueError(f"the activated gate is fp32, got {gate_out.dtype}")
+    block_t, block_k, warps = _dual_gate_tiling(rows, head_dim)
+    # A placeholder keeps the launch signature uniform; the store itself is
+    # switched off, because aiming it at g_raw_out would overwrite the bare
+    # projection with the activated gate and the scan would activate twice.
+    sink = g_raw_out if gate_out is None else gate_out
+    kda_gate_project_dual_kernel[
+        (num_heads, triton.cdiv(rows, block_t), triton.cdiv(head_dim, block_k))
+    ](
+        f_a,
+        w_fb,
+        A_log,
+        dt_bias,
+        g_raw_out,
+        sink,
+        rows,
+        stride_fa=f_a.stride(0),
+        stride_graw=g_raw_out.stride(0),
+        stride_gate=sink.stride(0),
+        lower_bound=lower_bound,
+        HV=num_heads,
+        K=head_dim,
+        D_FA=f_a.shape[-1],
+        BK=block_k,
+        BT=block_t,
+        HAS_GATE_OUT=gate_out is not None,
+        num_warps=warps,
+    )
+    return g_raw_out
+
+
 def batched_recurrent_kda_replay_commit(
     addresses: torch.Tensor,
     read_indices: torch.Tensor,
@@ -2279,35 +2453,42 @@ def batched_recurrent_kda_replay_commit(
     conv_width: int,
     layers_per_group: int,
     lower_bound: float,
+    gate_ready: bool = False,
 ) -> None:
-    """Commit all descriptor-table KDA layers with constant launch count."""
+    """Commit all descriptor-table KDA layers with constant launch count.
+
+    ``gate_ready`` asserts the descriptor's gate column already holds this
+    round's activated gate, so the precompute pass is skipped. Nothing here
+    can tell a fresh gate from last round's -- it is the caller's invariant.
+    """
     if head_dim != 128:
         raise ValueError("batched KDA replay currently requires head_dim=128")
     layers = addresses.shape[0]
     batch = accepted_length.numel()
     rows = batch * draft_token_num
-    block_t, block_k = _gate_tiling(
-        rows, num_heads, head_dim, addresses.device, layers=layers
-    )
-    batched_kda_gate_precompute_kernel[
-        (
-            layers * num_heads,
-            triton.cdiv(rows, block_t),
-            triton.cdiv(head_dim, block_k),
+    if not gate_ready:
+        block_t, block_k = _gate_tiling(
+            rows, num_heads, head_dim, addresses.device, layers=layers
         )
-    ](
-        addresses,
-        rows,
-        stride_fa=f_a_stride,
-        stride_gate=gate_stride,
-        lower_bound=lower_bound,
-        HV=num_heads,
-        K=head_dim,
-        D_FA=f_a_dim,
-        BK=block_k,
-        BT=block_t,
-        num_warps=1 if block_t >= 4 else 2,
-    )
+        batched_kda_gate_precompute_kernel[
+            (
+                layers * num_heads,
+                triton.cdiv(rows, block_t),
+                triton.cdiv(head_dim, block_k),
+            )
+        ](
+            addresses,
+            rows,
+            stride_fa=f_a_stride,
+            stride_gate=gate_stride,
+            lower_bound=lower_bound,
+            HV=num_heads,
+            K=head_dim,
+            D_FA=f_a_dim,
+            BK=block_k,
+            BT=block_t,
+            num_warps=1 if block_t >= 4 else 2,
+        )
     batched_recurrent_kda_replay_commit_kernel[(layers, batch, num_heads)](
         addresses,
         read_indices,

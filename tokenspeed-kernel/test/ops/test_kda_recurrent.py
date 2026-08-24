@@ -362,6 +362,7 @@ def test_kda_split_verify_registration_traits() -> None:
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
+        "emits_gate": frozenset({True}),
     }
 
 

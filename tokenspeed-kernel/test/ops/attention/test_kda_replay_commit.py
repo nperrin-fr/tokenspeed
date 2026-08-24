@@ -704,6 +704,203 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
 
 @requires_registered_replay
 @pytest.mark.parametrize("n", [1, 4])
+def test_verify_fills_the_gate_sink_commit_would_have_rebuilt(n):
+    """Verify's spare gate output is what the commit precompute produces."""
+    from tokenspeed_kernel.ops.attention import (
+        kda_verify_emits_gate,
+        try_kda_fused_paged_verify,
+    )
+
+    assert kda_verify_emits_gate(torch.bfloat16, recurrent_layout="v_major")
+    t = 3
+    x = _window(n, t, seed=613 + n)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    sink = torch.full((n * t, P), float("nan"), device=DEV, dtype=torch.float32)
+    out = try_kda_fused_paged_verify(
+        x["qkv_raw"],
+        x["conv_w"],
+        x["conv_pool"],
+        torch.empty(n * t, 3 * P, 3, device=DEV, dtype=torch.bfloat16),
+        x["f_a"],
+        x["w_fb"],
+        x["beta"],
+        x["A_log"],
+        x["dt_bias"],
+        state_pool=x["h_pool"],
+        state_scratch=torch.empty(n * t, HV, K, V, device=DEV, dtype=torch.float32),
+        read_indices=x["read_indices"],
+        write_indices=writes,
+        num_heads=HV,
+        head_dim=V,
+        draft_token_num=t,
+        lower_bound=LOWER_BOUND,
+        store_states=False,
+        recurrent_layout="v_major",
+        gate_out=sink,
+    )
+    assert out is not None
+    # Against the definition in float64, not against another kernel: the claim
+    # is that the sink holds the activated gate, on every row -- commit slices
+    # by accept length, so a short write would only fail for some batches.
+    expected = LOWER_BOUND * torch.sigmoid(
+        x["A_log"].double().exp().repeat_interleave(K)
+        * (x["f_a"].double() @ x["w_fb"].double().t() + x["dt_bias"].double())
+    )
+    torch.testing.assert_close(sink.double(), expected, atol=1e-6, rtol=1e-4)
+
+
+@requires_registered_replay
+def test_verify_refuses_a_gate_sink_it_cannot_fill():
+    """The softplus gate has no activated form to leave behind; say so."""
+    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+        triton_nvidia_kda_fused_paged_verify_split,
+    )
+
+    n, t = 2, 3
+    x = _window(n, t, seed=77)
+    with pytest.raises(ValueError, match="bounded gate"):
+        triton_nvidia_kda_fused_paged_verify_split(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            torch.empty(n * t, 3 * P, 3, device=DEV, dtype=torch.bfloat16),
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            state_pool=x["h_pool"],
+            state_scratch=torch.empty(n * t, HV, K, V, device=DEV, dtype=torch.float32),
+            read_indices=x["read_indices"],
+            write_indices=torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t),
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=t,
+            lower_bound=None,
+            gate_out=torch.empty(n * t, P, device=DEV, dtype=torch.float32),
+        )
+
+
+@pytest.mark.parametrize("t", [4, 8])
+def test_batched_replay_reads_the_gate_it_was_promised(t):
+    """``gate_ready`` skips the precompute and commits the supplied gate."""
+    layers, n = 3, 5
+    source = [_window(n, t, pages=32, seed=880 + layer) for layer in range(layers)]
+    reads = torch.stack([source[0]["read_indices"]] * 2).to(torch.int32)
+    writes = torch.stack(
+        [
+            torch.arange(17, 17 + n, device=DEV, dtype=torch.int32),
+            torch.arange(24, 24 + n, device=DEV, dtype=torch.int32),
+        ]
+    )
+    accepted = torch.tensor([0, t, 1, 3, 2], device=DEV, dtype=torch.int32)
+    groups = [0, 0, 1]
+
+    def run(gate_ready, prefill=None):
+        arms = [
+            {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+            for x in source
+        ]
+        for i, (x, group) in enumerate(zip(arms, groups, strict=True)):
+            x["read_indices"] = reads[group]
+            if prefill is not None:
+                x["gate_scratch"].copy_(prefill[i])
+        batched_recurrent_kda_replay_commit(
+            _batched_descriptor(arms),
+            reads,
+            writes,
+            accepted,
+            draft_token_num=t,
+            num_heads=HV,
+            head_dim=K,
+            f_a_dim=D_FA,
+            gate_ready=gate_ready,
+            **_batched_static_args(arms[0], layers_per_group=2),
+        )
+        return arms
+
+    # The precompute leaves its gate in the scratch, so handing those exact
+    # bits back isolates the skip from any second gate implementation.
+    baseline = run(False)
+    supplied = run(True, prefill=[x["gate_scratch"] for x in baseline])
+    for got, want in zip(supplied, baseline, strict=True):
+        torch.testing.assert_close(got["h_pool"], want["h_pool"], atol=0, rtol=0)
+        torch.testing.assert_close(got["conv_pool"], want["conv_pool"], atol=0, rtol=0)
+    # Without this the skip could be reading a gate it silently recomputed.
+    poisoned = run(True, prefill=[torch.rand_like(x["gate_scratch"]) for x in baseline])
+    assert any(
+        not torch.equal(got["h_pool"], want["h_pool"])
+        for got, want in zip(poisoned, baseline, strict=True)
+    )
+
+
+@pytest.mark.parametrize("t", [4, 8])
+def test_replay_commits_the_gate_the_dual_projection_left_behind(t):
+    """The end-to-end link: verify's own sink drives the commit.
+
+    The sibling test hands the commit back the precompute's own bits, so both
+    arms see identical memory and any misreading of the gate column cancels
+    out. This one fills the column from the projection verify actually runs,
+    which is the only arrangement production uses.
+    """
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        kda_gate_project_dual,
+    )
+
+    layers, n = 3, 5
+    source = [_window(n, t, pages=32, seed=915 + layer) for layer in range(layers)]
+    reads = torch.stack([source[0]["read_indices"]] * 2).to(torch.int32)
+    writes = torch.stack(
+        [
+            torch.arange(17, 17 + n, device=DEV, dtype=torch.int32),
+            torch.arange(24, 24 + n, device=DEV, dtype=torch.int32),
+        ]
+    )
+    accepted = torch.tensor([0, t, 1, 3, 2], device=DEV, dtype=torch.int32)
+    groups = [0, 0, 1]
+
+    def run(gate_ready):
+        arms = [
+            {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+            for x in source
+        ]
+        for x, group in zip(arms, groups, strict=True):
+            x["read_indices"] = reads[group]
+            if gate_ready:
+                kda_gate_project_dual(
+                    x["f_a"],
+                    x["w_fb"],
+                    x["A_log"],
+                    x["dt_bias"],
+                    num_heads=HV,
+                    head_dim=K,
+                    lower_bound=LOWER_BOUND,
+                    g_raw_out=torch.empty(n * t, P, device=DEV, dtype=torch.bfloat16),
+                    gate_out=x["gate_scratch"],
+                )
+        batched_recurrent_kda_replay_commit(
+            _batched_descriptor(arms),
+            reads,
+            writes,
+            accepted,
+            draft_token_num=t,
+            num_heads=HV,
+            head_dim=K,
+            f_a_dim=D_FA,
+            gate_ready=gate_ready,
+            **_batched_static_args(arms[0], layers_per_group=2),
+        )
+        return arms
+
+    # Not bitwise: the two projections reduce in different orders. A gate read
+    # as anything but the activated value misses by orders of magnitude, so
+    # this band separates the contract from the rounding.
+    for got, want in zip(run(True), run(False), strict=True):
+        torch.testing.assert_close(got["h_pool"], want["h_pool"], atol=1e-5, rtol=1e-4)
+
+
+@requires_registered_replay
+@pytest.mark.parametrize("n", [1, 4])
 def test_split_verify_wrapper_matches_fused_wrapper(n):
     from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
         triton_nvidia_kda_fused_paged_verify_no_store,

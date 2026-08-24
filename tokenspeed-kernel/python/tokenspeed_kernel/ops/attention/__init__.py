@@ -142,6 +142,7 @@ __all__ = [
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
     "kda_replay_commit_supported",
+    "kda_verify_emits_gate",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1657,6 +1658,25 @@ def try_kda_fused_paged_decode(
     return KdaFusedDecodeResult(out=out, output_norm_applied=output_norm_applied)
 
 
+def _kda_fused_paged_verify_traits(
+    *, store_states: bool, recurrent_layout: str, emits_gate: bool = False
+) -> dict[str, object]:
+    """The trait set the verify entry point and its probes both select on.
+
+    Shared so a probe cannot answer for a kernel the call would not choose:
+    the two drifting apart is the one way this family's capability check can
+    say yes and leave replay reading a gate nobody wrote.
+    """
+    traits: dict[str, object] = {
+        "paged_state": True,
+        "store_states": store_states,
+        "recurrent_layout": recurrent_layout,
+    }
+    if emits_gate:
+        traits["emits_gate"] = True
+    return traits
+
+
 def try_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -1680,6 +1700,7 @@ def try_kda_fused_paged_verify(
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
+    gate_out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1688,8 +1709,16 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. ``store_states`` selects the
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
-    registry's choice. Returns ``None`` only when no implementation
-    supports the current platform.
+    registry's choice.
+
+    ``gate_out`` is an optional fp32 sink for the activated gate that replay
+    would otherwise reproject for itself. Only the split-producer arrangement
+    computes it, so the sink is also a selection trait: pass it and a kernel
+    that cannot fill it is not chosen, rather than silently leaving replay on
+    a stale gate.
+
+    Returns ``None`` only when no implementation supports the current
+    platform.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if recurrent_layout not in ("k_major", "v_major"):
@@ -1704,17 +1733,18 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={
-                "paged_state": True,
-                "store_states": store_states,
-                "recurrent_layout": recurrent_layout,
-            },
+            traits=_kda_fused_paged_verify_traits(
+                store_states=store_states,
+                recurrent_layout=recurrent_layout,
+                emits_gate=gate_out is not None,
+            ),
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         return None
     return kernel(
+        **({} if gate_out is None else {"gate_out": gate_out}),
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
@@ -1882,11 +1912,51 @@ def kda_replay_commit_supported(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={
-                "paged_state": True,
-                "store_states": False,
-                "recurrent_layout": recurrent_layout,
-            },
+            traits=_kda_fused_paged_verify_traits(
+                store_states=False, recurrent_layout=recurrent_layout
+            ),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def kda_verify_emits_gate(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+    recurrent_layout: str | None = None,
+) -> bool:
+    """Whether fused verify can leave replay the activated gate it computed.
+
+    Only the split-producer arrangement runs the gate as its own pass, so only
+    it can write a caller-supplied sink. Ask once at setup and keep the answer:
+    the alternative is guessing every step which kernel the registry picks.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+        recurrent_layout: Layout of the committed state; the platform default
+            when omitted.
+
+    Returns:
+        ``True`` when a registered verify kernel fills the sink, so commit can
+        skip reprojecting the gate for itself.
+    """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits=_kda_fused_paged_verify_traits(
+                store_states=False,
+                recurrent_layout=recurrent_layout,
+                emits_gate=True,
+            ),
             solution=solution,
         )
     except NoKernelFoundError:
