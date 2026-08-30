@@ -32,6 +32,7 @@ def _select(**overrides):
     base = dict(
         num_tokens=1024,
         graph_phase=False,
+        is_decode=False,
         tail_fusion_max_tokens=16,
         fused_moe_ar=True,
         multimem_ok=True,
@@ -97,3 +98,31 @@ def test_fused_lane_fallback_without_multimem(m):
 
 def test_graph_phase_above_fused_capacity_still_tiers_by_tokens():
     assert _select(num_tokens=512, graph_phase=True) is K3MoETailTier.MULTIMEM_AR
+
+
+@pytest.mark.parametrize("m", [256, 1024, 2048, 8192])
+def test_decode_skips_the_multimem_window_prefill_keeps_it(m):
+    assert _select(num_tokens=m, is_decode=True) is K3MoETailTier.FUSED_LANE_AR
+    assert _select(num_tokens=m, is_decode=False) is K3MoETailTier.MULTIMEM_AR
+
+
+def test_spec_decode_bucket_at_the_window_edge_takes_the_fused_lane():
+    # bs=32 x 8 draft tokens lands exactly on MULTIMEM_AR_MIN_TOKENS.
+    assert (
+        _select(num_tokens=256, graph_phase=True, is_decode=True)
+        is K3MoETailTier.FUSED_LANE_AR
+    )
+
+
+def test_decode_still_prefers_the_fused_tail_in_its_own_range():
+    assert (
+        _select(num_tokens=8, graph_phase=True, is_decode=True)
+        is K3MoETailTier.TAIL_FUSION
+    )
+
+
+def test_decode_without_fused_ar_still_falls_to_separate_reduce():
+    assert (
+        _select(num_tokens=256, is_decode=True, fused_moe_ar=False)
+        is K3MoETailTier.SEPARATE_REDUCE
+    )

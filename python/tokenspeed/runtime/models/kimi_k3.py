@@ -1879,7 +1879,14 @@ class KimiLinearMoE(nn.Module):
         router_logits = self.gate(hidden_states)
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        plan = self.comm.plan(num_tokens, hidden_states)
+        # No context, or a non-decode mode: keep the token-count-only window.
+        plan = self.comm.plan(
+            num_tokens,
+            hidden_states,
+            is_decode=ctx is not None
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_decode(),
+        )
         if plan.lane is not None:
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
         else:

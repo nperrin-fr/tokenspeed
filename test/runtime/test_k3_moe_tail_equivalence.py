@@ -326,10 +326,13 @@ def test_selector_boundaries():
         select_k3_moe_tail_tier,
     )
 
-    def pick(num_tokens, *, graph_phase=True, fused_max=64, fused_ar=True, mm=True):
+    def pick(
+        num_tokens, *, graph_phase=True, fused_max=64, fused_ar=True, mm=True, dec=False
+    ):
         return select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=graph_phase,
+            is_decode=dec,
             tail_fusion_max_tokens=fused_max,
             fused_moe_ar=fused_ar,
             multimem_ok=mm,
@@ -347,6 +350,8 @@ def test_selector_boundaries():
     assert pick(8192) is K3MoETailTier.MULTIMEM_AR
     assert pick(8193) is not K3MoETailTier.MULTIMEM_AR
     assert pick(256, mm=False) is K3MoETailTier.FUSED_LANE_AR
+    # The multimem window is prefill's; decode takes the join at the same size.
+    assert pick(256, dec=True) is K3MoETailTier.FUSED_LANE_AR
     # fused_moe_ar reports the trtllm AR lane, which only the join tier uses.
     # The fused tail owns its own multicast collective, so it outranks the
     # flag rather than being gated by it; every other size falls to portable.
@@ -380,10 +385,10 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
     comm.routed_hidden, comm.hidden_size = L, H
 
     cap = mod.TAIL_FUSION_MAX_TOKENS
-    assert comm.plan(cap, None).tier is mod.K3MoETailTier.TAIL_FUSION
+    assert comm.plan(cap, None, is_decode=True).tier is mod.K3MoETailTier.TAIL_FUSION
     # Past the cap the plan leaves the fused tail's early return, so it needs
     # real hidden states to reach the lane decision.
-    above = comm.plan(cap + 1, torch.zeros(cap + 1, H))
+    above = comm.plan(cap + 1, torch.zeros(cap + 1, H), is_decode=True)
     assert above.tier is not mod.K3MoETailTier.TAIL_FUSION
 
 
@@ -412,25 +417,25 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
         comm.routed_hidden, comm.hidden_size = L, H
         return comm
 
-    plan = build(supports_deferred=True, fused_ar=True).plan(1, None)
+    plan = build(supports_deferred=True, fused_ar=True).plan(1, None, is_decode=True)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert plan.defer_finalize
     assert not plan.split_shared_rs
     assert plan.lane is None and not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
-    plan = build(supports_deferred=False, fused_ar=True).plan(32, None)
+    plan = build(supports_deferred=False, fused_ar=True).plan(32, None, is_decode=True)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
     assert plan.split_shared_rs
 
     # Split once token work enters a second collective-CTA wave.
     comm = build(supports_deferred=True, fused_ar=True)
-    assert not comm.plan(8, None).split_shared_rs
-    assert comm.plan(9, None).split_shared_rs
+    assert not comm.plan(8, None, is_decode=True).split_shared_rs
+    assert comm.plan(9, None, is_decode=True).split_shared_rs
 
     # Without the fused-AR (trtllm) plan the experts kernel cannot defer.
-    plan = build(supports_deferred=True, fused_ar=False).plan(1, None)
+    plan = build(supports_deferred=True, fused_ar=False).plan(1, None, is_decode=True)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
 
@@ -438,9 +443,29 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     comm = build(supports_deferred=True, fused_ar=True)
     comm.latent_tail = None
     hidden = torch.zeros(17, H)
-    plan = comm.plan(17, hidden)
+    plan = comm.plan(17, hidden, is_decode=True)
     assert plan.tier is not mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
+
+
+def test_plan_threads_the_decode_flag_into_the_multimem_window(monkeypatch):
+    """A spec-decode step at the window edge must not take MULTIMEM_AR."""
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
+
+    comm = object.__new__(mod.K3MoeTailComm)
+    comm.latent_tail = None
+    comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
+    comm.state = SimpleNamespace(multimem_ar_ok=True)
+    comm._shard_up_projection = False
+    comm.routed_hidden, comm.hidden_size = L, H
+
+    m = mod.MULTIMEM_AR_MIN_TOKENS
+    hidden = torch.zeros(m, H)
+    assert comm.plan(m, hidden, is_decode=True).tier is mod.K3MoETailTier.FUSED_LANE_AR
+    assert comm.plan(m, hidden, is_decode=False).tier is mod.K3MoETailTier.MULTIMEM_AR
 
 
 # 4 is included so a single node can cover the tiers; the fused tail itself

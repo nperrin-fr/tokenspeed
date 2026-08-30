@@ -93,15 +93,13 @@ class K3MoETailTier(IntEnum):
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Above plain decode-graph buckets: at decode sizes the two staged reduces
-# lose ~4% TPOT to the single fused-lane AR; the ld_reduce win is prefill's.
-# Caveat: spec-decode buckets reach bs*q tokens and can re-enter this window
-# in-graph (correct, but decode-suboptimal) — a follow-up should add an
-# is_decode axis rather than gate on the graph phase, which prefill graphs
-# legitimately share.
 # Measured profit edge of the fused tail; the kernel's own capacity is larger.
 TAIL_FUSION_MAX_TOKENS = 32
 
+# The ld_reduce win is prefill's: at decode sizes the two staged reduces lose
+# ~4% TPOT to the single fused-lane AR, so the window is gated on ``is_decode``
+# rather than on token count alone. Spec-decode reaches bs*q tokens per step,
+# which is how decode enters this range at all (bs=32 x 8 draft = exactly 256).
 MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
@@ -111,6 +109,7 @@ def select_k3_moe_tail_tier(
     *,
     num_tokens: int,
     graph_phase: bool,
+    is_decode: bool,
     tail_fusion_max_tokens: int,
     fused_moe_ar: bool,
     multimem_ok: bool,
@@ -120,6 +119,7 @@ def select_k3_moe_tail_tier(
     Args:
         num_tokens: Tokens in this forward (identical on every rank).
         graph_phase: Whether the forward runs under the CUDA-graph phase.
+        is_decode: Whether every rank is decoding (or idle) this forward.
         tail_fusion_max_tokens: Largest token count the fused tail is both
             able and worth running at, 0 when absent.
         fused_moe_ar: Whether the fused-AR execution plan is armed.
@@ -134,7 +134,11 @@ def select_k3_moe_tail_tier(
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
+    if (
+        multimem_ok
+        and not is_decode
+        and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS
+    ):
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -587,16 +591,33 @@ class K3MoeTailComm:
     # ------------------------------------------------------------------
     # Routing
     # ------------------------------------------------------------------
-    def plan(self, num_tokens: int, hidden_states: torch.Tensor) -> TailPlan:
+    def plan(
+        self, num_tokens: int, hidden_states: torch.Tensor, is_decode: bool
+    ) -> TailPlan:
         """Pick the tail tier and its forward-side obligations.
 
-        Every input must be rank-uniform (token count, graph phase and the
-        negotiated capabilities) so all ranks take identical branches.
+        Every input must be rank-uniform (token count, graph phase, decode
+        flag and the negotiated capabilities) so all ranks take identical
+        branches.
+
+        Args:
+            num_tokens: Tokens in this forward (identical on every rank).
+            hidden_states: Activations the tail writes through.
+            is_decode: Whether this forward is a decode step. Pass
+                ``ForwardContext.forward_mode.is_decode()``: the tiers it
+                steers need ``attn.dp_size == 1`` (see ``K3AttnCommState``),
+                so every rank runs the same batch and the mode is uniform.
+                Graph capture, warmup and replay all report ``DECODE``, while
+                prefill graphs report ``EXTEND``, so the tier is stable.
+
+        Returns:
+            The ``TailPlan`` for the selected tier.
         """
         # Graph warmup, capture, and replay must select the same tier.
         tier = select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=get_is_cuda_graph_phase(),
+            is_decode=is_decode,
             tail_fusion_max_tokens=(
                 min(self.latent_tail.max_num_tokens, TAIL_FUSION_MAX_TOKENS)
                 if self.latent_tail is not None
