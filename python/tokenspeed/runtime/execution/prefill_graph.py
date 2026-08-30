@@ -316,12 +316,14 @@ class PrefillGraph:
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
+            # Unreachable for a single bucket -- _capture_all_buckets absorbs
+            # those -- so reaching here means the setup allocations themselves
+            # did not fit and no bucket can be captured.
             logger.error(
-                "Prefill graph capture ran out of GPU memory. Free up "
-                "--gpu-memory-utilization headroom, lower "
-                "--prefill-graph-max-tokens (default %d), or set it to 0 to "
-                "disable the prefill graph.",
-                2048,
+                "Prefill graph setup ran out of GPU memory before any bucket "
+                "was captured. Free up --gpu-memory-utilization headroom, "
+                "lower --prefill-graph-max-tokens, or set it to 0 to disable "
+                "the prefill graph."
             )
             raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
@@ -357,8 +359,19 @@ class PrefillGraph:
             try:
                 with active_forward(self._ctx):
                     self._capture_bucket(bucket, decode_wrapper)
+            except torch.cuda.OutOfMemoryError:
+                # Buckets go largest-first, so one that does not fit says
+                # nothing about the smaller ones: drop it and keep going.
+                logger.warning(
+                    "Prefill graph: bucket %d did not fit in GPU memory; "
+                    "prefills that large fall back to eager.",
+                    bucket,
+                )
+                self._captures.pop(bucket, None)
+                torch.cuda.empty_cache()
             finally:
                 self._ctx = None
+        self._agree_captured_buckets()
         if self.config.global_rank == 0:
             sample = next(iter(self._captures.values()), None)
             logger.info(
@@ -576,6 +589,41 @@ class PrefillGraph:
             **extra_metadata_kwargs,
         )
         return ctx
+
+    def _agree_captured_buckets(self) -> None:
+        """Keep only buckets every rank captured; replay must stay in lockstep.
+
+        A rank that kept a bucket its peer dropped would replay while the peer
+        ran eager, and the two would disagree on collective token counts.
+        """
+        buckets = sorted(self.capture_buckets)
+        kept = [1 if b in self._captures else 0 for b in buckets]
+        if self.config.world_group is not None and self.config.world_size > 1:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager as pg_manager,
+            )
+
+            cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
+            flags = torch.tensor(kept, dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flags, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+            )
+            kept = flags.tolist()
+        agreed = [b for b, ok in zip(buckets, kept) if ok]
+        if len(agreed) == len(buckets):
+            return
+        for bucket in buckets:
+            if bucket not in agreed:
+                self._captures.pop(bucket, None)
+        self.capture_buckets = agreed
+        if not agreed:
+            self.disable = True
+            logger.warning("Prefill graph: no bucket fit; prefill stays eager.")
+        else:
+            logger.warning(
+                "Prefill graph: kept buckets %s; the rest are eager on every rank.",
+                agreed,
+            )
 
     def _capture_unanimous(self, captured_ok: bool) -> bool:
         """MIN-reduce capture success across the world (see ``capture``)."""

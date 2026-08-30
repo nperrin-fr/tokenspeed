@@ -616,6 +616,21 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
             PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
         )
 
+    def test_default_follows_the_chunked_prefill_size(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # A ceiling below the chunk leaves every bucket short of a whole chunk,
+        # so the graph would cost memory without ever matching a live forward.
+        for chunk in (8192, 4096, 2048, 1024):
+            self.assertEqual(
+                _resolve_prefill_graph_max_tokens(
+                    self._args(chunked_prefill_size=chunk)
+                ),
+                chunk,
+            )
+
     def test_all_to_all_backend_disables_the_graph(self):
         from tokenspeed.runtime.execution.model_executor import (
             _resolve_prefill_graph_max_tokens,
@@ -714,6 +729,42 @@ class TestPoolReuseAcrossCaptures(unittest.TestCase):
         for cap, _ in caps:
             cap.replay()
         torch.cuda.synchronize()
+
+
+class TestCapturedBucketAgreement(unittest.TestCase):
+    """Buckets a rank could not capture must be dropped on every rank."""
+
+    @staticmethod
+    def _graph(buckets, captured):
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        g = object.__new__(PrefillGraph)
+        g.config = SimpleNamespace(world_group=None, world_size=1)
+        g.capture_buckets = list(buckets)
+        g._captures = {b: object() for b in captured}
+        g.disable = False
+        return g
+
+    def test_all_captured_keeps_every_bucket(self):
+        g = self._graph([256, 1024, 8192], [256, 1024, 8192])
+        g._agree_captured_buckets()
+        self.assertEqual(g.capture_buckets, [256, 1024, 8192])
+        self.assertFalse(g.disable)
+
+    def test_an_oom_bucket_is_dropped_but_smaller_ones_survive(self):
+        # Capture runs largest-first, so a bucket that does not fit says
+        # nothing about the smaller ones.
+        g = self._graph([256, 1024, 8192], [256, 1024])
+        g._agree_captured_buckets()
+        self.assertEqual(g.capture_buckets, [256, 1024])
+        self.assertNotIn(8192, g._captures)
+        self.assertFalse(g.disable)
+
+    def test_losing_every_bucket_disables_the_graph(self):
+        g = self._graph([256, 1024], [])
+        g._agree_captured_buckets()
+        self.assertEqual(g.capture_buckets, [])
+        self.assertTrue(g.disable)
 
 
 if __name__ == "__main__":

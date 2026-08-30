@@ -108,11 +108,15 @@ def _draft_idle_global_num_tokens_for_step(
     return global_bs
 
 
-PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
+# Safety ceiling only: the operating point is the chunked-prefill size, which
+# ``get_prefill_token_buckets`` already argues is the right top bucket. A lower
+# ceiling just means no bucket ever covers a whole chunk, so the graph costs
+# memory and buys nothing.
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 8192
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+    """Largest prefill-graph bucket: explicit value, or min(chunk, kv budget).
 
     Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
