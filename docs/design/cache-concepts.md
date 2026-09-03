@@ -174,6 +174,11 @@ to the kernel page tables that attention kernels consume (the
 happen at **one designated point**; beyond that point, kernels see physical
 page tables and nothing upstream sees them at all.
 
+Attention-backend overrides derived from model architecture belong to an
+explicit argument-resolution step. Backend config generation and construction
+consume its derived `ServerArgs`; the caller's startup arguments remain
+unchanged so probing and final construction resolve from the same inputs.
+
 Outside the mapping point, Python code should perceive `prefix_granularity`
 and `page_size` as little as possible. If a Python component needs either
 value, that is a design smell to justify, not a default to reach for.

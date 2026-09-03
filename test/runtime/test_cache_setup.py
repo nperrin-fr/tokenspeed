@@ -1,5 +1,14 @@
+import copy
+import os
+import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+
+# CI registration (parsed via AST, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import pytest
 import torch
@@ -9,6 +18,7 @@ from tokenspeed.runtime.cache.transfer.layout import (
     combine_cache_transfer_layouts,
     select_layer_fields,
 )
+from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -602,32 +612,21 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
 
 
-def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target() -> None:
     import tokenspeed.runtime.layers.attention.registry as registry
 
-    monkeypatch.setattr(
-        registry,
-        "is_deepseek_v4",
-        lambda config: getattr(config, "is_deepseek_v4", False),
-    )
     server_args = SimpleNamespace(
         attention_backend=None,
         drafter_attention_backend=None,
         disaggregation_mode="prefill",
     )
-    target = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("LlamaForCausalLM",),
-            is_deepseek_v4=False,
-        )
+    target = object.__new__(ModelConfig)
+    target.hf_config = SimpleNamespace(
+        architectures=("LlamaForCausalLM",),
     )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("DeepseekV4ForCausalLMNextN",),
-            is_deepseek_v4=True,
-        )
+    draft = object.__new__(ModelConfig)
+    draft.hf_config = SimpleNamespace(
+        architectures=("DeepseekV4ForCausalLMNextN",),
     )
 
     with pytest.raises(NotImplementedError, match="target-only"):
@@ -639,6 +638,255 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             gpu_memory=0,
             draft_model_config=draft,
         )
+
+
+def test_create_attn_components_is_repeatable_without_mutating_server_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed.runtime.layers.attention.registry as registry
+
+    config = _mla_config()
+    memory_plan = SimpleNamespace(
+        prefix_granularity=64,
+        num_lcm_blocks=1,
+        lcm_block_bytes=128,
+        groups=(),
+    )
+    spec = SimpleNamespace(
+        memory_plan=memory_plan,
+        token_capacity=64,
+        layer_types=("full_attention",),
+    )
+    cache_setup = SimpleNamespace(
+        spec=spec,
+        num_draft_layers=0,
+        num_target_layers=1,
+        cache_budget_bytes=128,
+        fixed_workspace_bytes=0,
+    )
+    mapping = SimpleNamespace(world_size=1, world_group=None, has_pp=False, rank=3)
+    server_args = SimpleNamespace(
+        attention_backend="tokenspeed_mla",
+        drafter_attention_backend=None,
+        disaggregation_mode=None,
+        speculative_algorithm=None,
+        gpu_memory_utilization=0.9,
+        mapping=mapping,
+    )
+    model_config = SimpleNamespace(
+        architectures=["KimiK3ForConditionalGeneration"],
+        hf_config=SimpleNamespace(
+            architectures=("KimiK3ForConditionalGeneration",),
+        ),
+        is_deepseek_v4=False,
+        is_hybrid_dsa_kda=False,
+        is_hybrid_gdn=False,
+        is_hybrid_linear=True,
+        is_hybrid_mla_kda=True,
+        is_inkling=False,
+    )
+    backend = SimpleNamespace(set_cache_pool=lambda pool: None)
+    pool = SimpleNamespace()
+    cache_storage: dict[str, int] = {"allocated_bytes": 128}
+    generated_args: list[SimpleNamespace] = []
+    full_backend_inputs: list[str | None] = []
+
+    def create_config(
+        args: SimpleNamespace,
+        model: SimpleNamespace,
+        is_draft: bool = False,
+    ) -> AttnConfig:
+        generated_args.append(args)
+        return config
+
+    def resolve_full_backend(name: str | None, **kwargs: object) -> str:
+        full_backend_inputs.append(name)
+        return "tokenspeed_mla"
+
+    monkeypatch.setattr(registry, "_create_attn_config", create_config)
+    monkeypatch.setattr(
+        registry, "_resolve_hybrid_full_backend_name", resolve_full_backend
+    )
+    monkeypatch.setattr(registry, "prepare_cache_setup", lambda **kwargs: cache_setup)
+    # The budget probes the device; this test is about backend resolution only.
+    monkeypatch.setattr(
+        registry, "profile_available_cache_memory_bytes", lambda **kwargs: 0
+    )
+    monkeypatch.setattr(
+        registry, "_validate_lcm_page_size", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        registry, "create_cache_arena", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        registry,
+        "_create_target_components",
+        lambda **kwargs: (backend, pool),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_create_draft_components",
+        lambda **kwargs: (None, None),
+    )
+    monkeypatch.setattr(registry, "_prepare_verify_workspace", lambda **kwargs: None)
+    monkeypatch.setattr(
+        registry, "_cache_storage_report", lambda **kwargs: cache_storage
+    )
+    original_fields = copy.deepcopy(vars(server_args))
+
+    first = registry.create_attn_components(
+        server_args,
+        model_config,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+    )
+    second = registry.create_attn_components(
+        server_args,
+        model_config,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+    )
+
+    assert first == second
+    assert vars(server_args) == original_fields
+    assert server_args.mapping is mapping
+    assert server_args.mapping.rank == 3
+    assert generated_args[0] is not server_args
+    assert generated_args[1] is not server_args
+    assert [args.attention_backend for args in generated_args] == [
+        "hybrid_linear_attn",
+        "hybrid_linear_attn",
+    ]
+    assert full_backend_inputs == ["tokenspeed_mla", "tokenspeed_mla"]
+
+
+@pytest.mark.parametrize(
+    (
+        "attention_backend",
+        "drafter_attention_backend",
+        "is_deepseek_v4_model",
+        "is_deepseek_v4_draft_model",
+        "is_hybrid_linear",
+        "expected_attention_backend",
+        "expected_drafter_attention_backend",
+        "expected_ignored_hybrid_linear_backend",
+    ),
+    (
+        pytest.param(
+            "tokenspeed_mla",
+            "draft_backend",
+            True,
+            False,
+            False,
+            "deepseek_v4",
+            "draft_backend",
+            False,
+            id="deepseek-v4-target",
+        ),
+        pytest.param(
+            "tokenspeed_mla",
+            "draft_backend",
+            False,
+            True,
+            False,
+            "tokenspeed_mla",
+            "deepseek_v4",
+            False,
+            id="deepseek-v4-draft",
+        ),
+        pytest.param(
+            "tokenspeed_mla",
+            "draft_backend",
+            True,
+            True,
+            False,
+            "deepseek_v4",
+            "deepseek_v4",
+            False,
+            id="deepseek-v4-target-and-draft",
+        ),
+        pytest.param(
+            "tokenspeed_mla",
+            "draft_backend",
+            False,
+            False,
+            True,
+            "hybrid_linear_attn",
+            "draft_backend",
+            False,
+            id="hybrid-linear-model",
+        ),
+        pytest.param(
+            "tokenspeed_mla",
+            "draft_backend",
+            True,
+            True,
+            True,
+            "hybrid_linear_attn",
+            "deepseek_v4",
+            False,
+            id="hybrid-linear-target-with-deepseek-v4-draft",
+        ),
+        pytest.param(
+            "hybrid_linear_attn",
+            "hybrid_linear_attn",
+            False,
+            False,
+            False,
+            None,
+            None,
+            True,
+            id="non-hybrid-model-resets-explicit-hybrid-backends",
+        ),
+    ),
+)
+def test_resolve_backend_args_does_not_mutate_caller(
+    caplog: pytest.LogCaptureFixture,
+    attention_backend: str,
+    drafter_attention_backend: str,
+    is_deepseek_v4_model: bool,
+    is_deepseek_v4_draft_model: bool,
+    is_hybrid_linear: bool,
+    expected_attention_backend: str | None,
+    expected_drafter_attention_backend: str | None,
+    expected_ignored_hybrid_linear_backend: bool,
+) -> None:
+    from tokenspeed.runtime.layers.attention.registry import _resolve_backend_args
+
+    mapping = SimpleNamespace(rank=3, topology={"hosts": ["node-0"]})
+    server_args = SimpleNamespace(
+        attention_backend=attention_backend,
+        drafter_attention_backend=drafter_attention_backend,
+        mapping=mapping,
+    )
+    model_config = SimpleNamespace(
+        architectures=[],
+        is_deepseek_v4=is_deepseek_v4_model,
+        is_hybrid_linear=is_hybrid_linear,
+    )
+    draft_model_config = SimpleNamespace(
+        is_deepseek_v4=is_deepseek_v4_draft_model,
+        is_dspark=False,
+    )
+    original_state = copy.deepcopy(vars(server_args))
+
+    resolved = _resolve_backend_args(
+        server_args,
+        model_config,
+        draft_model_config,
+    )
+
+    assert resolved is not server_args
+    assert resolved.attention_backend == expected_attention_backend
+    assert resolved.drafter_attention_backend == expected_drafter_attention_backend
+    assert (
+        "Ignoring hybrid_linear_attn backend" in caplog.text
+    ) is expected_ignored_hybrid_linear_backend
+    assert vars(server_args) == original_state
+    assert server_args.mapping is mapping
+    assert server_args.mapping == original_state["mapping"]
 
 
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:

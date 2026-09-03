@@ -62,6 +62,41 @@ _QWEN4_EXP_ARCHITECTURES = frozenset(
         "Qwen4ExpForCausalLMNextN",
     }
 )
+_HYBRID_GDN_ARCHITECTURES = frozenset(
+    {
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGenerationNextN",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForConditionalGenerationNextN",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForCausalLMNextN",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
+    }
+)
+_HYBRID_MLA_KDA_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+    }
+)
+_HYBRID_DSA_KDA_TARGET_ARCHITECTURES = frozenset(
+    {
+        "Glm53FlashForConditionalGeneration",
+    }
+)
+_HYBRID_DSA_KDA_ARCHITECTURES = frozenset(
+    {
+        *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+        "Glm53FlashForConditionalGenerationNextN",
+    }
+)
+_INKLING_ARCHITECTURES = frozenset(
+    {
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationNextN",
+    }
+)
 _MLA_ARCHITECTURES = frozenset(
     {
         "DeepseekV3ForCausalLM",
@@ -69,7 +104,7 @@ _MLA_ARCHITECTURES = frozenset(
         "Eagle3DeepseekV2ForCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
-        "KimiK3ForConditionalGeneration",
+        *_HYBRID_MLA_KDA_ARCHITECTURES,
         "KimiK3ForConditionalGenerationNextN",
         # The K3 DSpark draft is MLA-native (DeepSeek-V3 layout, RoPE + YaRN),
         # so it must resolve to the MLA family rather than defaulting to MHA.
@@ -84,8 +119,7 @@ _DSA_ARCHITECTURES = frozenset(
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
-        "Glm53FlashForConditionalGeneration",
-        "Glm53FlashForConditionalGenerationNextN",
+        *_HYBRID_DSA_KDA_ARCHITECTURES,
     }
 )
 _MSA_ARCHITECTURES = frozenset(
@@ -618,6 +652,67 @@ class ModelConfig:
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
+
+    @property
+    def architectures(self) -> list[str]:
+        """Return the checkpoint's declared model architectures."""
+        return list(self.hf_config.architectures or [])
+
+    @property
+    def is_hybrid_gdn(self) -> bool:
+        """Whether this model combines full attention with GDN layers."""
+        return any(
+            architecture in _HYBRID_GDN_ARCHITECTURES
+            for architecture in self.architectures
+        )
+
+    @property
+    def is_hybrid_mla_kda(self) -> bool:
+        """Whether this model combines MLA with KDA layers."""
+        return any(
+            architecture in _HYBRID_MLA_KDA_ARCHITECTURES
+            for architecture in self.architectures
+        )
+
+    @property
+    def is_hybrid_dsa_kda(self) -> bool:
+        """Whether this model belongs to the DSA/KDA architecture family."""
+        return any(
+            architecture in _HYBRID_DSA_KDA_ARCHITECTURES
+            for architecture in self.architectures
+        )
+
+    @property
+    def is_hybrid_linear(self) -> bool:
+        """Whether this model uses a hybrid linear-attention backend."""
+        return self.is_hybrid_gdn or self.is_hybrid_mla_kda or self.is_hybrid_dsa_kda
+
+    @property
+    def has_linear_attention(self) -> bool:
+        """Whether this checkpoint declares linear-attention layers."""
+        return self.is_hybrid_gdn or any(
+            architecture in _HYBRID_MLA_KDA_ARCHITECTURES
+            or architecture in _HYBRID_DSA_KDA_TARGET_ARCHITECTURES
+            for architecture in self.architectures
+        )
+
+    @property
+    def is_inkling(self) -> bool:
+        """Whether this model belongs to the Inkling architecture family."""
+        return any(
+            architecture in _INKLING_ARCHITECTURES
+            for architecture in self.architectures
+        )
+
+    @property
+    def is_deepseek_v4(self) -> bool:
+        """Whether this model belongs to the DeepSeek V4 architecture family."""
+        return is_deepseek_v4(self.hf_config)
+
+    @property
+    def is_dspark(self) -> bool:
+        """Whether this model is a DeepSeek V4 DSpark checkpoint."""
+        return "DeepseekV4ForCausalLMDSpark" in self.architectures
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
