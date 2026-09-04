@@ -479,15 +479,6 @@ class ModelExecutor:
             graph_supported=graph_support.prefill_graph,
         )
 
-        self._autotune()
-
-        workspace_pool(self.device).freeze()
-
-        if not self.forward_step.disable:
-            self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
         self.encoder_graph_wrappers = getattr(
@@ -519,6 +510,17 @@ class ModelExecutor:
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
+
+    def capture_graphs(self) -> None:
+        """Tune kernels, pin the workspace, then capture the decode and prefill graphs."""
+        self._autotune()
+        workspace_pool(self.device).freeze()
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
+        # Capture consumes the generator; leave the same post-startup RNG state as before.
+        set_random_seed(48)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.

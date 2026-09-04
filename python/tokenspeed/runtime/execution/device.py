@@ -725,6 +725,7 @@ def build_device_side(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
+    executor.capture_graphs()
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
