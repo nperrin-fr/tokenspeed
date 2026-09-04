@@ -285,6 +285,7 @@ class ForwardStepRunner:
         }
 
         self.graphs: dict[tuple[str, int], object] = {}
+        self._owns_graphs = False
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
@@ -312,6 +313,14 @@ class ForwardStepRunner:
         Args:
             forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
         """
+        if self.disable:
+            return
+        if self._owns_graphs:
+            raise RuntimeError("decode graphs are captured; release_graphs() first")
+        for tree in (self.attn_backend, self.draft_attn_backend):
+            if tree is not None:
+                tree.note_graphs_captured()
+        self._owns_graphs = True
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
@@ -339,6 +348,24 @@ class ForwardStepRunner:
                 graph, output_buffers = self._capture_one(bs, variant=variant)
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
+
+    def release_graphs(self) -> None:
+        """Drop the captured decode graphs so the backends may rebind.
+
+        The caller resets kernel caches that point into the destroyed graphs.
+        """
+        global global_graph_memory_pool
+        if self.disable or not self._owns_graphs:
+            return
+        for tree in (self.attn_backend, self.draft_attn_backend):
+            if tree is not None:
+                tree.note_graphs_released()
+        self._owns_graphs = False
+        # The next capture starts a fresh mempool, like the prefill graph's.
+        global_graph_memory_pool = None
+        self.graphs.clear()
+        self.output_buffers.clear()
+        self._metadata_snapshots.clear()
 
     def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
         if self.sampling_backend is None:

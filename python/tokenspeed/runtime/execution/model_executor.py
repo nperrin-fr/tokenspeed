@@ -322,6 +322,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
+        self._serving = False
         # Every pool runs on the shared cache arena and publishes a runtime
         # contract; the per-group tables travel as CacheBatchMetadata. Fail
         # fast here rather than at the first forward or, worse, a CUDA-graph
@@ -483,10 +484,8 @@ class ModelExecutor:
 
         workspace_pool(self.device).freeze()
 
-        if not self.forward_step.disable:
-            self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
+        self.forward_step.capture()
+        self.prefill_graph.capture(self.forward_step)
 
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
@@ -978,6 +977,15 @@ class ModelExecutor:
             device=self.device,
         )
 
+    def note_serving_started(self) -> None:
+        """The first scheduler round ends the pre-serving window: no rebind after it."""
+        if self._serving:
+            return
+        self._serving = True
+        self.attn_backend.note_serving_started()
+        if self.draft_attn_backend is not None:
+            self.draft_attn_backend.note_serving_started()
+
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
@@ -985,6 +993,7 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
+        self.note_serving_started()
         graph_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -1082,6 +1091,7 @@ class ModelExecutor:
 
     def zero_cache_pages(self, pages):
         """Clear newly owned pages and return a CUDA completion event when needed."""
+        self.note_serving_started()
         if not pages:
             return None
 
@@ -1169,6 +1179,7 @@ class ModelExecutor:
         decode. The cache-transfer path additionally selects the transferred
         recurrent-state snapshot block from the resulting sequence length.
         """
+        self.note_serving_started()
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
             return
@@ -1204,6 +1215,7 @@ class ModelExecutor:
         multimodal_context=None,
         capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        self.note_serving_started()
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
         num_extends = forward_op.num_extends()
@@ -1518,6 +1530,7 @@ class ModelExecutor:
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
     ) -> None:
+        self.note_serving_started()
         # Remote spec candidates are CPU materialized; enqueue the H2D copy and
         # future_input_map update on execution_stream. The next forward's input
         # prep already waits on execution_stream before reading runtime state.
@@ -1549,11 +1562,13 @@ class ModelExecutor:
 
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
         """Clear backend restore state before publishing RDMA destinations."""
+        self.note_serving_started()
         slots = [int(slot) for slot in req_pool_indices]
         with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 
     def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
         """Arm backend first-decode hydration after remote transfer success."""
+        self.note_serving_started()
         with self.device_module.stream(self.execution_stream):
             self.attn_backend.mark_remote_cache_ready(int(req_pool_idx))

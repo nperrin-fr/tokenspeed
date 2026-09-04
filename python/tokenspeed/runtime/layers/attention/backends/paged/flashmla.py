@@ -56,6 +56,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -218,6 +219,14 @@ class FlashMLABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Metadata init
     # ------------------------------------------------------------------
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_prefill_metadata = None
+        self.chunked_prefill_metadata = None
+        self._decode_tile_metadata = None
+        self._decode_tile_metadata_keepalive = []
 
     def init_forward_metadata(
         self,

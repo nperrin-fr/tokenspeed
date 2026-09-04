@@ -53,11 +53,18 @@ class CacheGroupGeometry:
             write locations ride — or None when the pool publishes no such
             group (a single-group pool's sole group then serves as the
             history).
+        row_geometry: ``group_id -> (rows_per_page, entry_stride_tokens)``
+            for every non-state group: the physical row layout the leaves'
+            kernels read, so a rebind keeps it.
+        retentions: ``group_id -> retention`` for every non-state group; the
+            fact ``full_history_group_id`` is chosen from.
     """
 
     granularities: dict[str, int] = field(default_factory=dict)
     families: dict[str, str] = field(default_factory=dict)
     full_history_group_id: str | None = None
+    row_geometry: dict[str, tuple[int | None, int | None]] = field(default_factory=dict)
+    retentions: dict[str, str] = field(default_factory=dict)
 
     def granularity_of(self, group_id: str) -> int:
         """This group's block granularity; an unknown id is a contract bug.
@@ -104,4 +111,14 @@ def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
         full_history_group_id=(
             str(full_history.group_id) if full_history is not None else None
         ),
+        row_geometry={
+            str(spec.group_id): (spec.rows_per_page, spec.entry_stride_tokens)
+            for spec in cache_group_specs
+            if spec.family != "state"
+        },
+        retentions={
+            str(spec.group_id): str(spec.retention)
+            for spec in cache_group_specs
+            if spec.family != "state"
+        },
     )

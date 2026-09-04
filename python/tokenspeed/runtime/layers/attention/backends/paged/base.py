@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
-class PagedAttentionBackend(ABC):
+class PagedAttentionBackend(CachePoolBinding, ABC):
     """One cache group's paged attention kernels and their metadata.
 
     Persistent decode state is leaf-owned: ``init_cuda_graph_state`` allocates
@@ -118,7 +119,7 @@ class PagedAttentionBackend(ABC):
         self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
         self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.head_dim = spec.head_dim
-        self.cache_pool: CachePool | None = None
+        self._init_pool_binding()
         # Persistent decode buffers (``init_cuda_graph_state``) and the cached
         # per-bs metadata views over them (each leaf's ``_decode_views``).
         self.page_table_buf: torch.Tensor | None = None
@@ -129,20 +130,24 @@ class PagedAttentionBackend(ABC):
     # Static shape / lifecycle
     # ------------------------------------------------------------------
 
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        """Remember the pool whose buffers this leaf's kernels read."""
-        self.cache_pool = cache_pool
-
-    def child_backends(self) -> tuple:
-        """Leaves compose nothing (the DSA leaf overrides for its dense child)."""
-        return ()
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        # Graph buffers and views return with init_cuda_graph_state.
+        self.page_table_buf = None
+        self.seq_lens_buf = None
+        self._decode_views_by_bs = {}
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (e.g. sliding window sizes)."""
+        for backend in self.child_backends():
+            backend.configure_runtime(**kwargs)
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake; most
         leaves keep attention eager at the break points and need none."""
+        self.refuse_while_serving()
+        for backend in self.child_backends():
+            backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     @property
     def verify_floor(self) -> int:
@@ -189,6 +194,7 @@ class PagedAttentionBackend(ABC):
         unified refresh serves eager decode from the same buffers. A leaf
         with more persistent decode state extends this (``super()`` first).
         """
+        self.refuse_while_live()
         entries = max_bs * self.block_decode_expansion
         # The router hands this leaf [bs, max_num_pages] tables (context_len
         # already carries the spec-verify overshoot); null page 0 is the

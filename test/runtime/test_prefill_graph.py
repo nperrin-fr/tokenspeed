@@ -647,9 +647,14 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
     def _bare(self, raises=None):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
+        pg._owns_graphs = False
+        pg._captures, pg._outputs = {}, {}
+        pg._pool = pg._captured_hidden_mode = None
         pg.capture_buckets = [4]
         pg.attn_backend = SimpleNamespace(
-            init_prefill_graph_state=lambda **kwargs: None
+            init_prefill_graph_state=lambda **kwargs: None,
+            note_graphs_captured=lambda: None,
+            note_graphs_released=lambda: None,
         )
         pg.block_table = self.torch.zeros(4, 4, dtype=self.torch.int32)
         pg.config = SimpleNamespace(
@@ -671,17 +676,54 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         return pg
 
     def test_capture_failure_propagates_untouched(self):
-        """Nothing between the backend and the operator: same exception object,
-        same traceback. ``capture`` has no handler at all, so a partial ladder
-        cannot be left behind -- the boot dies with it."""
+        """The operator sees the backend's own exception; nothing handles it."""
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
+        released = []
+        pg.attn_backend.note_graphs_released = lambda: released.append(True)
         with self.assertRaises(RuntimeError) as caught:
             pg.capture(None)
         self.assertIs(caught.exception, cause)
+        self.assertEqual(released, [])
 
     def test_successful_capture_does_not_raise(self):
         self._bare().capture(None)
+
+    def test_release_drops_every_bucket_and_tells_the_backend(self):
+        pg = self._bare()
+        released = []
+        pg.attn_backend.note_graphs_released = lambda: released.append(True)
+        pg._owns_graphs = True
+        pg._captures, pg._outputs = {4: object()}, {4: object()}
+        pg._pool, pg._captured_hidden_mode = object(), "text"
+
+        pg.release_graphs()
+        pg.release_graphs()
+
+        self.assertEqual((pg._captures, pg._outputs, pg._pool), ({}, {}, None))
+        self.assertEqual(released, [True], "the second release owns nothing")
+
+    def test_a_second_capture_is_refused_until_released(self):
+        pg = self._bare()
+        captured = []
+        pg.attn_backend.note_graphs_captured = lambda: captured.append(True)
+
+        pg.capture(None)
+        with self.assertRaisesRegex(RuntimeError, "release_graphs"):
+            pg.capture(None)
+
+        self.assertEqual(captured, [True])
+
+    def test_release_is_a_no_op_when_prefill_graphs_are_disabled(self):
+        pg = self._bare()
+        released = []
+        pg.attn_backend.note_graphs_released = lambda: released.append(True)
+        pg._owns_graphs = True
+        pg.disable = True
+
+        pg.release_graphs()
+
+        self.assertEqual(released, [])
 
     def test_oom_propagates(self):
         """OOM keeps its own type and message. The capture pool not fitting is

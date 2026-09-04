@@ -75,6 +75,8 @@ class SpeculativeStateBackend(Protocol):
         num_extends: int,
     ) -> None: ...
 
+    def drop_verify_scratch(self) -> None: ...
+
 
 _SpeculativeStateBackendT = TypeVar(
     "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
@@ -108,8 +110,84 @@ class SparseTopKShare:
         self.decode = None
 
 
-class AttentionBackend(ABC):
-    """The runner-facing contract; see the module docstring."""
+class CachePoolBinding:
+    """A node's bound cache pool and the graph owners recording its buffers."""
+
+    BINDING_FIELDS = ("cache_pool", "_graph_owners", "_serving")
+
+    def _init_pool_binding(self) -> None:
+        self.cache_pool: CachePool | None = None
+        self._graph_owners = 0
+        self._serving = False
+
+    def child_backends(self) -> tuple[CachePoolBinding, ...]:
+        """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
+        return ()
+
+    def _subtree(self) -> list[CachePoolBinding]:
+        nodes: list[CachePoolBinding] = [self]
+        for backend in self.child_backends():
+            nodes.extend(backend._subtree())
+        return nodes
+
+    def note_graphs_captured(self) -> None:
+        """A graph owner recorded this subtree's buffers; rebinds wait for its release."""
+        for node in self._subtree():
+            node._graph_owners += 1
+
+    def note_graphs_released(self) -> None:
+        nodes = self._subtree()
+        if any(node._graph_owners == 0 for node in nodes):
+            raise RuntimeError("graphs released that were never captured")
+        for node in nodes:
+            node._graph_owners -= 1
+
+    def note_serving_started(self) -> None:
+        """The executor is built: from now on no node rebinds or re-initialises."""
+        for node in self._subtree():
+            node._serving = True
+
+    def refuse_while_serving(self) -> None:
+        """Raise once the first scheduler-driven operation has run."""
+        if self._serving:
+            raise RuntimeError("cannot rebind or re-initialise once serving has begun")
+
+    def refuse_while_live(self) -> None:
+        """Raise if a captured graph records this node's buffers or serving has begun."""
+        if self._graph_owners:
+            raise RuntimeError(
+                "cannot rebind or re-initialise while captured graphs record the buffers"
+            )
+        self.refuse_while_serving()
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        """Raise if this node or any child cannot rebind to ``cache_pool``."""
+        self.refuse_while_live()
+        for backend in self.child_backends():
+            backend.validate_cache_pool(cache_pool)
+
+    def set_cache_pool(self, cache_pool: CachePool) -> None:
+        """Bind: every node agrees, then the children bind, then this node."""
+        self.validate_cache_pool(cache_pool)
+        for backend in self.child_backends():
+            backend.set_cache_pool(cache_pool)
+        self._publish_cache_pool(cache_pool)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """A node's own binding work: read the old pool before super(), use the new one after."""
+        self.cache_pool = cache_pool
+
+
+class AttentionBackend(CachePoolBinding, ABC):
+    """The runner-facing contract; see the module docstring.
+
+    A subclass that skips ``__init__`` calls ``_init_pool_binding()`` itself.
+    """
+
+    BINDING_FIELDS = CachePoolBinding.BINDING_FIELDS + (
+        "_speculative_state_backends",
+        "_sparse_topk",
+    )
 
     # Cache families this node consumes from the pool contract (startup
     # validation: every published family must have a consumer); composites
@@ -130,22 +208,24 @@ class AttentionBackend(ABC):
         self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
         self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.head_dim = spec.head_dim
-        self.cache_pool: CachePool | None = None
-        self._speculative_state_backends: list[SpeculativeStateBackend] = []
+        self._init_pool_binding()
 
     # ------------------------------------------------------------------
     # Structure
     # ------------------------------------------------------------------
 
-    def set_cache_pool(self, cache_pool: CachePool) -> None:
-        """Bind the pool whose buffers this node's kernels read."""
-        self.cache_pool = cache_pool
+    def _init_pool_binding(self) -> None:
+        """The binding lifecycle fields; wrappers that skip __init__ call this."""
+        super()._init_pool_binding()
+        self._speculative_state_backends: list[SpeculativeStateBackend] = []
+        self._sparse_topk = SparseTopKShare()
 
-    def child_backends(self) -> tuple[AttentionBackend, ...]:
-        """Sub-backends this node delegates to (drives the CUDA-graph
-        support resolution and the pointer-identity walk); leaves return
-        ``()``."""
-        return ()
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """Record the pool and drop the verify caches built on the old one."""
+        super()._publish_cache_pool(cache_pool)
+        for backend in self._speculative_state_backends:
+            backend.drop_verify_scratch()
+        self._sparse_topk.clear()
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (information unavailable at
@@ -153,7 +233,10 @@ class AttentionBackend(ABC):
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake.
-        Default: no-op — attention stays eager at the break points."""
+        Default: nothing of its own — attention stays eager at the break points."""
+        self.refuse_while_serving()
+        for backend in self.child_backends():
+            backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
@@ -310,10 +393,7 @@ class AttentionBackend(ABC):
         builds a forward's metadata; composites fronting a paged child route
         to the child's, so the model, the indexer and the drafter meet the
         same object whichever level of the tree they hold."""
-        share = self.__dict__.get("_sparse_topk")
-        if share is None:
-            share = self.__dict__["_sparse_topk"] = SparseTopKShare()
-        return share
+        return self._sparse_topk
 
     def update_mamba_state_after_mtp_verify(self, accepted_lengths) -> None:
         """Commit recurrent-state pages after MTP verification; only nodes
@@ -384,12 +464,8 @@ class AttentionBackend(ABC):
         self, backend: SpeculativeStateBackend
     ) -> None:
         """Register a model side-state consumer of MTP verification results."""
-        backends = getattr(self, "_speculative_state_backends", None)
-        if backends is None:
-            backends = []
-            self._speculative_state_backends = backends
-        if backend not in backends:
-            backends.append(backend)
+        if backend not in self._speculative_state_backends:
+            self._speculative_state_backends.append(backend)
 
     def find_speculative_state_backend(
         self, backend_type: type[_SpeculativeStateBackendT]
@@ -398,7 +474,7 @@ class AttentionBackend(ABC):
         return next(
             (
                 backend
-                for backend in getattr(self, "_speculative_state_backends", ())
+                for backend in self._speculative_state_backends
                 if isinstance(backend, backend_type)
             ),
             None,
@@ -408,7 +484,7 @@ class AttentionBackend(ABC):
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
         """Publish MTP accept/reject results to registered model side-state."""
-        for backend in getattr(self, "_speculative_state_backends", ()):
+        for backend in self._speculative_state_backends:
             backend.commit_after_mtp_verify(accepted_lengths, num_extends=num_extends)
 
     @contextmanager

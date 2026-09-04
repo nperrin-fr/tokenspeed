@@ -266,6 +266,7 @@ class PrefillGraph:
         self._captured_hidden_mode = None
         # One captured graph + bucket-sized output per padded token bucket.
         self._captures: dict[int, BreakableCapture] = {}
+        self._owns_graphs = False
         self._outputs: dict[int, CapturedForward] = {}
 
     # ------------------------------------------------------------------
@@ -296,6 +297,8 @@ class PrefillGraph:
         """
         if self.disable:
             return
+        if self._owns_graphs:
+            raise RuntimeError("prefill graphs are captured; release_graphs() first")
         weight = self._embed_tokens.weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
@@ -310,8 +313,22 @@ class PrefillGraph:
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
+        self.attn_backend.note_graphs_captured()
+        self._owns_graphs = True
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper)
+
+    def release_graphs(self) -> None:
+        """Drop the captured buckets and their pool so the backend may rebind."""
+        if self.disable or not self._owns_graphs:
+            return
+        self.attn_backend.note_graphs_released()
+        self._owns_graphs = False
+        self._captures.clear()
+        self._outputs.clear()
+        self._pool = None
+        self._input_embeds_buf = None
+        self._captured_hidden_mode = None
 
     def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
         rank = self.config.global_rank

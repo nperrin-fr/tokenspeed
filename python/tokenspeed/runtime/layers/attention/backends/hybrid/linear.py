@@ -61,6 +61,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = set(full_attn_layers)
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
+        self._init_pool_binding()
 
     # The MLA full-attention sub-backend owns the spec-decode token width and
     # the chunked-prefill machinery. The DeepseekV3-style MLA layer forward
@@ -132,11 +133,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
 
-    def set_cache_pool(self, cache_pool) -> None:
-        self.cache_pool = cache_pool
-        for backend in self.child_backends():
-            backend.set_cache_pool(cache_pool)
-
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend
@@ -149,6 +145,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        self.refuse_while_live()
         # Both children are runner-facing nodes whose init_cuda_graph_state
         # absorbs the runner extras (cache_group_specs, ...) through **kwargs.
         self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)

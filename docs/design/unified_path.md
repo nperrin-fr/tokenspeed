@@ -63,6 +63,78 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Rebinding a cache pool
+
+`set_cache_pool` may run more than once on the same backend tree: a memory
+probe binds a small pool, captures into a throwaway graph pool, then binds
+the real pool. The contract is that a rebound backend is indistinguishable
+from one first bound to that pool:
+
+* Every node first answers `validate_cache_pool` for the whole subtree, and
+  only then do the children bind and the node publish its pool, so a
+  rejected rebind moves nothing (a router's leaves exist only from its first
+  bind on, so the first bind builds and binds them inside its own publish);
+  the registry validates the target and the draft tree before it binds
+  either. `set_cache_pool` is that sequence, shared by every node through
+  `CachePoolBinding` and never overridden; a node does its own work in
+  `_publish_cache_pool` (`set_kv_pool` on the state backends is a retained
+  alias). Atomicity covers rejections only: a failure inside a node's own
+  binding work propagates, and the caller rebuilds the tree. A node rejects
+  a pool that changes the geometry it owns: the router its group geometry
+  (granularities, families, retentions and the row layout the leaves'
+  kernels read), the state backends the state group ids, checkpoint grain
+  and the state layers' ids and shapes, DeepSeek V4 the group ids and row
+  geometry, Inkling the ShortConv geometry. Page counts and transfer policy
+  may change. Paged leaves own kernel geometry only; the router validates
+  group geometry for them.
+* Binding drops every pool-derived latch: pointer tables, scratch and views,
+  per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
+  ring and pending remote restores, and side-state verify caches. The state
+  backends keep their pool-independent index buffers, so a same-geometry
+  replacement stays usable without re-initialisation of those buffers (a
+  router in the same tree still needs `init_cuda_graph_state` before any
+  metadata call); the caller still runs `configure_runtime` (with the new
+  pool's specs and page counts), `init_cuda_graph_state`,
+  `init_prefill_graph_state` and `preallocate_verify_workspace` again after
+  a rebind, as after a first bind. A probe pool must still hold `max_bs`
+  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
+  slab. The backend tree covers only itself: the executor's own pool
+  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  pool) are the caller's to re-publish.
+* A rebind is refused while captured graphs record the buffers being
+  dropped: each graph owner (`ForwardStepRunner`, `PrefillGraph`) calls
+  `note_graphs_captured` on its tree root when it captures and
+  `note_graphs_released` from its `release_graphs`; the notes reach every
+  node, and each waits for every owner. The same guard refuses
+  `init_cuda_graph_state`, which reallocates the recorded buffers
+  (`init_prefill_graph_state` allocates the prefill owner's own buffers and
+  runs after the decode capture, as at startup, so only the serving half of
+  the guard applies to it), and an owner captures once: it is released
+  before anything re-initialises or captures again. The window closes when
+  the device side is built (the L2 layerwise-load tracker and the PD
+  transfer contract then hold the pool) or at the executor's first
+  scheduler-driven operation on the pool (a forward, an idle forward, a
+  remote-cache slot update, a page zeroing), whichever comes first: the tree
+  is marked serving, and from then on the guard refuses every rebind and re-
+  initialisation (`preallocate_verify_workspace` included;
+  `configure_runtime`, an idempotent latch, is not guarded) whether or not
+  graphs exist. A rebind is therefore an operation inside executor
+  construction. `release_graphs` is followed immediately by the rebind,
+  whose publish drops the metadata that still aliases the released graph
+  mempool. `release_graphs` releases the graphs only: the owner keeps its
+  pool references, so it may capture again for the same pool, and a rebound
+  tree gets a new owner. A graph owner is built for one pool: after a rebind
+  the executor constructs a new one, which sizes `init_cuda_graph_state`
+  from the new arena; `release_graphs` also forgets the graph mempool, so
+  the next capture starts a fresh one. Destroying graphs also destroys
+  buffers that eager kernels allocated inside a capture and still point at
+  (flashinfer's trtllm-gen MoE runner caches such pointers): the caller
+  resets those caches before the next forward or capture. The executor
+  freezes the device-global workspace pool before it captures; the
+  orchestrator that releases both owners unfreezes it before the rebind re-
+  runs sizing and freezes it again before the recapture, since neither owner
+  may unfreeze a block the other still addresses.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under

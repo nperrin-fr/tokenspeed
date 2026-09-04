@@ -41,6 +41,7 @@ class _ExecutionStream:
 
 def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._serving = False
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.execution_stream = _ExecutionStream()
@@ -74,6 +75,9 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     can establish these lengths: they come from the prefill node's complete
     prompt, not from the local extend prefix."""
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._serving = False
+    executor.attn_backend = SimpleNamespace(note_serving_started=lambda: None)
+    executor.draft_attn_backend = None
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.execution_stream = _ExecutionStream()
@@ -122,6 +126,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
             events.append("future-input")
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._serving = False
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([0]),
         state_write_req_pool_indices_buf=torch.tensor([0]),
@@ -159,6 +164,27 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "future-input",
         "draft-final",
     ]
+
+
+def test_the_first_round_marks_the_backend_trees_serving_once():
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor._serving = False
+    notes = []
+    executor.attn_backend = SimpleNamespace(
+        note_serving_started=lambda: notes.append("target")
+    )
+    executor.draft_attn_backend = SimpleNamespace(
+        note_serving_started=lambda: notes.append("draft")
+    )
+
+    executor.note_serving_started()
+    executor.note_serving_started()
+
+    assert notes == ["target", "draft"]
+    executor.draft_attn_backend = executor.attn_backend
+    executor._serving = False
+    executor.note_serving_started()
+    assert notes == ["target", "draft", "target", "target"]
 
 
 def test_cudagraph_gc_flag_reaches_the_capture_context():
@@ -213,6 +239,7 @@ def test_non_spec_decode_routes_through_verify():
     calls = []
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._serving = False
     executor.drafter = None
     executor.config = SimpleNamespace(output_length=1)
     executor.input_buffers = SimpleNamespace(

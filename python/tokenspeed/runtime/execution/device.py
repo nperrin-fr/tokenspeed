@@ -796,6 +796,8 @@ def build_device_side(
             dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
         )
 
+    # The L2 tracker and the PD transfer contract hold this pool: no rebind after here.
+    executor.note_serving_started()
     return DeviceBuild(
         specs=specs,
         transfer=kv_transfer,

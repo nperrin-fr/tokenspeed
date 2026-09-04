@@ -60,6 +60,7 @@ from tokenspeed.runtime.layers.attention.registry import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -143,6 +144,11 @@ class MSAAttnBackend(PagedAttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self.forward_decode_metadata = None
+        self.forward_extend_metadata = None
 
     @property
     def tokens_per_req(self) -> int:
@@ -517,11 +523,6 @@ class MSAHybridAttnBackend(AttentionBackend):
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.full_router, self.sparse_router)
 
-    def set_cache_pool(self, cache_pool) -> None:
-        self.cache_pool = cache_pool
-        self.full_router.set_cache_pool(cache_pool)
-        self.sparse_router.set_cache_pool(cache_pool)
-
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
@@ -539,6 +540,7 @@ class MSAHybridAttnBackend(AttentionBackend):
         self.sparse_router.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+        self.refuse_while_live()
         self.full_router.init_cuda_graph_state(max_bs, **kwargs)
         self.sparse_router.init_cuda_graph_state(max_bs, **kwargs)
 

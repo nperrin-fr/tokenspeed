@@ -7,8 +7,10 @@ check the fused triton fills against the same torch reference.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
+import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -16,6 +18,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
+from runtime.cache_pool_test_utils import (
+    assert_no_alias,
+    binding_state,
+    reachable_tensors,
+    storages_of,
+)
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -248,6 +256,7 @@ class _StubLeaf(PagedAttentionBackend):
         self.chunked_prefill_metadata = "chunk-meta"
 
     def init_cuda_graph_state(self, max_bs):
+        self.refuse_while_live()
         self.page_table_buf = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32
         )
@@ -722,6 +731,447 @@ class CacheGroupRouterTest(unittest.TestCase):
         kept = (share.prefill, share.decode)
         router.advance_draft_forward_metadata(torch.ones(2, dtype=torch.int32))
         self.assertEqual((share.prefill, share.decode), kept)
+
+
+def _spec(
+    group_id,
+    family="history",
+    granularity=4,
+    retention="full_history",
+    rows_per_page=None,
+    entry_stride_tokens=None,
+    sliding_window_tokens=None,
+):
+    return SimpleNamespace(
+        group_id=group_id,
+        family=family,
+        retention=retention,
+        block_granularity=granularity,
+        rows_per_page=rows_per_page,
+        entry_stride_tokens=entry_stride_tokens,
+        sliding_window_tokens=sliding_window_tokens,
+    )
+
+
+def _pool(*specs, paged=(FULL, SWA)):
+    return SimpleNamespace(
+        arena=SimpleNamespace(cache_group_specs=tuple(specs)),
+        paged_group_ids=tuple(paged),
+    )
+
+
+class CacheGroupRouterRebindTest(unittest.TestCase):
+    """A same-geometry rebind must keep the leaves it already initialised."""
+
+    def _router(self):
+        built = []
+
+        def factory(group_id, granularity):
+            leaf = _StubLeaf(granularity)
+            built.append(group_id)
+            return leaf
+
+        router = CacheGroupRouter(
+            factory, is_draft=False, spec_num_tokens=1, device="cpu"
+        )
+        return router, built
+
+    def test_same_geometry_rebind_keeps_leaves_and_their_state(self):
+        router, built = self._router()
+        specs = (_spec(FULL), _spec(SWA), _spec("linear_attention_0", "state", 8))
+        router.set_cache_pool(_pool(*specs))
+        self.assertEqual(sorted(built), sorted([FULL, SWA]))
+        first = dict(router.leaves)
+        counter = object()
+        router.register_step_counter(counter)
+        router._stacks = object()
+        router.decode_write_locations = object()
+
+        bigger = _pool(*specs)  # a different pool object, the same published geometry
+        router.set_cache_pool(bigger)
+
+        self.assertEqual(len(built), 2, "leaves must not be rebuilt")
+        self.assertIsNone(router._stacks)
+        self.assertIsNone(router.decode_write_locations)
+        self.assertIsNone(router._extend_write_locations)
+        self.assertEqual(router._decode_views, {})
+        self.assertEqual(router._decode_request_offset, 0)
+        for gid, leaf in router.leaves.items():
+            self.assertIs(leaf, first[gid])
+            self.assertIs(leaf.step_counter, counter)
+            self.assertIs(leaf.cache_pool, bigger)
+        self.assertIs(router.cache_pool, bigger)
+
+    def test_changed_geometry_rebind_is_rejected(self):
+        router, built = self._router()
+        original = _pool(_spec(FULL), _spec(SWA))
+        router.set_cache_pool(original)
+        first = dict(router.leaves)
+
+        with self.assertRaises(RuntimeError):
+            router.set_cache_pool(_pool(_spec(FULL, granularity=8), _spec(SWA)))
+
+        self.assertEqual(len(built), 2)
+        self.assertEqual(router.leaves, first)
+        self.assertIs(router.cache_pool, original)
+        router.set_cache_pool(original)
+        self.assertEqual(router.leaves, first)
+
+    def test_same_span_but_different_row_geometry_is_rejected(self):
+        """Equal products do not make two published row geometries identical."""
+        router, _ = self._router()
+        original = _pool(
+            _spec(FULL, granularity=4, rows_per_page=4, entry_stride_tokens=1),
+            paged=(FULL,),
+        )
+        changed = _pool(
+            _spec(FULL, granularity=4, rows_per_page=2, entry_stride_tokens=2),
+            paged=(FULL,),
+        )
+        router.set_cache_pool(original)
+
+        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+            router.set_cache_pool(changed)
+
+        self.assertIs(router.cache_pool, original)
+
+    def test_rebind_rejects_a_changed_group_retention_contract(self):
+        """A group's allocation/retention meaning is part of its published contract."""
+        router, _ = self._router()
+        original = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+        )
+        changed = _pool(
+            _spec(FULL, retention="full_history"),
+            _spec(SWA, retention="full_history"),
+        )
+        router.set_cache_pool(original)
+
+        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+            router.set_cache_pool(changed)
+
+        self.assertIs(router.cache_pool, original)
+
+    def test_a_serving_tree_refuses_rebinds_even_without_graphs(self):
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+        leaf = next(iter(router.leaves.values()))
+
+        router.note_serving_started()
+        with self.assertRaisesRegex(RuntimeError, "serving has begun"):
+            router.set_cache_pool(_pool(*specs))
+        with self.assertRaisesRegex(RuntimeError, "serving has begun"):
+            leaf.set_cache_pool(_pool(*specs))
+        with self.assertRaisesRegex(RuntimeError, "serving has begun"):
+            router.init_cuda_graph_state(2)
+        with self.assertRaisesRegex(RuntimeError, "serving has begun"):
+            router.init_prefill_graph_state(8, 2)
+
+    def test_the_alias_gate_sees_through_modules(self):
+        """Registered side backends are nn.Modules; a view they keep must be found."""
+        slab = torch.zeros(4, 4)
+
+        class _Side(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._verify_scratch = slab[1:3]
+
+        node = SimpleNamespace(_speculative_state_backends=[_Side()])
+        self.assertEqual(len(reachable_tensors(node)), 1)
+        with self.assertRaisesRegex(AssertionError, "_speculative_state_backends"):
+            assert_no_alias(node, storages_of(slab))
+
+    def test_binding_fields_are_exactly_what_the_initialiser_writes(self):
+        from tokenspeed.runtime.layers.attention.backends.base import (
+            AttentionBackend,
+            CachePoolBinding,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+
+        node = CacheGroupRouter.__new__(CacheGroupRouter)
+        node._init_pool_binding()
+        self.assertEqual(set(vars(node)), set(AttentionBackend.BINDING_FIELDS))
+        leaf = MHAAttnBackend.__new__(MHAAttnBackend)
+        leaf._init_pool_binding()
+        self.assertEqual(set(vars(leaf)), set(CachePoolBinding.BINDING_FIELDS))
+
+    def test_a_failed_release_moves_no_count(self):
+        router, _ = self._router()
+        router.set_cache_pool(_pool(_spec(FULL), _spec(SWA)))
+        router.note_graphs_captured()
+        leaf = next(iter(router.leaves.values()))
+        leaf._graph_owners = 0
+
+        with self.assertRaisesRegex(RuntimeError, "never captured"):
+            router.note_graphs_released()
+
+        self.assertEqual(router._graph_owners, 1)
+
+    def test_a_rebound_router_matches_a_fresh_one_field_by_field(self):
+        specs = (_spec(FULL), _spec(SWA))
+        rebound, _ = self._router()
+        rebound.set_cache_pool(_pool(*specs))
+        rebound.init_cuda_graph_state(2)
+        old_tensors = [
+            t
+            for node in (rebound, *rebound.leaves.values())
+            for t in reachable_tensors(node)
+        ]
+        old = storages_of(*old_tensors)
+        # A served round's per-forward state, which the rebind must forget.
+        rebound._decode_views[(1, 1)] = object()
+        rebound.decode_write_locations = object()
+        rebound._extend_write_locations = {FULL: torch.zeros(1)}
+        rebound._decode_request_offset = 3
+        rebound.set_cache_pool(_pool(*specs))
+        rebound.init_cuda_graph_state(2)
+        fresh, _ = self._router()
+        fresh.set_cache_pool(_pool(*specs))
+        fresh.init_cuda_graph_state(2)
+
+        self.assertEqual(binding_state(rebound), binding_state(fresh))
+        for node in (rebound, *rebound.leaves.values()):
+            assert_no_alias(node, old)
+        self.assertGreaterEqual(len(old_tensors), 2 * len(rebound.leaves))
+
+    def test_re_initialising_is_refused_while_graphs_are_captured(self):
+        router, _ = self._router()
+        router.set_cache_pool(_pool(_spec(FULL), _spec(SWA)))
+        router.init_cuda_graph_state(2)
+        leaf = next(iter(router.leaves.values()))
+        page_table = leaf.page_table_buf
+
+        router.note_graphs_captured()
+        with self.assertRaisesRegex(RuntimeError, "captured graphs"):
+            router.init_cuda_graph_state(2)
+        # The executor captures decode first, then the prefill owner initialises.
+        router.init_prefill_graph_state(8, 2)
+
+        self.assertIs(leaf.page_table_buf, page_table)
+
+    def test_a_rebind_is_refused_while_graphs_are_captured(self):
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+        leaf = next(iter(router.leaves.values()))
+        page_table = leaf.page_table_buf
+
+        router.note_graphs_captured()
+        with self.assertRaisesRegex(RuntimeError, "captured graphs"):
+            router.set_cache_pool(_pool(*specs))
+
+        self.assertIs(leaf.page_table_buf, page_table)
+        router.note_graphs_released()
+        router.set_cache_pool(_pool(*specs))
+
+    def test_metadata_before_the_re_init_fails_loudly(self):
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+
+        router.set_cache_pool(_pool(*specs))
+
+        with self.assertRaisesRegex(RuntimeError, "init_cuda_graph_state must run"):
+            router.stacks
+
+    def test_rebound_leaves_are_as_unbound_as_fresh_ones(self):
+        """Graph buffers and views only come back with init_cuda_graph_state."""
+        router, _ = self._router()
+        specs = (_spec(FULL), _spec(SWA))
+        router.set_cache_pool(_pool(*specs))
+        router.init_cuda_graph_state(2)
+        for leaf in router.leaves.values():
+            leaf._decode_views_by_bs[1] = object()
+
+        router.set_cache_pool(_pool(*specs))
+
+        for leaf in router.leaves.values():
+            self.assertIsNone(leaf.page_table_buf)
+            self.assertIsNone(leaf.seq_lens_buf)
+            self.assertEqual(leaf._decode_views_by_bs, {})
+
+
+class PagedLeafRebindTest(unittest.TestCase):
+    """Every leaf forgets the per-forward and per-graph state it annotates as optional.
+
+    The gate reads ``self.<name>: <Type> | None = None`` annotations in ``__init__``
+    whose name mentions ``metadata`` or ends in ``_buf``; state declared another way
+    (DSA's page-table alias, FlashMLA's keepalive list) gets its own test below.
+    """
+
+    def _optional_slots(self, backend_cls):
+        import inspect
+
+        init = ast.parse(textwrap.dedent(inspect.getsource(backend_cls.__init__)))
+        slots = []
+        for node in ast.walk(init):
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Attribute)
+                and isinstance(node.target.value, ast.Name)
+                and node.target.value.id == "self"
+                and ast.unparse(node.annotation).endswith("| None")
+            ):
+                slots.append(node.target.attr)
+        return slots
+
+    def _check(self, backend_cls, expected):
+        slots = self._optional_slots(backend_cls)
+        self.assertTrue(slots)
+        self.assertEqual(sorted(slots), sorted(expected))
+        leaf = backend_cls.__new__(backend_cls)
+        leaf._init_pool_binding()
+        leaf.cache_pool = object()
+        stale = object()
+        for name in slots:
+            setattr(leaf, name, stale)
+        pool = object()
+
+        leaf.set_cache_pool(pool)
+
+        self.assertIs(leaf.cache_pool, pool)
+        for name in slots:
+            self.assertIsNone(getattr(leaf, name), name)
+
+    def test_mha_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+
+        self._check(
+            MHAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
+        )
+
+    def test_msa_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.msa import (
+            MSAAttnBackend,
+        )
+
+        self._check(
+            MSAAttnBackend, ["forward_decode_metadata", "forward_extend_metadata"]
+        )
+
+    def test_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+            MLAAttnBackend,
+        )
+
+        self._check(
+            MLAAttnBackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+            ],
+        )
+
+    def test_trtllm_mha_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+            TRTLLMMHAAttnBackend,
+        )
+
+        self._check(
+            TRTLLMMHAAttnBackend,
+            [
+                "forward_prefill_metadata",
+                "forward_decode_metadata",
+                "spec_cache_seqlens_buf",
+            ],
+        )
+
+    def test_trtllm_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLABackend,
+        )
+
+        self._check(
+            TRTLLMMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+            ],
+        )
+
+    def test_flashmla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+            FlashMLABackend,
+        )
+
+        self._check(
+            FlashMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+                "_decode_tile_metadata",
+            ],
+        )
+
+    def test_trtllm_leaf_forgets_the_verify_views(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+            TRTLLMMHAAttnBackend,
+        )
+
+        leaf = TRTLLMMHAAttnBackend.__new__(TRTLLMMHAAttnBackend)
+        leaf._init_pool_binding()
+        leaf._verify_views_by_bs = {1: object()}
+        leaf.set_cache_pool(object())
+        self.assertEqual(leaf._verify_views_by_bs, {})
+
+    def test_flashmla_leaf_forgets_the_tile_keepalives(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+            FlashMLABackend,
+        )
+
+        leaf = FlashMLABackend.__new__(FlashMLABackend)
+        leaf._init_pool_binding()
+        leaf.cache_pool = object()
+        leaf._decode_tile_metadata_keepalive = [object()]
+        leaf.set_cache_pool(object())
+        self.assertEqual(leaf._decode_tile_metadata_keepalive, [])
+
+    def test_cutedsl_mla_leaf_forgets_the_previous_forward(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
+            CuteDSLMLABackend,
+        )
+
+        self._check(
+            CuteDSLMLABackend,
+            [
+                "forward_decode_metadata",
+                "forward_prefill_metadata",
+                "chunked_prefill_metadata",
+            ],
+        )
+
+    def test_dsa_forgets_the_prefill_page_table_alias(self):
+        from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
+
+        backend = DSABackend.__new__(DSABackend)
+        backend._init_pool_binding()
+        backend._dense_backend = SimpleNamespace(
+            validate_cache_pool=lambda pool: None, set_cache_pool=lambda pool: None
+        )
+        backend._prefill_page_table = object()
+        backend.kpool_runtime = SimpleNamespace(prefill_plan=object())
+        backend.kpool_runtime.reset_forward = lambda req_pool_indices: setattr(
+            backend.kpool_runtime, "prefill_plan", None
+        )
+        pool = object()
+
+        backend.set_cache_pool(pool)
+
+        self.assertIs(backend.cache_pool, pool)
+        self.assertIsNone(backend._prefill_page_table)
+        self.assertIsNone(backend.kpool_runtime.prefill_plan)
 
 
 if __name__ == "__main__":

@@ -20,11 +20,16 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.qsa import bind_qsa_indexers
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 class _TestAttentionBackend:
@@ -38,6 +43,7 @@ class _TestAttentionBackend:
 
     def __init__(self, *, is_draft: bool) -> None:
         self.is_draft = is_draft
+        self._speculative_state_backends: list = []
 
 
 class _TestIndexer:
@@ -78,7 +84,7 @@ def test_qsa_backend_draft_never_commits_target_acceptance() -> None:
     )
 
     assert qsa_backend is None
-    assert not hasattr(attn_backend, "_speculative_state_backends")
+    assert attn_backend._speculative_state_backends == []
     assert indexer.commits == []
 
 
@@ -88,3 +94,7 @@ def test_qsa_backend_rejects_rebinding_to_another_model() -> None:
 
     with pytest.raises(RuntimeError, match="cannot be rebound"):
         bind_qsa_indexers(attn_backend, [_TestIndexer()])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
