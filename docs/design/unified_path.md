@@ -241,6 +241,15 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+The `sonic` backend is the one exception: one step-level predicate (every
+row's indicator is exactly `GREEDY`) routes the whole step to the greedy
+backend's kernels, on the eager path and, as the `sonic_greedy` variant, on
+replay alike (a second full-model graph is captured per batch size for it), so
+eager and replay agree. Both routes return a maximal token, but they break
+exact bf16 ties differently, so a greedy row's tie-break depends on whether
+its step is all-greedy. That is within the "ties excepted" contract and is
+pinned by the tied-logits test in `test/runtime/sampling/test_sonic_backend.py`.
+
 ### Non-speculative serving is the N == 1 case, not a second path
 
 One sampling rule for every batch: **prefill requests sample, decode
