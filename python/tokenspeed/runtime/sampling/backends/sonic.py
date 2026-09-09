@@ -56,6 +56,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
     SamplingBuffers,
@@ -65,6 +66,10 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     fused_multistep,
     fused_singular,
     make_tiling,
+)
+from tokenspeed_kernel.ops.sampling.sonic_exchange import (
+    SlabExchange,
+    slab_exchange_supported,
 )
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
@@ -76,6 +81,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -90,6 +96,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+logger = get_colorful_logger(__name__)
 
 
 def _sanitize(sp: SamplingParams) -> tuple[float, int, float, float]:
@@ -185,6 +193,7 @@ class SonicSamplingBackend(SamplingBackend):
         self.pool_rows = config.max_req_pool_size + 1
 
         major, minor = torch.cuda.get_device_capability(self.device)
+        self.arch = major * 10 + minor
         self._dispatch: dict[
             tuple[int, int | None],
             tuple[TwoStageWarpConfig | ThreeStageWarpConfig, TopKStrategy, int],
@@ -193,7 +202,7 @@ class SonicSamplingBackend(SamplingBackend):
         with torch.device(self.device):
 
             self.tiling, self.values, self.indices = make_tiling(
-                arch=major * 10 + minor,
+                arch=self.arch,
                 vocab_size=self.vocab_size,
                 batch_size=self.max_bs,
                 lookahead=self.gamma,
@@ -247,7 +256,81 @@ class SonicSamplingBackend(SamplingBackend):
             logit_bias=buffers.bias,
         )
 
+        # Vocab-parallel sampling (``configure_sharded_sampling``): the logits width the
+        # kernels see, sonic's shard kwargs and the candidate exchange; unsharded until armed.
+        self.logits_width = self.vocab_size
+        self.shard: dict[str, int] = {}
+        self.exchange: SlabExchange | None = None
+
         self._warmup()
+
+    @override
+    def configure_sharded_sampling(self, model) -> bool:
+        """Keep the lm_head vocab-parallel: each rank reduces its logits shard,
+        the packed candidates cross the TP group through an NVLS multicast
+        exchange, and every rank draws the same token from the merged union
+        (so no sampler-output broadcast either). Armed only when the whole TP
+        group can map multicast (a MIN vote), the shards tile the vocabulary
+        and output logprobs are off (they need the full logits)."""
+
+        processor = model.logits_processor
+
+        if (
+            processor is None
+            or self._tp_pg is None
+            or self.config.enable_output_logprobs
+        ):
+
+            return False
+
+        shard = int(model.lm_head.weight.shape[0])
+        world = len(self.config.tp_group)
+        rank = self.config.tp_group.index(dist.get_rank())
+
+        supported = (
+            slab_exchange_supported(self._tp_pg) and shard * world >= self.vocab_size
+        )
+        vote = torch.tensor([int(supported)], dtype=torch.int32, device=self.device)
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=self._tp_pg)
+
+        if not bool(vote.item()):
+
+            return False
+
+        with torch.device(self.device):
+
+            self.tiling, self.values, self.indices = make_tiling(
+                arch=self.arch,
+                vocab_size=shard,
+                batch_size=self.max_bs,
+                lookahead=self.gamma,
+                unpacked_buffers=self.spec,
+            )
+
+        self._dispatch.clear()
+        self.logits_width = shard
+        self.shard = dict(
+            world_size=world,
+            local_rank=rank,
+            shard_size=shard,
+            local_vocab=max(0, min(shard, self.vocab_size - rank * shard)),
+        )
+        self.exchange = SlabExchange(
+            self._tp_pg,
+            rank,
+            world,
+            self.max_bs * self.n_max,
+            self.tiling.scratchpad.shape[1] // MAX_K,
+            MAX_K,
+            self.device,
+        )
+        self._warmup()
+        processor.configure_sharded_sampling()
+        logger.info(
+            f"sonic: vocab-parallel sampling armed (TP {world}, shard {shard} of {self.vocab_size})"
+        )
+
+        return True
 
     # ------------------------------------------------------------------ #
     # JIT warm-up
@@ -265,7 +348,7 @@ class SonicSamplingBackend(SamplingBackend):
         with torch.device(self.device):
 
             logits = torch.zeros(
-                (self.max_bs * self.n_max, self.vocab_size), dtype=torch.bfloat16
+                (self.max_bs * self.n_max, self.logits_width), dtype=torch.bfloat16
             )
             slot = torch.zeros((self.max_bs,), dtype=torch.int64)
             offsets = torch.zeros((self.pool_rows,), dtype=torch.int32)
@@ -441,10 +524,10 @@ class SonicSamplingBackend(SamplingBackend):
 
     def _check_logits(self, logits: torch.Tensor) -> None:
 
-        if logits.dtype != torch.bfloat16 or logits.shape[-1] != self.vocab_size:
+        if logits.dtype != torch.bfloat16 or logits.shape[-1] != self.logits_width:
 
             raise ValueError(
-                f"SonicSamplingBackend requires bf16 logits of width {self.vocab_size} "
+                f"SonicSamplingBackend requires bf16 logits of width {self.logits_width} "
                 f"(sonic's kernels compile for bf16 only), got {logits.dtype} "
                 f"x {logits.shape[-1]}"
             )
@@ -477,6 +560,8 @@ class SonicSamplingBackend(SamplingBackend):
             noise_seeds=self.seeds,
             noise_offsets=offsets,
             noise_steps=self.n_max,
+            exchange=self.exchange,
+            **self.shard,
         )
 
     def _sample_rows(
@@ -504,8 +589,11 @@ class SonicSamplingBackend(SamplingBackend):
         )
         sampled = sel.tokens.view(-1)
 
-        # TP-rank sync (rank 0 wins): gathered logits are not bit-identical across ranks.
-        self.maybe_broadcast(sampled)
+        # TP-rank sync (rank 0 wins): gathered logits are not bit-identical across
+        # ranks; sharded sampling merges bit-identical candidates on every rank.
+        if self.exchange is None:
+
+            self.maybe_broadcast(sampled)
 
         self._write_logprob_outputs(logits_output, logits, sampling_info, sampled)
 
@@ -595,6 +683,8 @@ class SonicSamplingBackend(SamplingBackend):
             noise_seeds=self.seeds,
             noise_offsets=offsets,
             noise_steps=self.n_max,
+            exchange=self.exchange,
+            **self.shard,
         )
 
     @override
@@ -651,7 +741,9 @@ class SonicSamplingBackend(SamplingBackend):
         accept_lengths = torch.add(ver.offsets.view(-1), 1, out=self.accept_buf[:bs])
 
         # TP-rank sync — see sample().
-        self.maybe_broadcast(predict, accept_lengths)
+        if self.exchange is None:
+
+            self.maybe_broadcast(predict, accept_lengths)
 
         self._write_logprob_outputs(logits_output, logits, sampling_info, predict)
 

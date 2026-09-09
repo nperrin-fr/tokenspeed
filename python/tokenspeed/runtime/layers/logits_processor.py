@@ -279,6 +279,8 @@ class LogitsProcessor(nn.Module):
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+        # Set by a sampling backend that merges candidates across the TP group.
+        self.sharded_sampling = False
 
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -291,6 +293,11 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def configure_sharded_sampling(self) -> None:
+        """Hand the sampler this rank's logits shard instead of gathered logits
+        (steps that return input logprobs still gather)."""
+        self.sharded_sampling = True
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
@@ -692,6 +699,15 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        if (
+            self.sharded_sampling
+            and not dp_sampling
+            and not logits_metadata.extend_return_logprob
+        ):
+            # Vocab-parallel sampling: the backend merges per-rank candidates.
+            if self.final_logit_softcapping:
+                fused_softcap_generic(logits, self.final_logit_softcapping)
+            return logits
         if dp_sampling and not self.skip_all_gather:
             if self._logits_layout_executor is None:
                 raise RuntimeError(

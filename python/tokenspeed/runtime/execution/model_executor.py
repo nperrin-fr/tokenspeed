@@ -441,6 +441,9 @@ class ModelExecutor:
         self._last_dp_sampling_route_log: (
             tuple[str, int, bool, int, int, bool, int] | None
         ) = None
+        # Collective across the TP group: every rank arms or declines together.
+        if not self.dp_sampling_runtime_config.enabled:
+            self.sampling_backend.configure_sharded_sampling(self.model_runner.model)
 
         self._active_multimodal_context = None
         self._active_positions_override = None

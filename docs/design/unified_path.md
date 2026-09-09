@@ -276,6 +276,20 @@ packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 Triton backends and `sonic` return separate token and length buffers and take
 the executor's two-copy path (`get_packed_output_d2h` returns None).
 
+### Sampling backends may keep the lm_head vocab-parallel
+
+`SamplingBackend.configure_sharded_sampling(model)` lets a backend that can
+merge candidates across the attention-TP group take each rank's logits shard
+instead of gathered logits; the logits processor then skips its all-gather on
+sampling steps (steps that return input logprobs still gather). `sonic` arms
+it collectively (NVLS multicast reachable on every rank, output logprobs off):
+every rank reduces its shard to sonic's packed top-128 slab, the slabs cross
+the group through a multicast exchange with round-stamped flags, and every
+rank draws the same token from the merged union, so the sampler-output
+broadcast is skipped too. Pinned by
+`tokenspeed-kernel/test/thirdparty/test_sonic_sharded.py` (bitwise equal to
+the unsharded draw, sample and chain verify).
+
 ## What stays graph-only
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics

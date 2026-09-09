@@ -153,6 +153,16 @@ class SamplingBackend(ABC):
         override it to initialize backend-local communication buffers.
         """
 
+    def configure_sharded_sampling(self, model) -> bool:
+        """Sample on the vocab-parallel logits shards instead of gathered logits.
+
+        A backend that can merge candidates across the attention-TP group
+        overrides this, arms its exchange collectively, tells
+        ``model.logits_processor`` to stop gathering, and returns True.
+        Default: False (the runtime gathers the logits).
+        """
+        return False
+
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
         """Broadcast each tensor from tp_group[0] so all attention-TP ranks
         agree. No-op when sync is off or tp_size <= 1. Graph-safe."""

@@ -24,6 +24,11 @@ at import, instead of drifting silently.
    nothing is refreshed per step. The plane path is untouched when those
    arguments are absent (upstream indexes a caller-supplied plane by slot, so
    it only works without ``slot_mapping``).
+3. Vocab-sharded sampling exchanges sonic's packed slabs through a multicast
+   ``SlabExchange`` (``exchange=`` on the functional wrappers): the wrappers
+   publish after the reduction, and the selection / unpack kernels acquire-poll
+   the peers' flags before merging the ``[W, Z_v, M]`` union. Upstream's greedy
+   merge decoded the flat ``[W, Z_v']`` index by ``W``; it is fixed here.
 
 sonic binds ``triton`` at import, so its modules are imported under the
 ``tokenspeed_triton`` redirect here; a sonic that some earlier import already
@@ -41,6 +46,7 @@ from types import ModuleType
 from typing import Any
 
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton, triton
+from tokenspeed_kernel.ops.sampling.triton.exchange import fence_sys
 from tokenspeed_kernel.thirdparty.sonic.noise import gumbel_noise, step_seed
 
 
@@ -99,7 +105,7 @@ def _namespace(module: ModuleType, **patched: Any) -> dict[str, Any]:
             f"{module.__name__} does not bind {missing}; patch would not apply"
         )
     ns = dict(module.__dict__)
-    ns.update(gumbel_noise=gumbel_noise, step_seed=step_seed)
+    ns.update(gumbel_noise=gumbel_noise, step_seed=step_seed, fence_sys=fence_sys)
     ns.update(patched)
     return ns
 
@@ -332,6 +338,192 @@ _FUSED_MULTISTEP = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+# Patch 3: vocab-sharded exchange.
+# --------------------------------------------------------------------------- #
+_SHARDED_MAXIMUM = [
+    (
+        "        ((index // world_size) * shard_size)\n"
+        "        + ((index % world_size) * block_n)\n",
+        "        ((index // block_v) * shard_size)\n"
+        "        + ((index % block_v) * block_n)\n",
+    )
+]
+
+# The wait prologue shared by the selection and unpack kernels (sharded scratch only).
+_WAIT_PROLOGUE = (
+    "    if fl_ptr is not None:\n"
+    "\n"
+    "        rnd = tl.load(rd_ptr)\n"
+    "        band = rnd & 1\n"
+    "        flag_ids = tl.arange(0, n_flags)\n"
+    "        flag_mask = flag_ids < world_size * vocab_blocks\n"
+    "        flag_base = fl_ptr + (band * band_rows + row_id) * (world_size * vocab_blocks)\n"
+    "        pending = tl.min(\n"
+    "            tl.load(flag_base + flag_ids, mask=flag_mask, other=rnd, volatile=True), axis=0\n"
+    "        ) < rnd\n"
+    "\n"
+    "        while pending:\n"
+    "\n"
+    "            pending = tl.min(\n"
+    "                tl.load(flag_base + flag_ids, mask=flag_mask, other=rnd, volatile=True), axis=0\n"
+    "            ) < rnd\n"
+    "\n"
+    "        fence_sys(rnd)\n"
+    "        s_ptr += band * band_rows * stride_s\n"
+    "\n"
+)
+_EXCHANGE_POINTERS = (
+    "    s_ptr,                              # Scratch-Pad -> [ L, Z_v • M ].\n",
+    "    s_ptr,                              # Scratch-Pad -> [ L, Z_v • M ] (exchange: [ 2 • R, W • Z_v • M ]).\n"
+    "    fl_ptr,                             # Exchange Flags -> [ 2, R, W, Z_v ] (None: local scratch).\n"
+    "    rd_ptr,                             # Exchange Round -> [ 1 ].\n",
+)
+_EXCHANGE_CONSTEXPRS = (
+    "    band_rows: tl.constexpr,            # Exchange Band Rows -> R.\n"
+    "    n_flags: tl.constexpr,              # Next Power-of-2 Exchange Flags per Row -> W • Z_v.\n"
+    ") -> None:\n"
+)
+_SELECTION_EXCHANGE = [
+    _EXCHANGE_POINTERS,
+    (
+        "    block_q: tl.constexpr,              # Next Power-of-2 Top-K Log-Probabilities Targets -> T'.\n"
+        ") -> None:\n",
+        "    block_q: tl.constexpr,              # Next Power-of-2 Top-K Log-Probabilities Targets -> T'.\n"
+        + _EXCHANGE_CONSTEXPRS,
+    ),
+    (
+        "    row_id = tl.program_id(axis=0)\n    batch_id = row_id\n\n",
+        "    row_id = tl.program_id(axis=0)\n    batch_id = row_id\n\n"
+        + _WAIT_PROLOGUE,
+    ),
+]
+_UNPACK_EXCHANGE = [
+    _EXCHANGE_POINTERS,
+    (
+        "    block_q: tl.constexpr,              # Block Size of Cumulative Length(s).\n) -> None:\n",
+        "    block_q: tl.constexpr,              # Block Size of Cumulative Length(s).\n"
+        + _EXCHANGE_CONSTEXPRS,
+    ),
+    (
+        "    row_id = tl.program_id(axis=0)\n\n    if enable_pdl:\n",
+        "    row_id = tl.program_id(axis=0)\n\n"
+        + _WAIT_PROLOGUE
+        + "    if enable_pdl:\n",
+    ),
+]
+
+# Wrapper side: publish between the stages, hand the exchange buffers to stage 2, bump after.
+_EXCHANGE_STAGE = (
+    "    scratch, flags, rounds = bitpacked, None, None\n"
+    "    stride_s, stride_r, stride_b = stride_y, None, None\n"
+    "    band_rows, n_flags = 0, 0\n"
+    "\n"
+    "    if exchange is not None:\n"
+    "\n"
+    "        exchange.publish(bitpacked, vocab_blocks)\n"
+    "        scratch, flags, rounds = exchange.scratch, exchange.flags, exchange.round\n"
+    "        stride_s = exchange.scratch.stride(0)\n"
+    "        stride_r, stride_b = vocab_blocks * MAX_K, block_v * MAX_K\n"
+    "        band_rows, n_flags = exchange.band_rows, exchange.n_flags\n"
+    "\n"
+)
+_FUSED_SINGULAR_EXCHANGE = [
+    (
+        "    warp_config: TwoStageWarpConfig | None = None,\n) -> Selection:\n",
+        "    warp_config: TwoStageWarpConfig | None = None,\n"
+        "    # Vocab-sharded exchange (world_size > 1): publish the slab, merge the union.\n"
+        "    exchange: object | None = None,\n"
+        ") -> Selection:\n",
+    ),
+    (
+        "    cumulative_selection_kernel[grid_1d](\n"
+        "        # Input Data Pointer(s).\n"
+        "        bitpacked,\n"
+        "        indicators,\n",
+        _EXCHANGE_STAGE + "    cumulative_selection_kernel[grid_1d](\n"
+        "        # Input Data Pointer(s).\n"
+        "        scratch,\n"
+        "        flags,\n"
+        "        rounds,\n"
+        "        indicators,\n",
+    ),
+    (
+        "        stride_y,\n        None,\n        None,\n        stride_f,\n",
+        "        stride_s,\n        stride_r,\n        stride_b,\n        stride_f,\n",
+    ),
+    (
+        "        block_z,\n"
+        "        # Tuning Configuration.\n"
+        "        num_warps=config.second,\n"
+        "    )\n"
+        "\n"
+        "    return selection\n",
+        "        block_z,\n"
+        "        band_rows,\n"
+        "        n_flags,\n"
+        "        # Tuning Configuration.\n"
+        "        num_warps=config.second,\n"
+        "    )\n"
+        "\n"
+        "    if exchange is not None:\n"
+        "\n"
+        "        exchange.bump()\n"
+        "\n"
+        "    return selection\n",
+    ),
+]
+_FUSED_MULTISTEP_EXCHANGE = [
+    (
+        "    warp_config: ThreeStageWarpConfig | None = None,\n) -> Verification:\n",
+        "    warp_config: ThreeStageWarpConfig | None = None,\n"
+        "    # Vocab-sharded exchange (world_size > 1): publish the slab, merge the union.\n"
+        "    exchange: object | None = None,\n"
+        ") -> Verification:\n",
+    ),
+    (
+        "    cumulative_unpack_kernel[grid_1d](\n"
+        "        # Input Data Pointer(s).\n"
+        "        bitpacked,\n"
+        "        indicators,\n",
+        _EXCHANGE_STAGE + "    cumulative_unpack_kernel[grid_1d](\n"
+        "        # Input Data Pointer(s).\n"
+        "        scratch,\n"
+        "        flags,\n"
+        "        rounds,\n"
+        "        indicators,\n",
+    ),
+    (
+        "        stride_y,\n"
+        "        None,\n"
+        "        None,\n"
+        "        # Kernel Specific(s).\n"
+        "        block_n,\n"
+        "        block_v,\n"
+        "        block_q,\n"
+        "        # Tuning Configuration.\n"
+        "        num_warps=config.second,\n"
+        "    )\n",
+        "        stride_s,\n"
+        "        stride_r,\n"
+        "        stride_b,\n"
+        "        # Kernel Specific(s).\n"
+        "        block_n,\n"
+        "        block_v,\n"
+        "        block_q,\n"
+        "        band_rows,\n"
+        "        n_flags,\n"
+        "        # Tuning Configuration.\n"
+        "        num_warps=config.second,\n"
+        "    )\n"
+        "\n"
+        "    if exchange is not None:\n"
+        "\n"
+        "        exchange.bump()\n",
+    ),
+]
+
+
 def _apply() -> tuple[Any, Any]:
     with redirect_triton_to_tokenspeed_triton():
         import sonic_sampler.interface.functional.multistep as f_multistep
@@ -359,12 +551,22 @@ def _apply() -> tuple[Any, Any]:
     _patched(prologue, "resolve_indices", _BATCH_SIZE_HELPER, ns)
     reduction = _patched(prologue, "bitpacked_reduction_kernel", _BATCH_SIZE_KERNEL, ns)
 
-    ns = _namespace(multistep)
-    _patched(multistep, "resolve_indices", _BATCH_SIZE_HELPER, ns)
-    unpack = _patched(multistep, "cumulative_unpack_kernel", _BATCH_SIZE_KERNEL, ns)
-
     ns = _namespace(singular)
-    selection = _patched(singular, "cumulative_selection_kernel", _SELECTION_KERNEL, ns)
+    _patched(singular, "sharded_maximum", _SHARDED_MAXIMUM, ns)
+    greedy = _patched(singular, "greedy_maximum", [], ns)
+    selection = _patched(
+        singular,
+        "cumulative_selection_kernel",
+        _SELECTION_KERNEL + _SELECTION_EXCHANGE,
+        ns,
+    )
+
+    # The unpack kernel imports greedy_maximum from singular: bind the fixed one.
+    ns = _namespace(multistep, greedy_maximum=greedy)
+    _patched(multistep, "resolve_indices", _BATCH_SIZE_HELPER, ns)
+    unpack = _patched(
+        multistep, "cumulative_unpack_kernel", _BATCH_SIZE_KERNEL + _UNPACK_EXCHANGE, ns
+    )
 
     ns = _namespace(verify)
     _patched(verify, "verify_drafted", _VERIFY_DRAFTED, ns)
@@ -379,7 +581,9 @@ def _apply() -> tuple[Any, Any]:
         bitpacked_reduction_kernel=reduction,
         cumulative_selection_kernel=selection,
     )
-    fused_singular = _patched(f_singular, "fused_singular", _FUSED_SINGULAR, ns)
+    fused_singular = _patched(
+        f_singular, "fused_singular", _FUSED_SINGULAR + _FUSED_SINGULAR_EXCHANGE, ns
+    )
 
     ns = _namespace(
         f_multistep,
@@ -387,7 +591,9 @@ def _apply() -> tuple[Any, Any]:
         cumulative_unpack_kernel=unpack,
         chain_speculative_verification_kernel=verification,
     )
-    fused_multistep = _patched(f_multistep, "fused_multistep", _FUSED_MULTISTEP, ns)
+    fused_multistep = _patched(
+        f_multistep, "fused_multistep", _FUSED_MULTISTEP + _FUSED_MULTISTEP_EXCHANGE, ns
+    )
 
     return fused_singular, fused_multistep
 
