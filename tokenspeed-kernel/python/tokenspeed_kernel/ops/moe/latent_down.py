@@ -62,6 +62,10 @@ _K_TILE = 448 * 8
 # Per-kernel sweeps separate 608 from 304; end to end the two are indistinguishable.
 _LAMPORT_CTAS = 608
 _LAMPORT_THREADS = 512
+# 16-byte fragments, and the block width a narrow grid uses.
+_LAMPORT_VEC = 8
+_LAMPORT_NARROW_THREADS = 128
+_LAMPORT_CTA_STEP = 32
 # Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
 _DOWN_SENTINEL = 0x80008000
 _BF16_BYTES = 2
@@ -159,14 +163,23 @@ def _pool_slot(block_index: int) -> int:
     return block_index % _DOWN_POOL_DEPTH
 
 
-def _lamport_geometry(m: int) -> tuple[int, int]:
+def _lamport_geometry(m: int, latent_size: int) -> tuple[int, int]:
     """The ``(ctas, threads)`` the gather launches at for a batch this wide.
 
-    One pair serves every width today. The pair that wins is measured per M, so
-    a width-keyed table drops in here alone: the mailbox, the producers and the
-    dispatch are all indifferent to which geometry a width picks, and kernels
-    are built once per distinct pair rather than once per width.
+    The gather walks ``m * latent / 8`` fragments with a grid-stride loop and
+    spins on each, so a thread past the fragment count exits having done
+    nothing: cover the fragments once, in the narrowest block that still fits
+    the CTA budget, which spreads a small batch over four times the SMs. Past
+    the budget this yields to the wide pair rather than a partial grid, so every
+    width gets either a measured-better narrow grid or today's behaviour.
     """
+    fragments = m * (latent_size // _LAMPORT_VEC)
+    ctas = -(-fragments // _LAMPORT_NARROW_THREADS)
+    # Round up to a warp-count step: covering more than once is free, and it
+    # holds the build to one kernel per step instead of one per width.
+    ctas = -(-ctas // _LAMPORT_CTA_STEP) * _LAMPORT_CTA_STEP
+    if ctas <= _LAMPORT_CTAS:
+        return ctas, _LAMPORT_NARROW_THREADS
     return _LAMPORT_CTAS, _LAMPORT_THREADS
 
 
@@ -606,7 +619,7 @@ class KimiK3LatentDownOp:
         gathers: dict[tuple[int, int], _Gather] = {}
         gather_by_m: dict[int, _Gather] = {}
         for m in range(1, max_m + 1):
-            geometry = _lamport_geometry(m)
+            geometry = _lamport_geometry(m, latent_size)
             if geometry not in gathers:
                 ctas, threads = geometry
                 gathers[geometry] = LamportCopyKernel(

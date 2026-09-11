@@ -625,9 +625,11 @@ def test_build_slot_arms_and_binds_what_the_kernels_need() -> None:
         assert (kw["in_dim"], kw["latent_dim"]) == (hidden_size, latent)
     assert made["gather"]["hidden_dim"] == latent
     assert made["gather"]["max_m"] == latent_down._FUSED_MAX_M
-    # Pin that the tuned launch geometry reaches the kernel, not its value.
-    assert made["gather"]["ctas"] == latent_down._LAMPORT_CTAS
-    assert made["gather"]["threads"] == latent_down._LAMPORT_THREADS
+    # Pin that the tuned launch geometry reaches the kernel, not its value:
+    # the geometry follows the width, so ask for the width this slot builds.
+    assert (made["gather"]["ctas"], made["gather"]["threads"]) == (
+        latent_down._lamport_geometry(1, latent)
+    )
     # The gather must spin on the word the arming above wrote, not the default
     # one every other Lamport buffer keeps.
     assert made["gather"]["sentinel"] == latent_down._DOWN_SENTINEL == 0x80008000
@@ -957,11 +959,13 @@ def test_build_slot_sizes_everything_to_the_ceiling_it_is_given() -> None:
     producer = slot.gemm_by_m[ceiling]
     assert isinstance(producer, latent_down._MulticastVaGemm)
     assert producer is not slot.gemm_by_m[latent_down._FUSED_MAX_M]
-    # Every width must have a gather, and one geometry must not build many.
+    # Every width must have a gather, and widths sharing a geometry must share
+    # the kernel: the build is one per distinct pair, never one per width.
     assert sorted(slot.gather_by_m) == list(range(1, ceiling + 1))
-    assert len(gathers) == 1
-    assert gathers[0]["max_m"] == ceiling
-    assert len({id(g) for g in slot.gather_by_m.values()}) == 1
+    pairs = {latent_down._lamport_geometry(m, latent) for m in range(1, ceiling + 1)}
+    assert len(gathers) == len(pairs) < ceiling
+    assert all(kw["max_m"] == ceiling for kw in gathers)
+    assert len({id(g) for g in slot.gather_by_m.values()}) == len(pairs)
     # The view is this rank's column block of the mailbox, addressed through
     # the multicast pointer: a wrong base publishes over a peer's columns.
     assert len(views) == 1
