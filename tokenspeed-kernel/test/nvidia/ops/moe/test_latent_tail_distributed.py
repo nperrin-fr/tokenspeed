@@ -24,6 +24,8 @@ survive CUDA-graph capture/replay.
 
 Normal one-GPU pytest runs skip this file. Exercise it with:
 ``torchrun --standalone --nproc-per-node=8 -m pytest -q <this file>``.
+The attention-epilogue contracts also hold at width 2, which is what CI runs;
+the latent-tail tests gate themselves on multicast support and skip there.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
 H, L, EPS = 7168, 3584, 1e-5
 
@@ -41,10 +44,18 @@ def _world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
-pytestmark = pytest.mark.skipif(
-    _world_size() not in {8, 16},
-    reason="launch with torchrun world size 8 or 16",
-)
+# CI runs this subtree on every runner, so the file guards itself, as its
+# neighbours here do.
+pytestmark = [
+    pytest.mark.skipif(
+        not current_platform().is_nvidia,
+        reason="the CuteDSL collective is NVIDIA-only",
+    ),
+    pytest.mark.skipif(
+        _world_size() not in {2, 4, 8, 16},
+        reason="launch with torchrun world size 2, 4, 8 or 16",
+    ),
+]
 
 
 def _require_latent_tail():
