@@ -182,6 +182,8 @@ class CacheGroupRouter(AttentionBackend):
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
         self._decode_request_offset = 0
+        # Opted-in leaves' buffer addresses, encoded once for the fused refresh.
+        self._leaf_refresh: tuple[tuple, torch.Tensor] | None = None
 
     def _check_routable(
         self, geometry: CacheGroupGeometry, group_ids: tuple[str, ...]
@@ -375,6 +377,29 @@ class CacheGroupRouter(AttentionBackend):
         self.stacks.compute_decode_locations(bs, seq_lens, n)
         self._publish_decode_locations(bs, n)
 
+    def _refresh_leaf_buffers(self, bs: int, seq_lens: torch.Tensor) -> frozenset[str]:
+        """Fill every opted-in leaf's decode buffers with one launch.
+
+        Returns the groups filled; their leaves skip the copies of their own
+        refresh. A stack off the GPU keeps every leaf copying for itself.
+        """
+        if not self.stacks.tables.is_cuda:
+            return frozenset()
+        buffers = {}
+        for gid, leaf in self.leaves.items():
+            targets = leaf.decode_buffer_targets()
+            if targets is not None:
+                buffers[gid] = targets
+        if not buffers:
+            return frozenset()
+        key = tuple(
+            (gid, a.data_ptr(), b.data_ptr()) for gid, (a, b) in buffers.items()
+        )
+        if self._leaf_refresh is None or self._leaf_refresh[0] != key:
+            self._leaf_refresh = (key, self.stacks.leaf_targets(buffers))
+        self.stacks.refresh_leaf_buffers(bs, seq_lens, self._leaf_refresh[1])
+        return frozenset(buffers)
+
     def decode_window_locations(self) -> torch.Tensor:
         """The full-history group's current decode write window view
         (``[decode_bs * tokens_per_req]``, address-stable; a MIXED round's
@@ -549,7 +574,9 @@ class CacheGroupRouter(AttentionBackend):
         # targets).
         self._decode_request_offset = num_extends
         self._refresh_decode_locations(bs, seq_lens)
+        prefilled = self._refresh_leaf_buffers(bs, seq_lens)
         for gid, leaf in self.leaves.items():
+            leaf.decode_buffers_prefilled = gid in prefilled
             leaf.refresh_decode_metadata(
                 bs,
                 actual_bs,
@@ -582,7 +609,9 @@ class CacheGroupRouter(AttentionBackend):
         self.stacks.fill(bs, 0, block_tables)
         self._decode_request_offset = 0
         self._refresh_decode_locations(bs, seq_lens)
+        prefilled = self._refresh_leaf_buffers(bs, seq_lens)
         for gid, leaf in self.leaves.items():
+            leaf.decode_buffers_prefilled = gid in prefilled
             leaf.init_forward_metadata_capture_cuda_graph(
                 bs, seq_lens, self.stacks.table(gid, bs)
             )

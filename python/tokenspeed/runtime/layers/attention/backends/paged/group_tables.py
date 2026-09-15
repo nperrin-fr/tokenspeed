@@ -135,6 +135,32 @@ def _unpack_group_kernel(
         )
 
 
+@triton.jit
+def _refresh_leaves_kernel(
+    seq_lens_ptr,  # [>= bs] int32 live lengths
+    tables_ptr,  # [G, max_bs, stack_max_num_pages] int32
+    targets_ptr,  # [G, 3] int64: seq_lens_buf address, page_table_buf address, columns
+    stride_g,
+    stride_b,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Copy one request's length and page row into one leaf's persistent buffers."""
+    g = tl.program_id(0)
+    b = tl.program_id(1)
+    cols = tl.load(targets_ptr + g * 3 + 2)
+    if cols > 0:
+        dst_seq = tl.cast(tl.load(targets_ptr + g * 3), tl.pointer_type(tl.int32))
+        dst_table = tl.cast(tl.load(targets_ptr + g * 3 + 1), tl.pointer_type(tl.int32))
+        tl.store(dst_seq + b, tl.load(seq_lens_ptr + b))
+        col_off = tl.arange(0, BLOCK_COLS)
+        src = tables_ptr + g * stride_g + b.to(tl.int64) * stride_b
+        dst = dst_table + b.to(tl.int64) * cols
+        for col0 in range(0, cols, BLOCK_COLS):
+            col = col0 + col_off
+            mask = col < cols
+            tl.store(dst + col, tl.load(src + col, mask=mask, other=0), mask=mask)
+
+
 class GroupTableStacks:
     """Stacked kernel page tables and decode write slots for a router's groups.
 
@@ -300,6 +326,67 @@ class GroupTableStacks:
             dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
             dst[:actual_bs, num_pages:].zero_()
             dst[actual_bs:bs].zero_()
+
+    def leaf_targets(
+        self, buffers: Mapping[str, tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        """Encode leaves' persistent buffers for :meth:`refresh_leaf_buffers`.
+
+        Args:
+            buffers: ``group_id -> (seq_lens_buf, page_table_buf)`` for every
+                leaf the router refreshes in one launch; the page table must
+                be contiguous ``[>= max_bs, max_num_pages]`` of that group.
+
+        Returns:
+            ``[G, 3]`` int64 device tensor holding each group's buffer
+            addresses and page columns, zero rows for groups left out. The
+            addresses are the leaf's persistent buffers, so one encoding
+            serves until the buffers are reallocated.
+        """
+        rows = [[0, 0, 0] for _ in self.group_ids]
+        for gid, (seq_lens_buf, page_table_buf) in buffers.items():
+            i = self._index[gid]
+            cols = self._max_num_pages[i]
+            if (
+                seq_lens_buf.dtype != torch.int32
+                or page_table_buf.dtype != torch.int32
+                or not page_table_buf.is_contiguous()
+                or page_table_buf.shape[1] != cols
+                or page_table_buf.shape[0] < self.max_bs
+                or seq_lens_buf.shape[0] < self.max_bs
+                or seq_lens_buf.device != self.tables.device
+                or page_table_buf.device != self.tables.device
+            ):
+                raise RuntimeError(
+                    f"cache group {gid!r} decode buffers do not match its stack "
+                    f"({self.max_bs} requests, {cols} pages)"
+                )
+            rows[i] = [seq_lens_buf.data_ptr(), page_table_buf.data_ptr(), cols]
+        return torch.tensor(rows, dtype=torch.int64, device=self.tables.device)
+
+    def refresh_leaf_buffers(
+        self, bs: int, seq_lens: torch.Tensor, targets: torch.Tensor
+    ) -> None:
+        """Fill every encoded leaf's ``seq_lens_buf[:bs]`` and
+        ``page_table_buf[:bs]`` from ``seq_lens`` and the stack in one launch.
+
+        Args:
+            bs: Requests to copy (the padded graph batch, or the live count).
+            seq_lens: ``[>= bs]`` int32 live lengths on the stack's device.
+            targets: The encoding from :meth:`leaf_targets`.
+        """
+        if bs == 0:
+            return
+        if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
+            raise RuntimeError("seq_lens must be a contiguous int32 tensor")
+        _refresh_leaves_kernel[(self.tables.shape[0], bs)](
+            seq_lens,
+            self.tables,
+            targets,
+            self.tables.stride(0),
+            self.tables.stride(1),
+            BLOCK_COLS=128 if self.tables.shape[2] >= 128 else 64,
+        )
 
     def compute_decode_locations(
         self, bs: int, seq_lens: torch.Tensor, tokens_per_req: int

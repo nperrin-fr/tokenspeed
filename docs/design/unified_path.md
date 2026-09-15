@@ -160,6 +160,22 @@ reading inputs and signal after computation; FlashInfer adapters preserve the
 upstream CuTe body and isolate PDL compilation caches. Graphs retain their
 capture-time PDL setting and must be recaptured to change it.
 
+### Leaf buffer refresh is one launch
+
+Most leaves' decode refresh is two copies: ``seq_lens[:bs]`` into the leaf's
+cache-seqlens buffer and the stack's ``[bs, max_num_pages]`` table into its
+page-table buffer. Each copy is a separate stream node, so a model with
+several cache groups paid eight or more per step. A leaf whose refresh is
+exactly that pair exposes the buffers through `decode_buffer_targets`; the
+router fills every such leaf from the stack with one launch
+(`GroupTableStacks.refresh_leaf_buffers`) before the leaf loop and sets
+`decode_buffers_prefilled` on it, and the leaf's refresh skips its own
+copies and clears the flag. The buffers, their addresses and the per-bs
+views are unchanged, so capture and replay see the same state; the flag is
+set only immediately before the refresh that consumes it. A leaf whose
+refresh does more (a clamp, a schedule build) returns None and copies as
+before, and a stack off the GPU leaves every leaf copying for itself.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base

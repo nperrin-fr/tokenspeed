@@ -323,6 +323,19 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     ) -> bool:
         return False
 
+    # The router sets this before a refresh whose buffer copies it already made.
+    decode_buffers_prefilled: bool = False
+
+    def decode_buffer_targets(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The ``(seq_lens_buf, page_table_buf)`` a decode refresh copies into.
+
+        A leaf whose refresh is exactly that pair of copies returns its
+        persistent buffers so the router can fill every such leaf with one
+        launch; it then finds ``decode_buffers_prefilled`` set, skips its own
+        copies and clears the flag. Default: None, the leaf copies itself.
+        """
+        return None
+
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
         """Publish this forward's ``[bs]`` request-pool slots (batch order).
 

@@ -188,3 +188,28 @@ def test_draft_replay_refreshes_spec_cache_seqlens_buf():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_prefilled_refresh_skips_the_copies_and_clears_the_flag():
+    """The router's fused fill leaves the leaf nothing to copy; the flag lasts one refresh."""
+    backend = _make_backend()
+    backend.init_cuda_graph_state(8)
+    seq_lens = torch.tensor([9, 10, 11, 12], dtype=torch.int32)
+    table = _page_table(4, backend.max_num_pages)
+    assert backend.decode_buffer_targets() == (
+        backend.seq_lens_buf,
+        backend.page_table_buf,
+    )
+    backend.decode_buffers_prefilled = True
+    backend.refresh_decode_metadata(4, 4, seq_lens, table)
+    assert not backend.decode_buffers_prefilled
+    assert (
+        backend.seq_lens_buf[:4].eq(0).all() and backend.page_table_buf[:4].eq(0).all()
+    )
+    assert (
+        backend.forward_decode_metadata.cache_seqlens_int32.data_ptr()
+        == backend.seq_lens_buf.data_ptr()
+    )
+    backend.refresh_decode_metadata(4, 4, seq_lens, table)
+    assert torch.equal(backend.seq_lens_buf[:4], seq_lens)
+    assert torch.equal(backend.page_table_buf[:4], table)

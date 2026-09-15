@@ -318,6 +318,83 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
+class _FusableLeaf(_StubLeaf):
+    """A stub whose refresh is the plain copy pair, so the router may fill it."""
+
+    def init_cuda_graph_state(self, max_bs):
+        self.page_table_buf = torch.zeros(
+            (max_bs, self.max_num_pages), dtype=torch.int32, device="cuda"
+        )
+        self.seq_lens_buf = torch.zeros((max_bs,), dtype=torch.int32, device="cuda")
+
+    def decode_buffer_targets(self):
+        return self.seq_lens_buf, self.page_table_buf
+
+    def refresh_decode_metadata(
+        self,
+        bs,
+        actual_bs,
+        seq_lens,
+        page_table,
+        *,
+        num_extends=0,
+        for_graph_replay=False,
+    ):
+        prefilled = self.decode_buffers_prefilled
+        self.decode_buffers_prefilled = False
+        if not prefilled:
+            self.page_table_buf[:bs].copy_(page_table)
+            self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        self.forward_decode_metadata = SimpleNamespace(
+            page_table=self.page_table_buf[:bs], seq_lens=self.seq_lens_buf[:bs]
+        )
+        self.calls.append(("refresh", bs, actual_bs, prefilled))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available(), "the fused leaf refresh is a GPU launch"
+)
+class FusedLeafRefreshTest(unittest.TestCase):
+    def test_router_fills_opted_in_leaves_in_one_launch(self):
+        leaves = {FULL: _FusableLeaf(4), SWA: _StubLeaf(2)}
+        router = CacheGroupRouter(
+            None, is_draft=False, spec_num_tokens=1, device="cuda"
+        )
+        router.bind(_geometry(), leaves)
+        router.init_cuda_graph_state(4)
+        # The plain stub keeps copying for itself, on the stack's device.
+        leaves[SWA].page_table_buf = leaves[SWA].page_table_buf.cuda()
+        leaves[SWA].seq_lens_buf = leaves[SWA].seq_lens_buf.cuda()
+        tables = {
+            gid: t.cuda() for gid, t in CacheGroupRouterTest._tables(None).items()
+        }
+        seq_lens = torch.tensor([7, 9, 1, 1], dtype=torch.int32, device="cuda")
+        req = torch.arange(4, dtype=torch.int64, device="cuda")
+        router.refresh_decode_metadata(
+            4, 2, req, seq_lens, forward_mode=ForwardMode.DECODE, block_tables=tables
+        )
+        encoded = router._leaf_refresh[1]
+        self.assertEqual(encoded.tolist()[1], [0, 0, 0])
+        for gid, leaf in leaves.items():
+            self.assertTrue(
+                torch.equal(leaf.page_table_buf[:4], router.stacks.table(gid, 4))
+            )
+            self.assertTrue(torch.equal(leaf.seq_lens_buf[:4], seq_lens))
+            self.assertFalse(leaf.decode_buffers_prefilled)
+        self.assertEqual(leaves[FULL].calls[-2], ("refresh", 4, 2, True))
+        self.assertEqual(leaves[SWA].calls[-2], ("refresh", 4, 2, 0, False))
+        # A second refresh reuses the encoding and refills from the new tables.
+        tables[FULL][0, 0] = 42
+        router.refresh_decode_metadata(
+            4, 2, req, seq_lens, forward_mode=ForwardMode.DECODE, block_tables=tables
+        )
+        self.assertIs(router._leaf_refresh[1], encoded)
+        self.assertTrue(
+            torch.equal(leaves[FULL].page_table_buf[:4], router.stacks.table(FULL, 4))
+        )
+        self.assertEqual(leaves[FULL].page_table_buf[0, 0].item(), 42)
+
+
 class CacheGroupRouterTest(unittest.TestCase):
     def _router(self, *, is_draft=False, spec=1):
         leaves = {

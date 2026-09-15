@@ -277,6 +277,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             self._verify_views_by_bs[bs] = metadata
         return metadata
 
+    def decode_buffer_targets(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.block_decode_active or self.seq_lens_buf is None:
+            return None
+        return self.seq_lens_buf, self.page_table_buf
+
     def refresh_decode_metadata(
         self,
         bs: int,
@@ -300,8 +305,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             self.forward_decode_metadata = self._decode_views(bs)
             return
 
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
-        self.page_table_buf[:bs].copy_(page_table[:bs])
+        if self.decode_buffers_prefilled:
+            self.decode_buffers_prefilled = False
+        else:
+            self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
+            self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
         # Pure verify (and the draft's multi-token step 1) reads the prefill
         # slot. An extend/mixed draft refresh only seeds later decode steps and
