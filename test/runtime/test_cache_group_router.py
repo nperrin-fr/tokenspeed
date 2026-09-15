@@ -358,7 +358,11 @@ class FusedLeafRefreshTest(unittest.TestCase):
     def test_router_fills_opted_in_leaves_in_one_launch(self):
         leaves = {FULL: _FusableLeaf(4), SWA: _StubLeaf(2)}
         router = CacheGroupRouter(
-            None, is_draft=False, spec_num_tokens=1, device="cuda"
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cuda",
+            consumed_group_ids=None,
         )
         router.bind(_geometry(), leaves)
         router.init_cuda_graph_state(4)
