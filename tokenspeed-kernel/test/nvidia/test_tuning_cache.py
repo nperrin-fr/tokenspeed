@@ -29,7 +29,9 @@ stale table.
 from __future__ import annotations
 
 import json
+import re
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 from tokenspeed_kernel.ops.tuning import (
@@ -103,3 +105,28 @@ def test_mismatched_gpu_metadata_returns_false(tmp_path) -> None:
         )
     )
     assert load_flashinfer_tuning_cache(str(path)) is False
+
+
+def test_every_packaged_table_is_named_for_its_own_metadata() -> None:
+    """A shipped table's filename must restate the environment it was swept on.
+
+    The filename is the only thing the lookup consults, so a table named for an
+    environment other than its own is either never found or, worse, applied to a
+    host it was not measured on.
+    """
+    from tokenspeed_kernel.ops.moe import flashinfer as fi_pkg
+
+    tactics = Path(fi_pkg.__file__).parent / "tactics"
+    tables = sorted(tactics.glob("*.json"))
+    assert tables, f"no packaged tuning tables under {tactics}"
+    for path in tables:
+        meta = json.loads(path.read_text())["_metadata"]
+        model, ep, tp = re.match(r"([^,]+),ep=(\d+),tp=(\d+),", path.name).groups()
+        assert path.name == flashinfer_tuning_cache_filename(
+            model,
+            int(ep),
+            int(tp),
+            meta["gpu"],
+            meta["flashinfer_version"],
+            meta["cudnn_version"],
+        )
