@@ -182,6 +182,7 @@ def _candidate_tactics(args) -> list[tuple[int, int]]:
             Fp8QuantizationType.NoneFp8,
             args.top_k,
             args.hidden_size,
+            args.hidden_size,  # hidden_size_output: the latent MoE maps back to its input width
             args.intermediate_size,
             args.local_experts,
             ActivationType.Situ.value,
@@ -193,6 +194,30 @@ def _candidate_tactics(args) -> list[tuple[int, int]]:
         ):
             seen[(int(tac[0]), int(tac[1]))] = None
     return list(seen)
+
+
+def _resolve_rank_geometry(args) -> None:
+    """Fill the per-rank expert count and intermediate size from the layout.
+
+    The runtime keys its tactics on the per-rank geometry, so a table swept on
+    another layout's geometry loads but never matches a lookup.
+
+    Args:
+        args: Parsed arguments; ``local_experts`` and ``intermediate_size`` are
+            derived from ``ep_size`` and ``tp_size`` when left unset.
+    """
+    if args.local_experts is None:
+        if args.num_experts % args.ep_size:
+            raise ValueError(
+                f"{args.num_experts} experts do not split over ep={args.ep_size}"
+            )
+        args.local_experts = args.num_experts // args.ep_size
+    if args.intermediate_size is None:
+        if args.moe_intermediate_size % args.tp_size:
+            raise ValueError(
+                f"intermediate {args.moe_intermediate_size} does not split over tp={args.tp_size}"
+            )
+        args.intermediate_size = args.moe_intermediate_size // args.tp_size
 
 
 def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
@@ -278,16 +303,21 @@ def main(argv: list[str] | None = None) -> int:
         "--ep-size",
         type=int,
         default=8,
-        help="Expert-parallel size used in an automatically generated filename",
+        help="Expert-parallel size; sets the experts per rank and the output filename",
     )
     parser.add_argument(
         "--tp-size",
         type=int,
         default=1,
-        help="MoE tensor-parallel size used in an automatically generated filename",
+        help="MoE tensor-parallel size; sets the per-rank intermediate and the output filename",
     )
     parser.add_argument("--num-experts", type=int, default=896)
-    parser.add_argument("--local-experts", type=int, default=112)
+    parser.add_argument(
+        "--local-experts",
+        type=int,
+        default=None,
+        help="Experts per rank; num_experts / ep_size when omitted",
+    )
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument(
         "--hidden-size",
@@ -295,7 +325,18 @@ def main(argv: list[str] | None = None) -> int:
         default=3584,
         help="Expert hidden size (Kimi-K3: routed_expert_hidden_size)",
     )
-    parser.add_argument("--intermediate-size", type=int, default=3072)
+    parser.add_argument(
+        "--moe-intermediate-size",
+        type=int,
+        default=3072,
+        help="Unsharded expert intermediate size (Kimi-K3: moe_intermediate_size)",
+    )
+    parser.add_argument(
+        "--intermediate-size",
+        type=int,
+        default=None,
+        help="Per-rank intermediate size; moe_intermediate_size / tp_size when omitted",
+    )
     parser.add_argument("--situ-alpha", type=float, default=4.0)
     parser.add_argument("--situ-beta", type=float, default=25.0)
     parser.add_argument(
@@ -325,6 +366,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--coarse-iters", type=int, default=8)
     parser.add_argument("--fine-iters", type=int, default=50)
     args = parser.parse_args(argv)
+    _resolve_rank_geometry(args)
+    print(
+        f"geometry: ep={args.ep_size} tp={args.tp_size} "
+        f"local_experts={args.local_experts} intermediate={args.intermediate_size}"
+    )
 
     from flashinfer.autotuner import AutoTuner, autotune
 

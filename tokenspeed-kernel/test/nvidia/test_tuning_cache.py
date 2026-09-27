@@ -28,8 +28,12 @@ stale table.
 
 from __future__ import annotations
 
+import ast
 import json
+import re
+from argparse import Namespace
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 from tokenspeed_kernel.ops.tuning import (
@@ -103,3 +107,78 @@ def test_mismatched_gpu_metadata_returns_false(tmp_path) -> None:
         )
     )
     assert load_flashinfer_tuning_cache(str(path)) is False
+
+
+def _packaged_tables() -> list[Path]:
+    from tokenspeed_kernel.ops.moe import flashinfer as fi_pkg
+
+    tactics = Path(fi_pkg.__file__).parent / "tactics"
+    tables = sorted(tactics.glob("*.json"))
+    assert tables, f"no packaged tuning tables under {tactics}"
+    return tables
+
+
+def test_every_packaged_table_is_named_for_its_own_metadata() -> None:
+    """A shipped table's filename must restate the environment it was swept on."""
+    for path in _packaged_tables():
+        meta = json.loads(path.read_text())["_metadata"]
+        model, ep, tp = re.match(r"([^,]+),ep=(\d+),tp=(\d+),", path.name).groups()
+        assert path.name == flashinfer_tuning_cache_filename(
+            model,
+            int(ep),
+            int(tp),
+            meta["gpu"],
+            meta["flashinfer_version"],
+            meta["cudnn_version"],
+        )
+
+
+def test_kimi_k3_tables_are_keyed_on_their_layouts_rank_geometry() -> None:
+    """Runner keys must carry the per-rank experts and intermediate of the named layout.
+
+    FlashInfer keys MoE tactics on the runner's geometry as well as the input
+    shapes, so a table swept on another layout's geometry loads cleanly and then
+    misses every lookup. Keys without runner extras predate that key format.
+    """
+    num_experts, moe_intermediate = 896, 3072
+    checked = 0
+    for path in _packaged_tables():
+        if not path.name.startswith("kimi-k3,"):
+            continue
+        ep, tp = map(int, re.match(r"[^,]+,ep=(\d+),tp=(\d+),", path.name).groups())
+        for key in json.loads(path.read_text()):
+            if key.startswith("_"):
+                continue
+            parts = ast.literal_eval(key)
+            if len(parts) < 4 or not parts[3]:
+                continue
+            extras = parts[3]
+            assert (extras[2], extras[10]) == (
+                num_experts // ep,
+                moe_intermediate // tp,
+            ), f"{path.name}: key swept on {extras[2]} experts x {extras[10]} intermediate"
+            checked += 1
+    assert checked, "no packaged Kimi-K3 table carries runner extras"
+
+
+def test_sweep_derives_rank_geometry_from_the_layout() -> None:
+    from tokenspeed_kernel.ops.moe.flashinfer.moe_tactic_sweep import (
+        _resolve_rank_geometry,
+    )
+
+    def resolve(ep_size: int, tp_size: int) -> tuple[int, int]:
+        args = Namespace(
+            num_experts=896,
+            moe_intermediate_size=3072,
+            ep_size=ep_size,
+            tp_size=tp_size,
+            local_experts=None,
+            intermediate_size=None,
+        )
+        _resolve_rank_geometry(args)
+        return args.local_experts, args.intermediate_size
+
+    assert resolve(8, 1) == (112, 3072)
+    assert resolve(1, 8) == (896, 384)
+    with pytest.raises(ValueError):
+        resolve(3, 1)
