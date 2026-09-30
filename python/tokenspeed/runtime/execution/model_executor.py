@@ -568,7 +568,7 @@ class ModelExecutor:
             device=torch.device(self.device),
         )
         self.attn_backend.bind_tree_verify(
-            TreeVerifyInputs(self.tree_spec.mask_buf, config.spec_num_tokens, max_bs)
+            TreeVerifyInputs(self.tree_spec.mask_buf, config.spec_num_tokens)
         )
         self.drafter.bind_tree(self.tree_spec)
 

@@ -18,15 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Target verify over a draft tree: prefix part + tree part, merged.
+"""Draft-tree inputs the attention leaves read.
 
-Every query row of a request sees the whole committed prefix and, among the
-verify window's ``N`` nodes, exactly the ancestors named by its mask. The
-prefix part is the leaf's own paged kernel run non-causally over
-``seq_len - N`` keys with its LSE; the tree part is ``tree_attention`` over
-the window's K/V read in place at the verify write slots; the two
-merge through their LSEs. Leaves without a tree path keep ``tree_verify``
-unset and the service refuses tree drafting for them.
+Target verify: every query row of a request sees the whole committed prefix
+and, among the verify window's ``N`` nodes, exactly the ancestors named by its
+mask. Drafting: ``K`` lane rows per request over the accepted prefix and a side
+buffer of their ancestors' K/V. Leaves without a tree path keep these unset
+and the service refuses tree drafting for them.
 """
 
 from __future__ import annotations
@@ -39,36 +37,14 @@ __all__ = ["TreeVerifyInputs"]
 class TreeVerifyInputs:
     """Per-step tree metadata the verify leaves read (one object, shared)."""
 
-    def __init__(self, mask: torch.Tensor, num_nodes: int, max_bs: int) -> None:
+    def __init__(self, mask: torch.Tensor, num_nodes: int) -> None:
         """Args:
         mask: ``[max_bs * N]`` int64 ancestor-or-self mask per window row,
             refreshed every step by the executor.
         num_nodes: ``N``, verify window width.
-        max_bs: largest decode batch.
         """
-        device = mask.device
         self.mask = mask
         self.num_nodes = num_nodes
-        self.prefix_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
-        self.cu_prefix_lens = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=device
-        )
-        self.cu_query_lens = torch.arange(
-            0, (max_bs + 1) * num_nodes, num_nodes, dtype=torch.int32, device=device
-        )
-        # The mask as rows of 32-bit words split into uint16 halves (xqa's draft-mask layout).
-        self.mask_words = (num_nodes + 31) // 32 * 2
-        self.packed_mask = torch.zeros(
-            (max_bs * num_nodes, self.mask_words), dtype=torch.uint16, device=device
-        )
-
-    def refresh(self, bs: int, seq_lens: torch.Tensor) -> None:
-        """Prefix length per request: the window's keys excluded (padded rows keep one key)."""
-        torch.clamp_min(seq_lens[:bs] - self.num_nodes, 1, out=self.prefix_lens[:bs])
-        torch.cumsum(self.prefix_lens[:bs], 0, out=self.cu_prefix_lens[1 : bs + 1])
-        rows = bs * self.num_nodes
-        halves = self.mask[:rows].view(torch.uint16).view(rows, 4)
-        self.packed_mask[:rows].copy_(halves[:, : self.mask_words])
 
 
 class TreeDraftInputs:
