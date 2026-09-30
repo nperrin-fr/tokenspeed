@@ -123,3 +123,26 @@ def test_tree_update_rejects_incomplete_index_state(broken):
             parent_indices=parents,
             **extra,
         )
+
+
+def test_tree_update_rejects_unknown_activation():
+    bs, dim, width, t = 2, 64, 4, 3
+    x = torch.randn(bs, dim, t, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.zeros(
+        1 + bs * (t + 1), dim, width - 1, device="cuda", dtype=torch.bfloat16
+    )
+    base = torch.arange(bs, device="cuda", dtype=torch.int32) * (t + 1) + 1
+    out_rows = base[:, None] + 1 + torch.arange(t, device="cuda", dtype=torch.int32)
+    parents = torch.tensor([[-1, 0, 0]] * bs, device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError):
+        causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            None,
+            activation="gelu",
+            conv_state_indices=base,
+            output_state_indices=out_rows,
+            parent_indices=parents,
+        )

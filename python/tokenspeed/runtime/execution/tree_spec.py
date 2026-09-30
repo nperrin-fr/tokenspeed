@@ -90,15 +90,14 @@ class TreeSpec:
     """Device buffers for the tree being verified this step."""
 
     def __init__(
-        self, config: TreeSpecConfig, max_bs: int, pool_size: int, device: torch.device
+        self, config: TreeSpecConfig, max_bs: int, device: torch.device
     ) -> None:
         self.config = config
         n = config.num_nodes
         self.chain_parent = torch.arange(-1, n - 1, dtype=torch.int32, device=device)
-        # Next round's tree per request pool slot; the drafter writes it next to future_input_map.
-        self.future_parent_map = self.chain_parent.repeat(pool_size, 1)
         self.parent_buf = self.chain_parent.repeat(max_bs, 1)
-        # The tree the drafter built this round; the executor publishes it to future_parent_map.
+        # The tree the drafter built this round; the executor publishes it to
+        # RuntimeStates.future_parent_map.
         self.draft_parent_buf = self.chain_parent.repeat(max_bs, 1)
         # The chain the parents describe, so graph warmup's compact (no load_step) is a no-op.
         self.depth_buf = torch.arange(n, dtype=torch.int32, device=device).repeat(
@@ -117,10 +116,13 @@ class TreeSpec:
     def num_nodes(self) -> int:
         return self.config.num_nodes
 
-    def load_step(self, bs: int, req_pool_indices: torch.Tensor) -> None:
-        """Read this step's trees and derive depth and ancestor masks."""
+    def load_step(
+        self, bs: int, req_pool_indices: torch.Tensor, parent_map: torch.Tensor
+    ) -> None:
+        """Read this step's trees from ``parent_map`` (``[pool, N]``, by pool
+        slot) and derive depth and ancestor masks."""
         parent = self.parent_buf[:bs]
-        torch.index_select(self.future_parent_map, 0, req_pool_indices, out=parent)
+        torch.index_select(parent_map, 0, req_pool_indices, out=parent)
         tree_ancestry(
             parent,
             self.depth_buf[:bs],

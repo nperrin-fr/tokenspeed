@@ -1012,7 +1012,7 @@ def _causal_conv1d_tree_update(
         *out.stride(),
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ("silu", "swish", True),
+        SILU_ACTIVATION=activation in ("silu", "swish"),
         BLOCK_N=block_n,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
@@ -1082,6 +1082,14 @@ def causal_conv1d_update(
             "output_state_indices of its shape, and none of num_accepted_tokens, "
             "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data"
         )
+    if validate_data:
+        assert cache_seqlens is None
+        assert pad_slot_id is not None
+        assert x.stride(1) == 1
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
     if parent_indices is not None:
         return _causal_conv1d_tree_update(
             x,
@@ -1093,14 +1101,6 @@ def causal_conv1d_update(
             output_state_indices,
             parent_indices,
         )
-    if validate_data:
-        assert cache_seqlens is None
-        assert pad_slot_id is not None
-        assert x.stride(1) == 1
-    if isinstance(activation, bool):
-        activation = "silu" if activation is True else None
-    elif activation is not None:
-        assert activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1

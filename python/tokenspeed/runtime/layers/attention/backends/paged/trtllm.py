@@ -61,6 +61,9 @@ from tokenspeed.runtime.utils.common import ceil_div
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -125,6 +128,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.num_sms = torch.cuda.get_device_properties(
             config.device
         ).multi_processor_count
+        # Draft-tree lanes (bind_tree_draft): per-layer side K/V of the lane
+        # slots and each step's (request, lane) slot rows.
+        self.tree_side_k: list[torch.Tensor] = []
+        self.tree_side_v: list[torch.Tensor] = []
+        self.tree_slot_rows: list[torch.Tensor] = []
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
         # per decode forward and needs non-causal (block-diffusion) attention.
@@ -154,6 +162,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_decode_metadata = None
         self.spec_cache_seqlens_buf = None
         self._verify_views_by_bs = {}
+        if self.tree_draft is not None and not self.tree_side_k:
+            self._allocate_tree_side_buffers()
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -471,6 +481,31 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        super().bind_tree_draft(inputs)
+        if self.cache_pool is not None:
+            self._allocate_tree_side_buffers()
+
+    def _allocate_tree_side_buffers(self) -> None:
+        """Side K/V for every draft layer's lane slots, sized from the bound pool."""
+        lanes, pool = self.tree_draft, self.cache_pool
+        rows = lanes.max_bs * lanes.num_slots
+        shape = (rows, self.tp_kv_head_num, self.head_dim)
+        self.tree_side_k = [
+            torch.zeros(shape, dtype=self.dtype, device=self.device)
+            for _ in range(pool.layer_num)
+        ]
+        self.tree_side_v = [
+            torch.zeros(shape, dtype=self.dtype, device=self.device)
+            for _ in range(pool.layer_num)
+        ]
+        requests = torch.arange(lanes.max_bs, device=self.device)[:, None]
+        slots = torch.arange(lanes.topk, device=self.device)
+        self.tree_slot_rows = [
+            (requests * lanes.num_slots + (step - 1) * lanes.topk + slots).view(-1)
+            for step in range(1, lanes.num_steps)
+        ]
+
     def tree_support(self) -> TreeSupport:
         if self.kv_cache_dtype == self.dtype:
             return TreeSupport(verify_blocker=None, draft_blocker=None)
@@ -526,8 +561,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         topk, slots = lanes.topk, lanes.num_slots
         heads, kv_heads, dim = layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim
         q = q.contiguous().view(-1, heads, dim)
-        side_k, side_v = lanes.side_k[layer.layer_id], lanes.side_v[layer.layer_id]
-        rows = lanes.slot_rows[lanes.step - 1][: bs * topk]
+        side_k = self.tree_side_k[layer.layer_id]
+        side_v = self.tree_side_v[layer.layer_id]
+        rows = self.tree_slot_rows[lanes.step - 1][: bs * topk]
         side_k.index_copy_(0, rows, k.view(-1, kv_heads, dim))
         side_v.index_copy_(0, rows, v.view(-1, kv_heads, dim))
 

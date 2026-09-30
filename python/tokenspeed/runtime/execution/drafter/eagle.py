@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -188,7 +189,6 @@ class Eagle(BaseDrafter):
             )
         config = tree_spec.config
         max_bs = self.input_buffers.max_bs
-        pool = self.token_to_kv_pool
         logits_processor = self.draft_model_runner.model.logits_processor
         # The fused distributed argmax leaves each TP rank only its vocab shard of the logits.
         logits_processor.do_argmax = False
@@ -205,10 +205,6 @@ class Eagle(BaseDrafter):
             topk=config.topk,
             num_steps=config.num_steps,
             max_bs=max_bs,
-            num_layers=pool.layer_num,
-            num_kv_heads=pool.head_num,
-            head_dim=pool.head_dim,
-            dtype=pool.dtype,
             device=self.device,
         )
         self.attn_backend.bind_tree_draft(self.tree_lanes)
@@ -544,7 +540,7 @@ class Eagle(BaseDrafter):
         """Expand K lanes for S - 1 steps from the step-0 row, then keep the best tree."""
         tree, lanes = self.draft_tree, self.tree_lanes
         topk = tree.topk
-        lane_tokens = tree.seed(bs, self._tree_logits(logits_output))
+        lane_tokens = tree.seed(bs, *self._score_candidates(logits_output))
         hidden = logits_output.hidden_states.repeat_interleave(topk, dim=0)
         lane_mask = lanes.lane_mask[: bs * topk].view(bs, topk)
         lane_mask.copy_(
@@ -583,7 +579,7 @@ class Eagle(BaseDrafter):
             lane_tokens = tree.expand(
                 bs,
                 step,
-                self._tree_logits(out),
+                *self._score_candidates(out),
                 None if last else (lane_mask, out.hidden_states, next_hidden),
             )
             hidden = next_hidden
@@ -593,14 +589,19 @@ class Eagle(BaseDrafter):
         self.tree_spec.draft_parent_buf[:bs].copy_(parent)
         return tokens
 
-    def _tree_logits(self, logits_output: LogitsProcessorOutput) -> torch.Tensor:
+    def _score_candidates(
+        self, logits_output: LogitsProcessorOutput
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each draft row's best K candidates: ``[rows, K]`` log-probabilities
+        (best first) and tokens. The one place a drafter decides how the tree
+        scores candidates; DraftTree only records and selects."""
         logits = logits_output.next_token_logits
         if logits.shape[-1] != self.tree_vocab_size:
             raise RuntimeError(
                 f"tree drafting ranks all {self.tree_vocab_size} draft tokens, "
                 f"got logits of width {logits.shape[-1]}"
             )
-        return logits
+        return logprob_topk(logits, self.draft_tree.topk)
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)

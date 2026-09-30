@@ -231,11 +231,12 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
     Eagle.bind_tree(drafter, tree_spec)
 
     assert processor.do_argmax is False
-    full = SimpleNamespace(next_token_logits=torch.zeros(2, 50))
-    assert Eagle._tree_logits(drafter, full) is full.next_token_logits
+    full = SimpleNamespace(next_token_logits=torch.randn(2, 50, device="cuda"))
+    scores, tokens = Eagle._score_candidates(drafter, full)
+    assert scores.shape == tokens.shape == (2, 2)
     shard = SimpleNamespace(next_token_logits=torch.zeros(2, 25))
     with pytest.raises(RuntimeError, match="ranks all 50 draft tokens"):
-        Eagle._tree_logits(drafter, shard)
+        Eagle._score_candidates(drafter, shard)
 
 
 def test_base_wire_target_is_a_noop():

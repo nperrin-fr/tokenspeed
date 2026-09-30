@@ -1277,3 +1277,37 @@ def test_triton_gdn_packed_decode_inputs(
     torch.testing.assert_close(
         pool[reads].float(), states[-1].to(state_dtype).float(), rtol=2e-2, atol=3e-2
     )
+
+
+def test_gdn_decode_mtp_rejects_strided_tree_parents(device: str, require):
+    """The kernel reads parents as a contiguous [B, T] block; a strided view is refused."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    T = 4
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        pool_size=32,
+        state_dtype=torch.float32,
+    )
+    wide = torch.full((q.shape[0], 2 * T), -1, device=device, dtype=torch.int32)
+    output_idx = torch.arange(8, 8 + q.shape[0] * T, device=device, dtype=torch.int32)
+    with pytest.raises(ValueError, match="contiguous int32"):
+        gdn_decode_mtp(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=pool,
+            initial_state_indices=torch.arange(
+                q.shape[0], device=device, dtype=torch.int32
+            ),
+            output_state_indices=output_idx.view(q.shape[0], T),
+            parent_indices=wide[:, ::2],
+            scale=q.shape[-1] ** -0.5,
+            disable_state_update=False,
+            use_qk_l2norm=True,
+        )

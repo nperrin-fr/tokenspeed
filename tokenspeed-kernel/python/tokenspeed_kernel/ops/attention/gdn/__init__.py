@@ -359,7 +359,7 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
-        parent_indices: Optional int32 ``[B, T]`` draft-tree parents: step
+        parent_indices: Optional contiguous int32 ``[B, T]`` draft-tree parents: step
             ``t`` continues from the state after step ``parent_indices[i, t]``
             (the initial state when negative) instead of step ``t - 1``.
             Requires ``output_state_indices`` and runs the Triton solution;
@@ -394,10 +394,15 @@ def gdn_decode_mtp(
     if parent_indices is not None:
         if output_state_indices is None:
             raise ValueError("parent_indices requires output_state_indices")
-        if parent_indices.shape != q.shape[:2] or parent_indices.dtype != torch.int32:
+        if (
+            parent_indices.shape != q.shape[:2]
+            or parent_indices.dtype != torch.int32
+            or not parent_indices.is_contiguous()
+        ):
             raise ValueError(
-                f"parent_indices must be int32 {tuple(q.shape[:2])}, got "
-                f"{parent_indices.dtype} {tuple(parent_indices.shape)}"
+                f"parent_indices must be contiguous int32 {tuple(q.shape[:2])}, got "
+                f"{parent_indices.dtype} {tuple(parent_indices.shape)} "
+                f"strides {parent_indices.stride()}"
             )
         if solution not in (None, "triton"):
             raise ValueError(

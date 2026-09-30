@@ -40,7 +40,6 @@ from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
     draft_tree_finalize,
 )
-from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 
 __all__ = ["DraftTree"]
 
@@ -89,17 +88,17 @@ class DraftTree:
             (max_bs, topk), dtype=torch.float32, device=device
         )
 
-    def seed(self, bs: int, logits: torch.Tensor) -> torch.Tensor:
-        """Step 0: the draft's top-K at the frontier become the first lanes.
+    def seed(self, bs: int, scores: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Step 0: the drafter's best K candidates at the frontier become the first lanes.
 
         Args:
-            logits: ``[bs, V]`` draft logits at the frontier.
+            scores: ``[bs, K]`` float32 log-probabilities, best first.
+            tokens: ``[bs, K]`` int64 candidate tokens.
 
         Returns:
             ``[bs, K]`` int64 tokens the lanes forward next.
         """
         k = self.topk
-        scores, tokens = logprob_topk(logits, k)
         self.entry_tokens[:bs, :k] = tokens
         self.entry_scores[:bs, :k] = scores
         self.entry_parent[:bs, :k] = -1
@@ -112,14 +111,18 @@ class DraftTree:
         self,
         bs: int,
         step: int,
-        logits: torch.Tensor,
+        scores: torch.Tensor,
+        tokens: torch.Tensor,
         next_lanes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         """Steps ``1 .. S - 1``: expand every lane, keep the best K children.
 
         Args:
             step: drafting step, from 1.
-            logits: ``[bs * K, V]`` draft logits of the lanes.
+            scores: ``[bs * K, K]`` float32 log-probabilities of each lane's
+                best K children, best first (at most 0: a child never scores
+                above its parent).
+            tokens: ``[bs * K, K]`` int64 child tokens.
             next_lanes: ``(lane_mask, hidden_src, hidden_dst)`` handed to
                 ``draft_tree_expand`` to prepare the next step, or ``None``
                 after the last step.
@@ -128,10 +131,9 @@ class DraftTree:
             ``[bs, K]`` int64 tokens the lanes forward next.
         """
         k = self.topk
-        child_scores, child_tokens = logprob_topk(logits, k)
         lane_tokens = draft_tree_expand(
-            child_scores.view(bs, k * k),
-            child_tokens.view(bs, k * k),
+            scores.view(bs, k * k),
+            tokens.view(bs, k * k),
             self.lane_scores[:bs],
             self.lane_entry[:bs],
             self.entry_scores[:bs],

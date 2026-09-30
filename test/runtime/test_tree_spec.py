@@ -35,7 +35,6 @@ def test_compact_rows_packs_hidden_and_positions(nodes):
     spec = TreeSpec(
         TreeSpecConfig(topk=4, num_steps=5, num_nodes=nodes),
         bs,
-        8,
         torch.device("cuda"),
     )
     paths = [[0, 2, 5], [0, 1, 2, 3], [0]]  # jump, identity, root only
@@ -65,7 +64,6 @@ def test_fresh_spec_is_the_chain(nodes):
     spec = TreeSpec(
         TreeSpecConfig(topk=1, num_steps=nodes - 1, num_nodes=nodes),
         3,
-        8,
         torch.device("cuda"),
     )
     positions = torch.arange(3 * nodes, dtype=torch.int64, device="cuda") + 100
@@ -76,6 +74,7 @@ def test_fresh_spec_is_the_chain(nodes):
     spec.compact_rows(root_only, hidden, positions)
     assert torch.equal(positions, before)
     fresh = (spec.depth_buf.clone(), spec.mask_buf.clone())
-    spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"))
+    chain = torch.arange(-1, nodes - 1, dtype=torch.int32, device="cuda").repeat(8, 1)
+    spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"), chain)
     assert torch.equal(spec.depth_buf, fresh[0])
     assert torch.equal(spec.mask_buf, fresh[1])

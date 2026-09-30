@@ -59,33 +59,22 @@ class TreeDraftInputs:
     """Drafting lanes of a draft tree: ``K`` query rows per request per step.
 
     A lane row sees the committed prefix (``prefix_lens``, the accepted
-    frontier) and, in a per-layer side buffer of ``(S - 1) * K`` slots per
-    request, the draft K/V of its own ancestors. Lane K/V never enter the
-    paged cache: they are only valid while this round's tree is drafted.
+    frontier) and, among the ``(S - 1) * K`` lane slots per request, the
+    draft K/V of its own ancestors (``lane_mask``). The leaf keeps those
+    slots' K/V in its own side buffers: lane K/V never enter the paged cache
+    and are only valid while this round's tree is drafted. The drafter writes
+    everything here.
     """
 
     def __init__(
-        self,
-        topk: int,
-        num_steps: int,
-        max_bs: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        self, topk: int, num_steps: int, max_bs: int, device: torch.device
     ) -> None:
         self.topk = topk
+        self.num_steps = num_steps
         self.num_slots = (num_steps - 1) * topk
+        self.max_bs = max_bs
         # The drafting step being run (1 .. S - 1); None outside the lane loop.
         self.step: int | None = None
-        shape = (max_bs * self.num_slots, num_kv_heads, head_dim)
-        self.side_k = [
-            torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
-        ]
-        self.side_v = [
-            torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
-        ]
         self.lane_mask = torch.zeros((max_bs * topk,), dtype=torch.int64, device=device)
         self.prefix_lens = torch.ones((max_bs,), dtype=torch.int32, device=device)
         self.cu_prefix_lens = torch.zeros(
@@ -94,13 +83,6 @@ class TreeDraftInputs:
         self.cu_query_lens = torch.arange(
             0, (max_bs + 1) * topk, topk, dtype=torch.int32, device=device
         )
-        lanes = torch.arange(topk, dtype=torch.int64, device=device)
-        requests = torch.arange(max_bs, dtype=torch.int64, device=device)[:, None]
-        # Side-buffer row of (request, lane) at each step.
-        self.slot_rows = [
-            (requests * self.num_slots + (step - 1) * topk + lanes).view(-1)
-            for step in range(1, num_steps)
-        ]
 
     def set_prefix(self, bs: int, frontier: torch.Tensor) -> None:
         torch.clamp_min(frontier[:bs].to(torch.int32), 1, out=self.prefix_lens[:bs])

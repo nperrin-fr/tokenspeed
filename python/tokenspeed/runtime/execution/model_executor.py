@@ -579,9 +579,9 @@ class ModelExecutor:
                 num_nodes=config.spec_num_tokens,
             ),
             max_bs=max_bs,
-            pool_size=self.runtime_states.future_input_map.shape[0],
             device=torch.device(self.device),
         )
+        self.runtime_states.init_draft_trees(config.spec_num_tokens)
         self.attn_backend.bind_tree_verify(
             TreeVerifyInputs(
                 self.tree_spec.mask_buf,
@@ -1342,7 +1342,7 @@ class ModelExecutor:
                     next_round_input_ids[requests].to(torch.int32)
                 )
                 if self.tree_spec is not None:
-                    self.tree_spec.future_parent_map[indices[requests]] = (
+                    self.runtime_states.future_parent_map[indices[requests]] = (
                         self.tree_spec.draft_parent_buf[requests]
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
@@ -1729,7 +1729,9 @@ class ModelExecutor:
             )
             if self.tree_spec is not None and num_extends == 0 and bs > 0:
                 self.tree_spec.load_step(
-                    bs, self.input_buffers.req_pool_indices_buf[:bs]
+                    bs,
+                    self.input_buffers.req_pool_indices_buf[:bs],
+                    self.runtime_states.future_parent_map,
                 )
                 self.tree_spec.depth_positions(
                     bs, self.input_buffers.positions_buf[:total_tokens]

@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_finalize,
     tree_ancestry,
 )
+from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 
 from tokenspeed.runtime.execution.drafter.tree import DraftTree
 
@@ -42,7 +43,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
     record = []  # per request: list of (token path tuple, score)
     lane_paths = [[None] * topk for _ in range(bs)]
     logp = torch.log_softmax(torch.randn(bs, vocab, generator=gen) * 3, -1).to(DEVICE)
-    tree.seed(bs, logp)
+    tree.seed(bs, *logprob_topk(logp, topk))
     for b in range(bs):
         sc, tk = torch.topk(logp[b].float(), topk)
         record.append([((int(t),), float(s)) for t, s in zip(tk, sc)])
@@ -51,7 +52,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
         logp = torch.log_softmax(
             torch.randn(bs * topk, vocab, generator=gen) * 3, -1
         ).to(DEVICE)
-        lane_tokens = tree.expand(bs, step, logp, None)
+        lane_tokens = tree.expand(bs, step, *logprob_topk(logp, topk), None)
         for b in range(bs):
             cands = []
             for lane in range(topk):
@@ -228,12 +229,12 @@ def test_nan_scores_keep_lanes_and_tree_valid():
     tree = DraftTree(bs, topk, steps, nodes, torch.device(DEVICE))
     logits = torch.randn(bs, vocab, device=DEVICE)
     logits[1] = float("nan")
-    tree.seed(bs, logits)
+    tree.seed(bs, *logprob_topk(logits, topk))
     lane_logits = torch.randn(bs * topk, vocab, device=DEVICE)
     lane_logits[topk:] = float("nan")
     for step in range(1, steps):
         before = tree.lane_entry[:bs].clone()
-        tree.expand(bs, step, lane_logits, None)
+        tree.expand(bs, step, *logprob_topk(lane_logits, topk), None)
         _parent_lanes(tree, bs, before)
     tokens, parent = tree.finalize(
         bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE)
@@ -248,7 +249,7 @@ def test_expand_prepares_next_lanes():
     torch.manual_seed(3)
     bs, topk, steps, nodes, vocab, width = 3, 4, 4, 12, 64, 40
     tree = DraftTree(bs, topk, steps, nodes, torch.device(DEVICE))
-    tree.seed(bs, torch.randn(bs, vocab, device=DEVICE))
+    tree.seed(bs, *logprob_topk(torch.randn(bs, vocab, device=DEVICE), topk))
     lane_mask = (
         torch.ones(topk, dtype=torch.int64, device=DEVICE)
         << torch.arange(topk, device=DEVICE)
@@ -261,7 +262,7 @@ def test_expand_prepares_next_lanes():
         tree.expand(
             bs,
             step,
-            torch.randn(bs * topk, vocab, device=DEVICE),
+            *logprob_topk(torch.randn(bs * topk, vocab, device=DEVICE), topk),
             (lane_mask, hidden_src, hidden_dst),
         )
         parent = _parent_lanes(tree, bs, before_entry)

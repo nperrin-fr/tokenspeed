@@ -92,11 +92,12 @@ def _tree(parent: list[int], req: torch.Tensor) -> TreeSpec:
     spec = TreeSpec(
         TreeSpecConfig(topk=2, num_steps=N - 1, num_nodes=N),
         BS,
-        POOL + 1,
         torch.device("cuda"),
     )
-    spec.future_parent_map[:] = torch.tensor(parent, dtype=torch.int32, device="cuda")
-    spec.load_step(BS, req)
+    parent_map = torch.tensor(parent, dtype=torch.int32, device="cuda").repeat(
+        POOL + 1, 1
+    )
+    spec.load_step(BS, req, parent_map)
     return spec
 
 

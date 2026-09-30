@@ -17,15 +17,19 @@ not grow a second copy of any of it.
 
 ### The tree is a parameter of the chain path
 
-After verify, `TreeSpec.verify` (the `verify_tree` kernel) packs `predict`
-along the accepted path. The executor reads the TP-agreed path from the
-sampling backend (`SamplingBackend.accepted_path`), stores it with
-`TreeSpec.record_path`, and calls `TreeSpec.compact` once, a single launch that
-moves, for every request:
+The sampling backend verifies the step's trees (`TreeVerifyBatch`: parents and
+depths) with the `verify_tree` kernel, packing `predict` along the accepted
+path. The TP-agreed path has one owner, the backend's packed verify output
+(`SamplingBackend.accepted_path`); every consumer receives it explicitly:
 
-* target KV of the path (every layer) to the window's leading slots;
-* target hidden rows to the front of the window;
-* the window positions back from `vc + depth` to `vc + i`.
+* the attention backend moves the path's target KV (every layer) to the
+  window's leading slots (`compact_verify_window`; the cache-group router owns
+  the K/V address table and the `compact_window_rows` kernel copies words, so
+  it is dtype-agnostic);
+* `TreeSpec.compact_rows` moves the target hidden rows to the front of the
+  window and the positions back from `vc + depth` to `vc + i`;
+* the linear-attention commit reads the last accepted node through
+  `commit_speculative_state_after_verify(accepted_path=...)` (`None` for a chain).
 
 Everything downstream sees a chain.
 
@@ -38,8 +42,8 @@ output or drafting-step-0 code.
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
 `TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
-the forward, and `TreeSpec.compact` shifts them back after the forward (row `i`
-then holds the path node at depth `i`).
+the forward, and `TreeSpec.compact_rows` shifts them back after the forward
+(row `i` then holds the path node at depth `i`).
 
 The two shifts must cancel for any `depth_buf`, including graph warmup, which
 replays the forward without the step prep: `depth_buf` and `mask_buf` start as
@@ -65,15 +69,15 @@ last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. ReplaySSM keeps no per-node state and refuses trees; the
 fused KDA verify kernel follows a chain and refuses them too.
 
-KV compaction covers the attention layers only (`history_group_by_layer`) and
-moves each physical region once.
+KV compaction covers the attention layers only (`history_group_by_layer`, read
+by the router from its bound pool) and moves each physical region once.
 
 ### Draft lanes never write the paged cache
 
-Drafting steps `1 .. S-1` run `K` lane rows per request. Their K/V go to a
-per-layer side buffer of `(S - 1) * K` slots per request and are valid only
-while the round's tree is drafted; KV prewrite is off on lane steps
-(`support_kv_cache_prewrite`).
+Drafting steps `1 .. S-1` run `K` lane rows per request. Their K/V go to the
+trtllm leaf's per-layer side buffers of `(S - 1) * K` slots per request,
+allocated from the leaf's own bound pool, and are valid only while the round's
+tree is drafted; KV prewrite is off on lane steps (`support_kv_cache_prewrite`).
 
 Lane attention reads `TreeDraftInputs` (prefix lengths over the accepted
 frontier, the lanes' ancestor masks, and the step index, a Python value fixed
@@ -82,6 +86,20 @@ lengths once per round, masks by `draft_tree_expand` for the next step. This is 
 refresh-only draft metadata contract of `unified_path.md`; it is graph-safe
 because the buffers are bound once at fixed addresses and written by in-graph
 ops before the lane forward reads them.
+
+### The drafter scores, the tree selects
+
+`Eagle._score_candidates` is the one place a drafter decides how candidates are
+scored (today `logprob_topk` over the full draft vocabulary); `DraftTree` only
+records `(scores, tokens)` and selects. A child's score is at most its parent's
+(`draft_tree_expand` clamps child log-probabilities at 0). A new drafter changes
+the scorer, not the tree machinery.
+
+### Next round's tree rides with next round's tokens
+
+The drafter's parents for a pool slot live in `RuntimeStates.future_parent_map`
+next to its candidate tokens in `future_input_map`; rows reset to dummy tokens
+(bootstrap, recovery) reset to the chain.
 
 ### Tree construction is deterministic
 
@@ -120,13 +138,32 @@ blocker together. Composites never forward the question, so a new composite
 cannot silently skip a child. Sliding window and attention sinks are the named
 exception: they are per layer and per call, so the trtllm forward refuses them.
 
+## Not scheduler or cache state
+
+The only per-request fact that crosses steps is the next round's `parent[N]`,
+an attribute of the candidate block `future_input_map` already carries on the
+executor side. Lane K/V are round-local scratch (never prefix-matched,
+transferred or freed with blocks) and the per-node GDN states are the existing
+verify scratch, so nothing here is a cache group for the C++ scheduler to own.
+
+## Intended direction
+
+* One drafter loop: fold the lane steps into the chain's multi-step loop with
+  `K` as the row multiplier (keep the fused distributed argmax at `K == 1`).
+* Tree refresh inside `refresh_decode_metadata`, and leaves branching on a
+  tree mask in the verify metadata instead of the query shape.
+* The parallel tree conv kernel as the only verify conv kernel if it benches at
+  or above the serial chain kernel.
+
 ## Tests
 
 * `tokenspeed-kernel/test/ops/test_tree_speculative.py` — tree kernels against
   fp32 references (masks up to 64 nodes, short prefixes, splits).
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
-* `test/runtime/test_tree_spec.py` — KV compaction; the fresh-spec chain.
+* `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the
+  fresh-spec chain. `test_tree_speculative.py::test_compact_window_rows_moves_every_buffer`
+  — KV-row compaction over bf16 and fp8 planes.
 * `test/runtime/test_tree_support_resolution.py` — backend capability
   resolution: supported trees, a draft with linear layers, each named blocker.
 * `test/runtime/sampling/test_tree_sampling.py` — a chain-shaped tree verifies
