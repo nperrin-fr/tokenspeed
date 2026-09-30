@@ -118,12 +118,21 @@ class DraftTree:
         self.lane_scores[:bs] = scores
         return TreeExpansion(lane_tokens=tokens, parent_lane=lanes)
 
-    def expand(self, bs: int, step: int, logits: torch.Tensor) -> TreeExpansion:
+    def expand(
+        self,
+        bs: int,
+        step: int,
+        logits: torch.Tensor,
+        next_lanes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ) -> TreeExpansion:
         """Steps ``1 .. S - 1``: expand every lane, keep the best K children.
 
         Args:
             step: drafting step, from 1.
             logits: ``[bs * K, V]`` draft logits of the lanes.
+            next_lanes: ``(lane_mask, hidden_src, hidden_dst)`` handed to
+                ``draft_tree_expand`` to prepare the next step, or ``None``
+                after the last step.
         """
         k = self.topk
         child_scores, child_tokens = logprob_topk(logits, k)
@@ -138,6 +147,7 @@ class DraftTree:
             self.entry_tokens[:bs],
             start=k + (step - 1) * k * k,
             depth=step + 1,
+            next_lanes=next_lanes,
         )
         return TreeExpansion(lane_tokens=lane_tokens, parent_lane=parent_lane)
 

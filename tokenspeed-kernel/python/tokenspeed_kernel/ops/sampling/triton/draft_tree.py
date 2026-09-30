@@ -217,11 +217,20 @@ def _draft_tree_expand_kernel(
     entry_tokens_ptr,  # [bs, E] int64
     lane_tokens_ptr,  # [bs, K] int64 out
     parent_lane_ptr,  # [bs, K] int64 out
+    lane_mask_ptr,  # [bs, K] int64 lane ancestor masks, updated in place
+    hidden_src_ptr,  # [bs * K, HIDDEN] this step's lane hidden rows
+    hidden_dst_ptr,  # [bs * K, HIDDEN] next step's lane hidden rows
+    stride_hidden_src,
+    stride_hidden_dst,
     start,
     depth,
     num_entries,
+    mask_bit_base,
     K: tl.constexpr,
     KK_PAD: tl.constexpr,
+    PREPARE_NEXT: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HBLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     idx = tl.arange(0, KK_PAD)
@@ -248,12 +257,26 @@ def _draft_tree_expand_kernel(
         )
         other = tl.where(other == other, other, float("-inf"))
         rank += ((other > score) | ((other == score) & (j < idx))).to(tl.int32)
+    if PREPARE_NEXT:
+        parent_mask = tl.load(lane_mask_ptr + req * K + lane, mask=ok, other=0)
     tl.debug_barrier()
     best = ok & (rank < K)
     tl.store(lane_scores_ptr + req * K + rank, score, mask=best)
     tl.store(lane_entry_ptr + req * K + rank, (start + idx).to(tl.int64), mask=best)
     tl.store(lane_tokens_ptr + req * K + rank, token, mask=best)
     tl.store(parent_lane_ptr + req * K + rank, lane.to(tl.int64), mask=best)
+    if PREPARE_NEXT:
+        # The next step's lane r: its parent lane's ancestors plus its own side-buffer slot.
+        own_bit = tl.full([KK_PAD], 1, tl.int64) << (mask_bit_base + rank).to(tl.int64)
+        tl.store(lane_mask_ptr + req * K + rank, parent_mask | own_bit, mask=best)
+        cols = tl.arange(0, HBLOCK)
+        for r in tl.static_range(K):
+            src_lane = tl.sum(tl.where(best & (rank == r), lane, 0), axis=0)
+            src = hidden_src_ptr + (req * K + src_lane).to(tl.int64) * stride_hidden_src
+            dst = hidden_dst_ptr + (req * K + r).to(tl.int64) * stride_hidden_dst
+            for c0 in range(0, HIDDEN, HBLOCK):
+                c = c0 + cols
+                tl.store(dst + c, tl.load(src + c, mask=c < HIDDEN), mask=c < HIDDEN)
 
 
 def draft_tree_expand(
@@ -268,6 +291,7 @@ def draft_tree_expand(
     *,
     start: int,
     depth: int,
+    next_lanes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Record every lane's ``K`` children and keep the best ``K`` as new lanes.
 
@@ -281,6 +305,12 @@ def draft_tree_expand(
             ``entry_depth`` (int64) and ``entry_tokens`` (int64).
         start: first candidate id of this step's children.
         depth: depth of this step's children.
+        next_lanes: ``(lane_mask, hidden_src, hidden_dst)`` to prepare the next
+            drafting step, or ``None`` after the last one. ``lane_mask`` is the
+            ``[bs, K]`` int64 lane ancestor masks, updated in place: new lane
+            ``r`` gets its parent lane's mask plus bit ``depth * K - K + r``
+            (its slot in the lanes' side buffer, counting from the first
+            expanded step); ``hidden_dst[b * K + r] = hidden_src[b * K + parent]``.
 
     Returns:
         ``(lane_tokens, parent_lane)``: ``[bs, K]`` int64 token of each new lane
@@ -291,6 +321,12 @@ def draft_tree_expand(
     parent_lane = torch.empty_like(lane_tokens)
     if bs == 0:
         return lane_tokens, parent_lane
+    if next_lanes is None:
+        lane_mask, hidden_src, hidden_dst = lane_tokens, lane_tokens, lane_tokens
+        hidden = 1
+    else:
+        lane_mask, hidden_src, hidden_dst = next_lanes
+        hidden = hidden_src.shape[1]
     _draft_tree_expand_kernel[(bs,)](
         child_scores,
         child_tokens,
@@ -302,11 +338,20 @@ def draft_tree_expand(
         entry_tokens,
         lane_tokens,
         parent_lane,
+        lane_mask,
+        hidden_src,
+        hidden_dst,
+        hidden_src.stride(0),
+        hidden_dst.stride(0),
         start,
         depth,
         entry_scores.shape[1],
+        (depth - 1) * topk,
         K=topk,
         KK_PAD=max(16, triton.next_power_of_2(topk * topk)),
+        PREPARE_NEXT=next_lanes is not None,
+        HIDDEN=hidden,
+        HBLOCK=1024,
     )
     return lane_tokens, parent_lane
 

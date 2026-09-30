@@ -47,7 +47,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
         logp = torch.log_softmax(
             torch.randn(bs * topk, vocab, generator=gen) * 3, -1
         ).to(DEVICE)
-        exp = tree.expand(bs, step, logp)
+        exp = tree.expand(bs, step, logp, None)
         for b in range(bs):
             cands = []
             for lane in range(topk):
@@ -131,7 +131,7 @@ def test_nan_scores_keep_lanes_and_tree_valid():
     lane_logits = torch.randn(bs * topk, vocab, device=DEVICE)
     lane_logits[topk:] = float("nan")
     for step in range(1, steps):
-        exp = tree.expand(bs, step, lane_logits)
+        exp = tree.expand(bs, step, lane_logits, None)
         assert exp.parent_lane.min() >= 0 and exp.parent_lane.max() < topk
     tokens, parent = tree.finalize(
         bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE)
@@ -139,3 +139,29 @@ def test_nan_scores_keep_lanes_and_tree_valid():
     for b in range(bs):
         for j in range(1, nodes):
             assert 0 <= int(parent[b, j]) < j
+
+
+def test_expand_prepares_next_lanes():
+    """Next step's lane masks and hidden rows follow each new lane's parent."""
+    torch.manual_seed(3)
+    bs, topk, steps, nodes, vocab, width = 3, 4, 4, 12, 64, 40
+    tree = DraftTree(bs, topk, steps, nodes, torch.device(DEVICE))
+    tree.seed(bs, torch.randn(bs, vocab, device=DEVICE))
+    lane_mask = (
+        torch.ones(topk, dtype=torch.int64, device=DEVICE)
+        << torch.arange(topk, device=DEVICE)
+    ).repeat(bs, 1)
+    for step in range(1, steps):
+        hidden_src = torch.randn(bs * topk, width, device=DEVICE)
+        hidden_dst = torch.empty_like(hidden_src)
+        before = lane_mask.clone()
+        exp = tree.expand(
+            bs, step, torch.randn(bs * topk, vocab, device=DEVICE), (lane_mask, hidden_src, hidden_dst)
+        )
+        parent = exp.parent_lane
+        own = torch.ones_like(parent) << (step * topk + torch.arange(topk, device=DEVICE))
+        assert torch.equal(lane_mask, torch.gather(before, 1, parent) | own)
+        want = torch.gather(
+            hidden_src.view(bs, topk, width), 1, parent[:, :, None].expand(-1, -1, width)
+        ).view(bs * topk, width)
+        assert torch.equal(hidden_dst, want)

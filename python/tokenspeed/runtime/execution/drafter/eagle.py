@@ -539,26 +539,15 @@ class Eagle(BaseDrafter):
         topk = tree.topk
         expansion = tree.seed(bs, self._tree_logits(logits_output))
         hidden = logits_output.hidden_states.repeat_interleave(topk, dim=0)
-        lane_bits = torch.ones(
-            topk, dtype=torch.int64, device=self.device
-        ) << torch.arange(topk, device=self.device)
         lane_mask = lanes.lane_mask[: bs * topk].view(bs, topk)
-        lane_mask.copy_(lane_bits.expand(bs, -1))
+        lane_mask.copy_(
+            torch.ones(topk, dtype=torch.int64, device=self.device)
+            << torch.arange(topk, device=self.device)
+        )
         lanes.set_prefix(bs, frontier)
         positions = frontier.repeat_interleave(topk)
 
         for step in range(1, self.spec_num_steps):
-            if step > 1:
-                parent = expansion.parent_lane
-                lane_mask.copy_(
-                    torch.gather(lane_mask, 1, parent)
-                    | (lane_bits << ((step - 1) * topk))
-                )
-                hidden = torch.gather(
-                    hidden_out.view(bs, topk, -1),
-                    1,
-                    parent[:, :, None].expand(-1, -1, hidden_out.shape[-1]),
-                ).view(bs * topk, -1)
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
@@ -582,8 +571,15 @@ class Eagle(BaseDrafter):
                     spec_step_idx=step,
                 )
             lanes.step = None
-            expansion = tree.expand(bs, step, self._tree_logits(out))
-            hidden_out = out.hidden_states
+            last = step == self.spec_num_steps - 1
+            next_hidden = None if last else torch.empty_like(out.hidden_states)
+            expansion = tree.expand(
+                bs,
+                step,
+                self._tree_logits(out),
+                None if last else (lane_mask, out.hidden_states, next_hidden),
+            )
+            hidden = next_hidden
 
         tokens, parent = tree.finalize(bs, next_tokens[:, 0])
         tokens[:, 1:] = self._map_hot(tokens[:, 1:].long()).to(torch.int32)
