@@ -95,6 +95,9 @@ change.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
+* `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
+  parameter of the chain path (compaction), position vs slot, one verify
+  kernel, and position-keyed sampled verify.
 
 ## Public pull requests
 
