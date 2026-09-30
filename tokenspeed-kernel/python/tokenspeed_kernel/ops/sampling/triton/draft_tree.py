@@ -213,7 +213,6 @@ def _draft_tree_expand_kernel(
     entry_depth_ptr,  # [bs, E] int64
     entry_tokens_ptr,  # [bs, E] int64
     lane_tokens_ptr,  # [bs, K] int64 out
-    parent_lane_ptr,  # [bs, K] int64 out
     lane_mask_ptr,  # [bs, K] int64 lane ancestor masks, updated in place
     hidden_src_ptr,  # [bs * K, HIDDEN] this step's lane hidden rows
     hidden_dst_ptr,  # [bs * K, HIDDEN] next step's lane hidden rows
@@ -261,7 +260,6 @@ def _draft_tree_expand_kernel(
     tl.store(lane_scores_ptr + req * K + rank, score, mask=best)
     tl.store(lane_entry_ptr + req * K + rank, (start + idx).to(tl.int64), mask=best)
     tl.store(lane_tokens_ptr + req * K + rank, token, mask=best)
-    tl.store(parent_lane_ptr + req * K + rank, lane.to(tl.int64), mask=best)
     if PREPARE_NEXT:
         # The next step's lane r: its parent lane's ancestors plus its own side-buffer slot.
         own_bit = tl.full([KK_PAD], 1, tl.int64) << (mask_bit_base + rank).to(tl.int64)
@@ -289,7 +287,7 @@ def draft_tree_expand(
     start: int,
     depth: int,
     next_lanes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Record every lane's ``K`` children and keep the best ``K`` as new lanes.
 
     Args:
@@ -310,14 +308,12 @@ def draft_tree_expand(
             expanded step); ``hidden_dst[b * K + r] = hidden_src[b * K + parent]``.
 
     Returns:
-        ``(lane_tokens, parent_lane)``: ``[bs, K]`` int64 token of each new lane
-        (best first) and the lane it descends from.
+        ``[bs, K]`` int64 token of each new lane, best first.
     """
     bs, topk = lane_scores.shape
     lane_tokens = torch.empty((bs, topk), dtype=torch.int64, device=lane_scores.device)
-    parent_lane = torch.empty_like(lane_tokens)
     if bs == 0:
-        return lane_tokens, parent_lane
+        return lane_tokens
     if next_lanes is None:
         lane_mask, hidden_src, hidden_dst = lane_tokens, lane_tokens, lane_tokens
         hidden = 1
@@ -334,7 +330,6 @@ def draft_tree_expand(
         entry_depth,
         entry_tokens,
         lane_tokens,
-        parent_lane,
         lane_mask,
         hidden_src,
         hidden_dst,
@@ -350,7 +345,7 @@ def draft_tree_expand(
         HIDDEN=hidden,
         HBLOCK=1024,
     )
-    return lane_tokens, parent_lane
+    return lane_tokens
 
 
 def draft_tree_finalize(

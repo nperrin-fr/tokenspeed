@@ -20,12 +20,13 @@
 
 """Attention inside a speculative draft tree.
 
-Each request owns ``R`` query rows and ``M`` key/value slots; row ``r`` sees
-slot ``j`` when bit ``j`` of its 64-bit mask is set. Target verify uses
-``R == M == N`` over the forward's own K/V; drafting uses ``R == K`` rows over
-the per-request buffer of already expanded nodes. The result is one partial
-attention state (output and natural-log LSE) that callers merge with the
-prefix part.
+``tree_attention``: each request owns ``R`` query rows and ``M`` key/value
+slots; row ``r`` sees slot ``j`` when bit ``j`` of its 64-bit mask is set.
+Draft lanes use it with ``R == K`` rows over the per-request buffer of already
+expanded nodes, merging the prefix part's attention state in the kernel.
+
+``tree_decode_attention``: target verify of the ``N``-node window over the
+paged cache in one pass (split-KV).
 """
 
 from __future__ import annotations
@@ -171,7 +172,7 @@ def tree_attention(
     rows_per_req: int,
     slots_per_req: int,
     sm_scale: float,
-    lse_base2: bool = False,
+    lse_base2: bool,
     prefix: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:

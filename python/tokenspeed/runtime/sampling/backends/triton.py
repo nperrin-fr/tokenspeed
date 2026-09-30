@@ -734,12 +734,10 @@ class TritonSamplingBackend(SamplingBackend):
         # Rank 0 remains the source of truth for attention-TP agreement.
         self.broadcast_verify_outputs()
 
-        if tree is not None:
-            tree.record_path(bs, accept_index)
         if self.config.enable_output_logprobs:
             if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.
-                logits = logits.index_select(0, tree.path_rows(bs))
+                logits = logits.index_select(0, tree.path_rows(accept_index))
             self._write_logprob_outputs(
                 logits_output,
                 logits,

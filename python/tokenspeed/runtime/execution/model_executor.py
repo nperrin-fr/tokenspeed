@@ -588,6 +588,7 @@ class ModelExecutor:
         """Pack each request's accepted path to the front of its verify window:
         target hidden rows, target KV, and the window positions back to ``vc + i``."""
         tree = self.tree_spec
+        tree.record_path(bs, self.sampling_backend.accepted_path(bs, tree.num_nodes))
         tree.compact(
             bs,
             self.attn_backend.tree_verify_write_locations(),

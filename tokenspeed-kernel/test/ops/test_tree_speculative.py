@@ -66,7 +66,14 @@ def test_tree_attention_matches_reference(rows, slots):
     mask[0] = 0  # a row that sees nothing
     scale = d**-0.5
     out, lse = tree_attention(
-        q, k, v, mask, rows_per_req=rows, slots_per_req=slots, sm_scale=scale
+        q,
+        k,
+        v,
+        mask,
+        rows_per_req=rows,
+        slots_per_req=slots,
+        sm_scale=scale,
+        lse_base2=False,
     )
     ref_out, ref_lse = _reference_tree_attention(q, k, v, mask, rows, slots, scale)
     torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
@@ -102,6 +109,7 @@ def test_tree_attention_last_dim_strided():
         rows_per_req=rows,
         slots_per_req=slots,
         sm_scale=scale,
+        lse_base2=False,
         out=out,
     )
     ref_out, _ = _reference_tree_attention(q, k, v, mask, rows, slots, scale)
@@ -129,7 +137,14 @@ def test_merge_with_prefix_equals_full_attention():
         bs * n, hq, d
     )
     tree_out, tree_lse = tree_attention(
-        q, kt, vt, mask, rows_per_req=n, slots_per_req=n, sm_scale=scale
+        q,
+        kt,
+        vt,
+        mask,
+        rows_per_req=n,
+        slots_per_req=n,
+        sm_scale=scale,
+        lse_base2=False,
     )
     out, _ = attn_merge_state(
         pre_out.bfloat16().contiguous(), pre_lse, tree_out, tree_lse

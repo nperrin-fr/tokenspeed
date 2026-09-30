@@ -31,6 +31,7 @@ import torch
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -46,16 +47,21 @@ PARAMS = {
 }
 
 
-def _backend(route: str) -> tuple[TritonSamplingBackend, torch.Tensor]:
-    backend = TritonSamplingBackend(
-        SamplingBackendConfig(
-            max_bs=BS,
-            max_draft_tokens_per_req=N,
-            max_req_pool_size=POOL,
-            vocab_size=VOCAB,
-            device="cuda",
-        )
+def _config(logprobs: bool) -> SamplingBackendConfig:
+    return SamplingBackendConfig(
+        max_bs=BS,
+        max_draft_tokens_per_req=N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cuda",
+        enable_output_logprobs=logprobs,
     )
+
+
+def _backend(
+    route: str, logprobs: bool = False
+) -> tuple[TritonSamplingBackend, torch.Tensor]:
+    backend = TritonSamplingBackend(_config(logprobs))
     params = []
     for i in range(BS):
         sp = SamplingParams(**PARAMS[route])
@@ -140,7 +146,8 @@ def test_chain_shaped_tree_verifies_like_chain(route):
             chain_predict[b * N : b * N + n], tree_predict[b * N : b * N + n]
         )
     assert torch.equal(
-        tree.path_buf[:BS, :3].cpu(), torch.tensor([[0, 1, 2]] * BS, dtype=torch.int32)
+        backend.accepted_path(BS, N)[:, :3].cpu(),
+        torch.tensor([[0, 1, 2]] * BS, dtype=torch.int32),
     )
 
 
@@ -178,3 +185,53 @@ def test_nodes_sample_the_chain_draw_at_their_depth(route):
         BS, N
     )
     assert torch.equal(picks, torch.gather(chain, 1, depth))
+
+
+@pytest.mark.parametrize("backend_name", ["greedy", "triton"])
+def test_greedy_tree_verify_walks_the_argmax_with_logprobs(backend_name):
+    torch.manual_seed(2)
+    offsets = torch.arange(30, 30 + POOL + 1, dtype=torch.int32, device="cuda")
+    logits = torch.randn(BS * N, VOCAB, device="cuda") * 3
+    target = logits.argmax(-1).view(BS, N)
+    if backend_name == "greedy":
+        backend = GreedySamplingBackend(_config(True))
+        req = torch.tensor([2, 5, 7], dtype=torch.int64, device="cuda")
+    else:
+        backend, req = _backend("greedy", logprobs=True)
+
+    # Node 1 misses, node 2 (its sibling) matches, node 3 under node 2 matches for request 0 only.
+    parent = [-1, 0, 0, 2]
+    tree = _tree(parent, req)
+    candidates = torch.randint(0, VOCAB, (BS, N), dtype=torch.int32, device="cuda")
+    candidates[:, 1] = (target[:, 0] + 1) % VOCAB
+    candidates[:, 2] = target[:, 0]
+    candidates[:, 3] = (target[:, 2] + 1) % VOCAB
+    candidates[0, 3] = target[0, 2]
+
+    out = LogitsProcessorOutput(next_token_logits=logits.clone())
+    predict, accept = backend.verify(out, _info(req, offsets), candidates, tree=tree)
+    path = backend.accepted_path(BS, N).cpu().tolist()
+
+    logprobs = torch.log_softmax(logits.float(), -1)
+    for b in range(BS):
+        want_path, node = [0], 0
+        while True:
+            kids = [
+                j
+                for j in range(N)
+                if parent[j] == node and int(candidates[b, j]) == int(target[b, node])
+            ]
+            if not kids:
+                break
+            node = kids[0]
+            want_path.append(node)
+        assert int(accept[b]) == len(want_path)
+        assert path[b] == want_path + [-1] * (N - len(want_path))
+        for d, node in enumerate(want_path):
+            assert int(predict[b * N + d]) == int(target[b, node])
+            torch.testing.assert_close(
+                out.next_token_logprobs[b * N + d].float(),
+                logprobs[b * N + node, target[b, node]],
+                atol=1e-3,
+                rtol=1e-3,
+            )

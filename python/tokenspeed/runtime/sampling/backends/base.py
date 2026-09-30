@@ -193,6 +193,11 @@ class SamplingBackend(ABC):
             self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
         )
 
+    def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
+        """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
+        tree verify, as agreed across TP ranks."""
+        return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
+
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         """Configure optional DP sampling state.
 
@@ -336,5 +341,5 @@ class SamplingBackend(ABC):
         tree: TreeSpec | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Verify each request's draft window; ``tree`` is the draft tree
-        (``None`` for a chain) and needs ``supports_tree_verify``. A tree
-        verify stores the agreed accepted path with ``tree.record_path``."""
+        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
+        verify leaves its agreed path in ``accepted_path``."""

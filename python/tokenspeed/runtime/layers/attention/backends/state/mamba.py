@@ -948,7 +948,7 @@ class MambaAttnBackend(AttentionBackend):
         source_steps = steps
         if self.tree_verify is not None:
             # Scratch row step s holds node s - 1: the last accepted node is path[steps - 1].
-            last = (steps - 1).clamp_min(0).long().unsqueeze(1)
+            last = (steps - 1).long().unsqueeze(1)
             source_steps = self.tree_verify.path[:bs].gather(1, last).squeeze(1) + 1
         state_verify_commit_rows(
             source_steps,

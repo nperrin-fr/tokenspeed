@@ -166,7 +166,7 @@ class TreeSpec:
             predict: ``[bs * N]`` int32 output, the picks packed along the path.
             accept_length: ``[bs]`` int32 output, accepted drafts plus the bonus.
             accept_index: ``[bs, N]`` int32 output, the accepted path (root
-                first, ``-1`` past it); ``record_path`` stores it once agreed.
+                first, ``-1`` past it).
             candidates: ``[bs, N]`` node tokens, node 0 the root.
             target: ``[bs * N]`` int32 target pick at every node.
         """
@@ -183,10 +183,14 @@ class TreeSpec:
         """Store the accepted path (after the TP broadcast) for compaction."""
         self.path_buf[:bs].copy_(accept_index)
 
-    def path_rows(self, bs: int) -> torch.Tensor:
-        """``[bs * N]`` source row of each packed row: the accepted path first, then identity."""
-        n = self.num_nodes
-        path = self.path_buf[:bs].long()
+    def path_rows(self, path: torch.Tensor) -> torch.Tensor:
+        """``[bs * N]`` source row of each packed row: the accepted path first, then identity.
+
+        Args:
+            path: ``[bs, N]`` accepted path, root first, ``-1`` past it.
+        """
+        bs, n = path.shape
+        path = path.long()
         local = torch.where(path >= 0, path, self._node_offsets)
         return (local + torch.arange(bs, device=path.device)[:, None] * n).view(-1)
 

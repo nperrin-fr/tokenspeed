@@ -131,7 +131,7 @@ class DraftTree:
         """
         k = self.topk
         child_scores, child_tokens = logprob_topk(logits, k)
-        lane_tokens, _ = draft_tree_expand(
+        lane_tokens = draft_tree_expand(
             child_scores.view(bs, k * k),
             child_tokens.view(bs, k * k),
             self.lane_scores[:bs],

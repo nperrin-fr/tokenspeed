@@ -238,11 +238,10 @@ class GreedySamplingBackend(SamplingBackend):
         self.broadcast_verify_outputs()
 
         if tree is not None:
-            tree.record_path(bs, accept_index)
             if self.config.enable_output_logprobs:
                 # predict is packed along the path; score it against the path's own rows.
                 logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                    logits.index_select(0, tree.path_rows(bs)), predict
+                    logits.index_select(0, tree.path_rows(accept_index)), predict
                 )
         elif self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

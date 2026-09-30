@@ -1072,10 +1072,15 @@ def causal_conv1d_update(
         or {parent_indices.dtype, output_state_indices.dtype, conv_state_indices.dtype}
         != {torch.int32}
         or num_accepted_tokens is not None
+        or cache_seqlens is not None
+        or intermediate_conv_window is not None
+        or pad_slot_id != PAD_SLOT_ID
+        or validate_data
     ):
         raise ValueError(
             "parent_indices needs int32 conv_state_indices (batch,) and "
-            "output_state_indices of its shape, and no num_accepted_tokens"
+            "output_state_indices of its shape, and none of num_accepted_tokens, "
+            "cache_seqlens, intermediate_conv_window, pad_slot_id, validate_data"
         )
     if parent_indices is not None:
         return _causal_conv1d_tree_update(
