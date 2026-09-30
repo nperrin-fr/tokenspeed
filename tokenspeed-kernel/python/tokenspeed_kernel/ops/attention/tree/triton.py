@@ -120,6 +120,9 @@ def _tree_attention_kernel(
 
     scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
     scores = tl.where(visible, scores, float("-inf"))
+    # Slots no row sees may hold a previous round's stale K/V; keep them out of P.V.
+    seen = tl.max(visible.to(tl.int32), axis=0) > 0
+    v = tl.where(seen[:, None], v, 0.0)
 
     row_max = tl.max(scores, axis=1)
     safe_max = tl.where(row_max == float("-inf"), 0.0, row_max)

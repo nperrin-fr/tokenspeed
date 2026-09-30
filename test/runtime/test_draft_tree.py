@@ -22,7 +22,10 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.triton.draft_tree import tree_ancestry
+from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
+    draft_tree_finalize,
+    tree_ancestry,
+)
 
 from tokenspeed.runtime.execution.drafter.tree import DraftTree
 
@@ -68,6 +71,34 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
     return tokens.cpu(), parent.cpu(), record
 
 
+def test_finalize_keeps_the_best_scores_even_when_nearly_tied():
+    """Distinct scores closer than any depth penalty keep their order."""
+    scores = torch.tensor([[-1.0, -1.0000003576, -1.0000008345]], device=DEVICE)
+    parent = torch.tensor([[-1, 0, -1]], device=DEVICE)
+    depth = torch.tensor([[1, 2, 1]], device=DEVICE)
+    tokens = torch.tensor([[10, 11, 12]], device=DEVICE)
+    root = torch.tensor([9], device=DEVICE)
+    out_tokens, out_parent = draft_tree_finalize(
+        scores, parent, depth, tokens, root, num_nodes=3, max_depth=2, rank_bits=6
+    )
+    assert out_tokens.tolist() == [[9, 10, 11]]
+    assert out_parent.tolist() == [[-1, 0, 1]]
+
+
+def test_finalize_keeps_a_parent_tied_with_its_child():
+    """A zero log-prob step ties child and parent; the parent (lower id) ranks first."""
+    scores = torch.tensor([[-0.5, -0.5, -0.7]], device=DEVICE)
+    parent = torch.tensor([[-1, 0, -1]], device=DEVICE)
+    depth = torch.tensor([[1, 2, 1]], device=DEVICE)
+    tokens = torch.tensor([[10, 11, 12]], device=DEVICE)
+    root = torch.tensor([9], device=DEVICE)
+    out_tokens, out_parent = draft_tree_finalize(
+        scores, parent, depth, tokens, root, num_nodes=2, max_depth=2, rank_bits=6
+    )
+    assert out_tokens.tolist() == [[9, 10]]
+    assert out_parent.tolist() == [[-1, 0]]
+
+
 @pytest.mark.parametrize("nodes", [2, 17, 64])
 def test_tree_ancestry_walks_full_chain(nodes):
     """Depth is not capped: the default chain of N nodes is N - 1 deep."""
@@ -111,8 +142,8 @@ def test_draft_tree_structure(bs, topk, steps, nodes):
                 anc |= 1 << cur
                 cur = int(parent[b, cur])
             assert int(mask[b, j]) & ((1 << 64) - 1) == anc  # bit 63 is the int64 sign
-        # Kept nodes are the best N - 1 candidates (depth tie-break as in finalize).
-        ranked = sorted(record[b], key=lambda e: -(e[1] - 1e-6 * len(e[0])))
+        # Kept nodes are the best N - 1 candidates, ties to the earlier candidate.
+        ranked = sorted(record[b], key=lambda e: -e[1])
         assert set(paths[j] for j in range(1, nodes)) == {
             e[0] for e in ranked[: nodes - 1]
         }

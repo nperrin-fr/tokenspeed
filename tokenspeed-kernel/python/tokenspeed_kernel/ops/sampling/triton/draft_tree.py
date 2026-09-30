@@ -36,20 +36,16 @@ __all__ = ["draft_tree_expand", "draft_tree_finalize", "tree_ancestry"]
 
 
 @triton.jit
-def _adjusted_scores(scores_ptr, depth_ptr, offs, ok, tie_break):
-    depth = tl.load(depth_ptr + offs, mask=ok, other=0)
+def _finite_scores(scores_ptr, offs, ok):
     score = tl.load(scores_ptr + offs, mask=ok, other=float("-inf"))
-    score = score - tie_break * depth.to(tl.float32)
     return tl.where(score == score, score, float("-inf"))
 
 
 @triton.jit
 def _draft_tree_select_kernel(
     scores_ptr,  # [bs, E] float32
-    depth_ptr,  # [bs, E] int64, 1 under the root
     kept_ptr,  # [bs, N - 1] int32 out: kept entry of each global rank
     slot_ptr,  # [bs, E] int32 out: global rank of each kept entry
-    tie_break,
     E: tl.constexpr,
     N: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -61,19 +57,17 @@ def _draft_tree_select_kernel(
     base = req * E
     ent = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     ent_ok = ent < E
-    score = _adjusted_scores(scores_ptr, depth_ptr, base + ent, ent_ok, tie_break)
+    score = _finite_scores(scores_ptr, base + ent, ent_ok)
     rank = tl.zeros([BLOCK], dtype=tl.int32)
     for start in range(0, E, CHUNK):
         other = start + tl.arange(0, CHUNK)
         other_ok = other < E
-        other_score = _adjusted_scores(
-            scores_ptr, depth_ptr, base + other, other_ok, tie_break
-        )
+        other_score = _finite_scores(scores_ptr, base + other, other_ok)
         better = (other_score[None, :] > score[:, None]) | (
             (other_score[None, :] == score[:, None]) & (other[None, :] < ent[:, None])
         )
         rank += tl.sum((better & other_ok[None, :]).to(tl.int32), axis=1)
-    # A child scores strictly below its parent, so kept entries form a tree.
+    # A child never outranks its parent (score <= parent's, ties to the lower id).
     kept = ent_ok & (rank < N - 1)
     tl.store(kept_ptr + req * (N - 1) + rank, ent.to(tl.int32), mask=kept)
     tl.store(slot_ptr + base + ent, rank, mask=kept)
@@ -357,7 +351,6 @@ def draft_tree_finalize(
     *,
     num_nodes: int,
     max_depth: int,
-    tie_break: float,
     rank_bits: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep the best ``num_nodes - 1`` candidates under the root, depth first.
@@ -371,8 +364,6 @@ def draft_tree_finalize(
         root_tokens: ``[bs]`` token of node 0, any stride.
         num_nodes: ``N``, nodes including the root; ``N - 1 <= E``.
         max_depth: deepest candidate depth.
-        tie_break: per-depth score penalty that puts every parent strictly
-            ahead of its children.
         rank_bits: bits per level of the depth-first key; ``max_depth *
             rank_bits <= 62`` and every sibling rank + 1 fits.
 
@@ -395,10 +386,8 @@ def draft_tree_finalize(
     block = 64
     _draft_tree_select_kernel[(bs, triton.cdiv(num_entries, block))](
         scores,
-        depth,
         kept,
         slot,
-        tie_break,
         E=num_entries,
         N=num_nodes,
         BLOCK=block,

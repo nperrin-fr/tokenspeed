@@ -551,10 +551,13 @@ class ModelExecutor:
 
     def _init_tree_spec(self, max_bs: int) -> None:
         """Arm draft-tree speculation: shared tree state, verify leaves, drafter."""
-        if self.runtime_states.has_request_token_history:
+        if (
+            self.runtime_states.has_request_token_history
+            or self.runtime_states.ngram_accepted_tokens is not None
+        ):
             raise NotImplementedError(
                 "draft trees write verify-window tokens in node order; a target that "
-                "reads request token history needs them along the accepted path"
+                "reads request token or n-gram history needs them along the accepted path"
             )
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(

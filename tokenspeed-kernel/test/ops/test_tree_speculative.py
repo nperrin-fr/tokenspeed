@@ -116,6 +116,31 @@ def test_tree_attention_last_dim_strided():
     torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
 
 
+def test_tree_attention_ignores_nan_in_unseen_slots():
+    gen = torch.Generator().manual_seed(5)
+    bs, rows, slots, hq, hkv, d = 2, 4, 12, 8, 2, 128
+    q = torch.randn(bs * rows, hq, d, generator=gen).bfloat16().cuda()
+    k = torch.randn(bs * slots, hkv, d, generator=gen).bfloat16().cuda()
+    v = torch.randn(bs * slots, hkv, d, generator=gen).bfloat16().cuda()
+    mask = _random_masks(bs, rows, 4, gen) | 1  # rows see slots 0..3 only
+    scale = d**-0.5
+    ref_out, _ = _reference_tree_attention(q, k, v, mask, rows, slots, scale)
+    stale = torch.arange(bs * slots, device="cuda") % slots >= 8
+    k[stale] = float("nan")
+    v[stale] = float("nan")
+    out, _ = tree_attention(
+        q,
+        k,
+        v,
+        mask,
+        rows_per_req=rows,
+        slots_per_req=slots,
+        sm_scale=scale,
+        lse_base2=False,
+    )
+    torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
+
+
 def test_merge_with_prefix_equals_full_attention():
     gen = torch.Generator().manual_seed(7)
     bs, n, prefix, hq, hkv, d = 2, 8, 33, 8, 2, 64

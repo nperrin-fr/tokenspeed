@@ -44,8 +44,6 @@ from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 
 __all__ = ["DraftTree"]
 
-# Keeps an ancestor strictly ahead of its descendants when a step's log-prob is 0.
-_DEPTH_TIE_BREAK = 1e-6
 # Bits per depth level in the depth-first sort key (sibling rank + 1 < 64).
 _RANK_BITS = 6
 
@@ -165,6 +163,5 @@ class DraftTree:
             root_tokens,
             num_nodes=self.num_nodes,
             max_depth=self.num_steps,
-            tie_break=_DEPTH_TIE_BREAK,
             rank_bits=_RANK_BITS,
         )

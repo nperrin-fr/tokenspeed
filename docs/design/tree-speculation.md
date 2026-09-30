@@ -18,9 +18,10 @@ not grow a second copy of any of it.
 ### The tree is a parameter of the chain path
 
 After verify, `TreeSpec.verify` (the `verify_tree` kernel) packs `predict`
-along the accepted path and the sampling backend stores the TP-agreed path with
-`TreeSpec.record_path`. The executor then calls `TreeSpec.compact` once, a
-single launch that moves, for every request:
+along the accepted path. The executor reads the TP-agreed path from the
+sampling backend (`SamplingBackend.accepted_path`), stores it with
+`TreeSpec.record_path`, and calls `TreeSpec.compact` once, a single launch that
+moves, for every request:
 
 * target KV of the path (every layer) to the window's leading slots;
 * target hidden rows to the front of the window;
@@ -98,8 +99,8 @@ keyed by `(seed, position)`. For a tree the key is the node's position
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws (a child is accepted when it equals its parent's draw).
-Backends that cannot do this keep `supports_tree_verify = False` and the server
-refuses tree drafting with them.
+Backends that cannot do this keep `supports_tree_verify = False` and the
+executor refuses tree drafting with them at startup.
 
 ## Scope
 
@@ -107,7 +108,8 @@ EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
 attention backend with bf16 KV and one KV cache group, alone or inside the
 hybrid linear-attention backend (GDN, without ReplaySSM); no structured output,
-no mixed batches, no sliding window or attention sinks in the target.
+no mixed batches, no sliding window or attention sinks in the target, and no
+target that reads request token history or n-gram (Engram) input history.
 
 ## Tests
 
