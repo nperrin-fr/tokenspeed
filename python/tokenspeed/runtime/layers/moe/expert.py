@@ -234,7 +234,7 @@ class MoELayer(torch.nn.Module):
         if self._quant_kind == "mxfp4":
             if self.quant_config.is_w4a8_fp8:
                 internal_activation_dtype = "fp8"
-            elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
+            elif self.quant_config.use_dynamic_mxfp4_activations:
                 internal_activation_dtype = "mxfp4"
         # --moe-mxfp4-fp8-activation: FP8 activations for every MXFP4 routed
         # expert layer in the model. "fp8" matches only the FlashInfer cutlass
