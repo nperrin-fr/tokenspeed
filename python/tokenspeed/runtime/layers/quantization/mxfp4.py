@@ -204,9 +204,3 @@ class Mxfp4Config(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> list[str]:
         return []
-
-    def is_static_cfg(self):
-        return self.is_checkpoint_mxfp4_serialized
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []

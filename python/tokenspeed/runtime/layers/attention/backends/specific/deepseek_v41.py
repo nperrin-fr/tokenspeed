@@ -896,40 +896,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         valid = (keys[index] == wanted) & (positions >= 0) & (requests >= 0)
         return order[index].masked_fill(~valid, -1)
 
-    def read_compressor_tail(self, owner, positions, request_indices, forward_mode):
-        """Return FP32 [rows, 2, 512] content/score history; missing rows fail."""
-        if self.spec.compress_ratios[owner] != 2:
-            raise ValueError("Only ratio-2 owners have compressor tails")
-        self._owner_group(owner)
-        slots = self.cache_slots(
-            V41_COMPRESSOR_TAIL_GROUP_ID, positions, request_indices, forward_mode
-        )
-        return self.cache_pool.compressor_tail(owner)[slots // 2, slots % 2]
-
-    def write_compressor_tail(
-        self, owner, content, scores, positions, request_indices, forward_mode
-    ) -> None:
-        """Store FP32 projected inputs only at LCM-retained token rows.
-
-        Released rows in a prefill are skipped; completed pairs use this
-        forward's projection tensors rather than requiring expired tail pages.
-        """
-        self._owner_group(owner)
-        tail = self.cache_pool.compressor_tail(owner)
-        if content.shape != (positions.numel(), 512) or scores.shape != content.shape:
-            raise ValueError("compressor content/scores must be [tokens, 512]")
-        slots = self.cache_slots(
-            V41_COMPRESSOR_TAIL_GROUP_ID, positions, request_indices, forward_mode
-        )
-        if content.is_cuda:
-            from tokenspeed_kernel.ops.attention import dsv41
-
-            dsv41.compressor_tail_scatter(content, scores, tail, slots)
-        else:
-            live = slots >= 0
-            tail[slots[live] // 2, slots[live] % 2, 0] = content[live].float()
-            tail[slots[live] // 2, slots[live] % 2, 1] = scores[live].float()
-
     def compress(
         self,
         owner,

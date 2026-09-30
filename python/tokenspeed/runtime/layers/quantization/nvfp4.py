@@ -111,9 +111,6 @@ class Nvfp4Config(QuantizationConfig):
             return "nvfp4"
         return None
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
 
 class Nvfp4W4A16Config(Nvfp4Config):
     """Per-layer config for weight-only ModelOpt NVFP4 projections."""

@@ -115,9 +115,6 @@ class Fp8Config(QuantizationConfig):
             scale_fmt=scale_fmt,
         )
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
 
 class Mxfp8Config(Fp8Config):
     """Config class for MXFP8."""

@@ -397,9 +397,6 @@ class ModelOptMixedConfig(QuantizationConfig):
     def moe_weight_dtype(self, prefix: str = "") -> str:
         return self.get_moe_quant_config(prefix).moe_weight_dtype(prefix)
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
 
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 

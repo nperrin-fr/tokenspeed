@@ -26,13 +26,7 @@ from tokenspeed_kernel.ops.communication.triton import (
     allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    reducescatter_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm import rmsnorm
 from tokenspeed_kernel.platform import current_platform
@@ -188,42 +182,6 @@ class RMSNorm(torch.nn.Module):
             return result[0], result[1], None
         return result, None, None
 
-    def forward_with_reducescatter_fusion(
-        self,
-        rank: int,
-        group: tuple[int, ...],
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        fuse_block_quant_fp8: bool = False,
-        add_in: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward method with reducescatter fusion, prioritizing flashinfer fused operations
-        """
-
-        if residual is not None:
-
-            if len(group) > 1:
-                fused_result = reducescatter_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    use_oneshot=True,
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    add_in=add_in,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
-
-        result = self.forward(x, residual)
-        if isinstance(result, tuple):
-            return result[0], result[1], None
-        return result, None, None
-
 
 class GemmaRMSNorm(torch.nn.Module):
     def __init__(
@@ -333,44 +291,6 @@ class GemmaRMSNorm(torch.nn.Module):
             return result[0], result[1], None
         return result, None, None
 
-    def forward_with_reducescatter_fusion(
-        self,
-        rank: int,
-        group: tuple[int, ...],
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        fuse_block_quant_fp8: bool = False,
-        add_in: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward method with reducescatter fusion for GemmaRMSNorm.
-        Uses gemma_weight (= weight + 1.0) as gamma so that the standard
-        fused kernel computes x * (1 + weight) matching GemmaRMSNorm semantics.
-        """
-
-        if residual is not None:
-
-            if len(group) > 1:
-                fused_result = reducescatter_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.gemma_weight,
-                    rank=rank,
-                    group=_get_process_group(group),
-                    eps=self.variance_epsilon,
-                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    use_oneshot=True,
-                    block_quant_fp8=fuse_block_quant_fp8,
-                    add_in=add_in,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
-
-        result = self.forward(x, residual)
-        if isinstance(result, tuple):
-            return result[0], result[1], None
-        return result, None, None
-
 
 class FusedRMSNorm(nn.Module):
     """Fused RMSNorm layer for normalizing two tensors simultaneously.
@@ -441,64 +361,3 @@ class FusedRMSNorm(nn.Module):
                 eps=self.q_a_norm.variance_epsilon,
             )
         return input_q_a, input_kv_a
-
-    def forward_with_allgather_fusion(
-        self,
-        rank: int,
-        group: tuple[int, ...],
-        qkv: torch.Tensor,
-        total_num_tokens: int,
-        fuse_block_quant_fp8: bool = False,
-        trigger_completion_at_end: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        """
-        Forward method with allgather fusion, performing allgather + dual RMSNorm + optional FP8 block quantization.
-
-        This method fuses allgather communication with dual RMSNorm computation
-        and optional FP8 block-wise quantization in a single kernel launch.
-
-        Args:
-            qkv: Input tensor to allgather, shape [num_token_current_rank, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
-            fuse_block_quant_fp8: Whether to perform FP8 block-wise quantization on the first norm output
-            trigger_completion_at_end: Whether to trigger completion event at the end of kernel
-
-        Returns:
-            Tuple of (allgather_out, quant_out, k_nope, block_scale):
-                - allgather_out: Gathered tensor, shape [num_token_all_group, hidden_dim]
-                - quant_out: FP8 quantized first norm output (q_contiguous), None if fuse_block_quant_fp8=False
-                - k_nope: Second norm output
-                - block_scale: Quantization scales, None if fuse_block_quant_fp8=False
-        """
-
-        if len(group) > 1:
-            fused_result = allgather_dual_rmsnorm(
-                qkv=qkv,
-                total_num_tokens=total_num_tokens,
-                rank=rank,
-                group=_get_process_group(group),
-                weight_q_a=self.weight_q_a,
-                weight_kv_a=self.weight_kv_a,
-                eps_q=self.q_a_norm.variance_epsilon,
-                eps_kv=self.kv_a_norm.variance_epsilon,
-                max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                block_quant_fp8=fuse_block_quant_fp8,
-                trigger_completion_at_end=trigger_completion_at_end,
-                fp32_acc=False,
-            )
-            if fused_result[0] is not None:
-                return fused_result
-
-        q_lora_rank = self.weight_q_a.shape[0]
-        kv_lora_rank = self.weight_kv_a.shape[0]
-        q = qkv[..., :q_lora_rank]
-        k_nope = qkv[..., q_lora_rank : q_lora_rank + kv_lora_rank]
-        q_contiguous = torch.empty_like(q)
-        if q.shape[0] > 0:
-            self.forward(input_q_a=q, input_kv_a=k_nope, output_q_a=q_contiguous)
-
-        return qkv, q_contiguous, k_nope, None

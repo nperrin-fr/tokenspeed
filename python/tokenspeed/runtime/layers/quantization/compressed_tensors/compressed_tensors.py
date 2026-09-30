@@ -153,9 +153,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             f"{weight_quant}"
         )
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> CompressedTensorsConfig:
         ignore: list[str] = cast(list[str], config.get("ignore", []))
