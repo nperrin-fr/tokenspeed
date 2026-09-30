@@ -35,8 +35,6 @@ for the root), ``depth`` and a 64-bit ``mask`` whose bit ``j`` marks node
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
@@ -44,20 +42,12 @@ from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
 )
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 
-__all__ = ["DraftTree", "TreeExpansion"]
+__all__ = ["DraftTree"]
 
 # Keeps an ancestor strictly ahead of its descendants when a step's log-prob is 0.
 _DEPTH_TIE_BREAK = 1e-6
 # Bits per depth level in the depth-first sort key (sibling rank + 1 < 64).
 _RANK_BITS = 6
-
-
-@dataclass
-class TreeExpansion:
-    """One drafting step's lane update, for the drafter's forward inputs."""
-
-    lane_tokens: torch.Tensor  # [bs, K] int64, tokens the lanes forward next
-    parent_lane: torch.Tensor  # [bs, K] int64, lane each new lane descends from
 
 
 class DraftTree:
@@ -101,11 +91,14 @@ class DraftTree:
             (max_bs, topk), dtype=torch.float32, device=device
         )
 
-    def seed(self, bs: int, logits: torch.Tensor) -> TreeExpansion:
+    def seed(self, bs: int, logits: torch.Tensor) -> torch.Tensor:
         """Step 0: the draft's top-K at the frontier become the first lanes.
 
         Args:
             logits: ``[bs, V]`` draft logits at the frontier.
+
+        Returns:
+            ``[bs, K]`` int64 tokens the lanes forward next.
         """
         k = self.topk
         scores, tokens = logprob_topk(logits, k)
@@ -113,10 +106,9 @@ class DraftTree:
         self.entry_scores[:bs, :k] = scores
         self.entry_parent[:bs, :k] = -1
         self.entry_depth[:bs, :k] = 1
-        lanes = torch.arange(k, device=tokens.device).expand(bs, k)
-        self.lane_entry[:bs] = lanes
+        self.lane_entry[:bs] = torch.arange(k, device=tokens.device)
         self.lane_scores[:bs] = scores
-        return TreeExpansion(lane_tokens=tokens, parent_lane=lanes)
+        return tokens
 
     def expand(
         self,
@@ -124,7 +116,7 @@ class DraftTree:
         step: int,
         logits: torch.Tensor,
         next_lanes: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-    ) -> TreeExpansion:
+    ) -> torch.Tensor:
         """Steps ``1 .. S - 1``: expand every lane, keep the best K children.
 
         Args:
@@ -133,10 +125,13 @@ class DraftTree:
             next_lanes: ``(lane_mask, hidden_src, hidden_dst)`` handed to
                 ``draft_tree_expand`` to prepare the next step, or ``None``
                 after the last step.
+
+        Returns:
+            ``[bs, K]`` int64 tokens the lanes forward next.
         """
         k = self.topk
         child_scores, child_tokens = logprob_topk(logits, k)
-        lane_tokens, parent_lane = draft_tree_expand(
+        lane_tokens, _ = draft_tree_expand(
             child_scores.view(bs, k * k),
             child_tokens.view(bs, k * k),
             self.lane_scores[:bs],
@@ -149,7 +144,7 @@ class DraftTree:
             depth=step + 1,
             next_lanes=next_lanes,
         )
-        return TreeExpansion(lane_tokens=lane_tokens, parent_lane=parent_lane)
+        return lane_tokens
 
     def finalize(
         self, bs: int, root_tokens: torch.Tensor

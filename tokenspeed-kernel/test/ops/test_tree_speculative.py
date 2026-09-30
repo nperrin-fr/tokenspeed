@@ -27,7 +27,7 @@ import torch
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tree import tree_attention, tree_decode_attention
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
-from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree_greedy
+from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -74,6 +74,38 @@ def test_tree_attention_matches_reference(rows, slots):
     assert torch.equal(seen, torch.isfinite(lse))
     torch.testing.assert_close(lse[seen], ref_lse[seen], atol=1e-3, rtol=1e-3)
     assert torch.all(out[0] == 0)
+
+
+def _last_dim_strided(t):
+    """The same values viewed with stride 2 along the last dim."""
+    backing = torch.zeros(
+        *t.shape[:-1], 2 * t.shape[-1], dtype=t.dtype, device=t.device
+    )
+    backing[..., ::2] = t
+    return backing[..., ::2]
+
+
+def test_tree_attention_last_dim_strided():
+    gen = torch.Generator().manual_seed(20260930)
+    bs, rows, slots, hq, hkv, d = 2, 17, 17, 8, 2, 128
+    q = torch.randn(bs * rows, hq, d, generator=gen).bfloat16().cuda()
+    k = torch.randn(bs * slots, hkv, d, generator=gen).bfloat16().cuda()
+    v = torch.randn(bs * slots, hkv, d, generator=gen).bfloat16().cuda()
+    mask = _random_masks(bs, rows, slots, gen)
+    scale = d**-0.5
+    out = _last_dim_strided(torch.empty_like(q))
+    tree_attention(
+        _last_dim_strided(q),
+        _last_dim_strided(k),
+        _last_dim_strided(v),
+        mask,
+        rows_per_req=rows,
+        slots_per_req=slots,
+        sm_scale=scale,
+        out=out,
+    )
+    ref_out, _ = _reference_tree_attention(q, k, v, mask, rows, slots, scale)
+    torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
 
 
 def test_merge_with_prefix_equals_full_attention():
@@ -135,13 +167,13 @@ def test_merge_with_prefix_equals_full_attention():
         torch.testing.assert_close(fused_lse, full_lse * scale, atol=1e-3, rtol=1e-3)
 
 
-def _reference_verify(cands, parents, target, max_depth):
+def _reference_verify(cands, parents, target):
     bs, n = cands.shape
     predicts = torch.zeros(bs * n, dtype=torch.int32)
     lengths, paths = [], torch.full((bs, n), -1, dtype=torch.int32)
     for b in range(bs):
         cur, path = 0, [0]
-        for _ in range(max_depth):
+        while True:
             pick = int(target[b * n + cur])
             kids = [
                 j
@@ -172,7 +204,7 @@ def _random_tree(n, max_depth, rng):
 @pytest.mark.parametrize(
     "n,max_depth,vocab", [(8, 3, 3), (32, 6, 4), (64, 10, 5), (5, 4, 2)]
 )
-def test_verify_tree_greedy_matches_reference(n, max_depth, vocab):
+def test_verify_tree_matches_reference(n, max_depth, vocab):
     rng = random.Random(n)
     bs = 16
     parents = torch.tensor(
@@ -180,20 +212,18 @@ def test_verify_tree_greedy_matches_reference(n, max_depth, vocab):
     )
     cands = torch.randint(0, vocab, (bs, n), dtype=torch.int32)
     target = torch.randint(0, vocab, (bs * n,), dtype=torch.int32)
-    # A chain row and an all-accept row.
+    # A chain row deeper than max_depth and an all-accept row.
     parents[0] = torch.arange(-1, n - 1)
     cands[1, 1:] = 0
     target[n : 2 * n] = 0
-    ref = _reference_verify(cands, parents, target, max_depth)
+    ref = _reference_verify(cands, parents, target)
     out = [
         torch.zeros(bs * n, dtype=torch.int32),
         torch.zeros(bs, dtype=torch.int32),
         torch.zeros(bs, n, dtype=torch.int32),
     ]
     out = [t.cuda() for t in out]
-    verify_tree_greedy(
-        *out, cands.cuda(), parents.cuda(), target.cuda(), max_depth=max_depth
-    )
+    verify_tree(*out, cands.cuda(), parents.cuda(), target.cuda())
     predicts, lengths, paths = [t.cpu() for t in out]
     assert torch.equal(lengths, ref[1])
     assert torch.equal(paths, ref[2])
@@ -342,13 +372,21 @@ def test_tree_decode_attention_large_query_tiles(hq, hkv, d, n):
     _check_tree_decode(2, n, 3, [40, 97], hq, hkv, d, 64, gen)
 
 
-def _check_tree_decode(bs, n, splits, prefix_lens, hq, hkv, d, page, gen):
+def test_tree_decode_attention_last_dim_strided():
+    gen = torch.Generator().manual_seed(20260930)
+    _check_tree_decode(2, 16, 3, [40, 97], 32, 8, 128, 32, gen, strided=True)
+
+
+def _check_tree_decode(
+    bs, n, splits, prefix_lens, hq, hkv, d, page, gen, strided=False
+):
     q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
         bs, n, prefix_lens, hq, hkv, d, page, gen
     )
-    rows = lambda cache: cache.permute(0, 2, 1, 3).reshape(-1, hkv, d).cuda()
+    layout = _last_dim_strided if strided else (lambda t: t)
+    rows = lambda cache: layout(cache.permute(0, 2, 1, 3).reshape(-1, hkv, d).cuda())
     out = tree_decode_attention(
-        q.cuda(),
+        layout(q.cuda()),
         rows(k_cache),
         rows(v_cache),
         tables.cuda(),

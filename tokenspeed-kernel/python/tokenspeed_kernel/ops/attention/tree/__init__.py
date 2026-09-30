@@ -19,9 +19,8 @@
 # SOFTWARE.
 
 from tokenspeed_kernel.ops.attention.tree.triton import (
-    MAX_TREE_SLOTS,
     tree_attention,
     tree_decode_attention,
 )
 
-__all__ = ["MAX_TREE_SLOTS", "tree_attention", "tree_decode_attention"]
+__all__ = ["tree_attention", "tree_decode_attention"]

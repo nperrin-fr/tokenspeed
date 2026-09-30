@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
+from tokenspeed.runtime.utils.common import ceil_div
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
@@ -122,8 +123,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # the forward with the pool frozen, and under --disable-autotune no
         # earlier forward will have grown the block by then.
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
-        # KV splits per (request, KV head) of draft-tree verify, by batch size.
-        self.tree_verify_splits: dict[int, int] = {}
+        self.num_sms = torch.cuda.get_device_properties(
+            config.device
+        ).multi_processor_count
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
         # per decode forward and needs non-causal (block-diffusion) attention.
@@ -509,12 +511,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
     def _tree_verify_splits(self, bs: int, kv_heads: int) -> int:
         """About two (request, KV head, split) programs per SM, at most 16 splits."""
-        if bs not in self.tree_verify_splits:
-            sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-            self.tree_verify_splits[bs] = max(
-                1, min(16, -(-2 * sms // (bs * kv_heads)))
-            )
-        return self.tree_verify_splits[bs]
+        return max(1, min(16, ceil_div(2 * self.num_sms, bs * kv_heads)))
 
     def _forward_tree_lanes(
         self,

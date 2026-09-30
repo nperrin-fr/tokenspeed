@@ -40,7 +40,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
-from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree_greedy
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -701,14 +700,13 @@ class TritonSamplingBackend(SamplingBackend):
                 logits, req_pool_indices, offsets_pool, tree, bs
             )
             # The accepted path rides in accept_index so the TP broadcast below carries it.
-            verify_tree_greedy(
+            tree.verify(
+                bs,
                 predict,
                 accept_length,
                 accept_index,
-                candidates.to(torch.int32),
-                tree.parent_buf[:bs],
+                candidates,
                 target_sampled,
-                max_depth=tree.max_depth,
             )
         else:
             target_sampled = self._sample_verify_targets(
@@ -737,7 +735,7 @@ class TritonSamplingBackend(SamplingBackend):
         self.broadcast_verify_outputs()
 
         if tree is not None:
-            tree.path_buf[:bs].copy_(accept_index)
+            tree.record_path(bs, accept_index)
         if self.config.enable_output_logprobs:
             if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.

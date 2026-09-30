@@ -559,7 +559,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy"
+                "use --sampling-backend greedy or triton"
             )
         config = self.config
         self.tree_spec = TreeSpec(
@@ -1332,7 +1332,7 @@ class ModelExecutor:
                 )
                 if self.tree_spec is not None:
                     self.tree_spec.future_parent_map[indices[requests]] = (
-                        self.drafter.tree_parent_out[requests]
+                        self.tree_spec.draft_parent_buf[requests]
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 

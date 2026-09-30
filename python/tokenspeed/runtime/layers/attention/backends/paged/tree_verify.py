@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["TreeVerifyInputs"]
+__all__ = ["TreeDraftInputs", "TreeVerifyInputs"]
 
 
 class TreeVerifyInputs:
@@ -50,8 +50,9 @@ class TreeVerifyInputs:
         num_nodes: ``N``, verify window width.
         parent: ``[max_bs, N]`` int32 parent node per window row (``-1`` for
             the root), refreshed every step by the executor.
-        path: ``[max_bs, N]`` int32 accepted path, written by verify (root
-            first, ``-1`` past it); recurrent state commits read it.
+        path: ``[max_bs, N]`` int32 accepted path, stored by
+            ``TreeSpec.record_path`` (root first, ``-1`` past it); recurrent
+            state commits read it.
         """
         self.mask = mask
         self.num_nodes = num_nodes
@@ -81,7 +82,6 @@ class TreeDraftInputs:
     ) -> None:
         self.topk = topk
         self.num_slots = (num_steps - 1) * topk
-        self.max_bs = max_bs
         # The drafting step being run (1 .. S - 1); None outside the lane loop.
         self.step: int | None = None
         shape = (max_bs * self.num_slots, num_kv_heads, head_dim)

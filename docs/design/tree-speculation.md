@@ -1,7 +1,7 @@
 # Draft-tree speculation
 
 This document records the invariants of draft-tree speculative decoding
-(`--speculative-eagle-topk > 1`, EAGLE3 and MTP drafters). A deviation from the rules here is a
+(`--speculative-eagle-topk > 1`, EAGLE3 and EAGLE-style MTP drafters). A deviation from the rules here is a
 bug unless this document is updated in the same change.
 
 ## The problem this solves
@@ -17,14 +17,16 @@ not grow a second copy of any of it.
 
 ### The tree is a parameter of the chain path
 
-After verify, the accepted path is compacted into a chain and everything
-downstream sees a chain:
+After verify, `TreeSpec.verify` (the `verify_tree` kernel) packs `predict`
+along the accepted path and the sampling backend stores the TP-agreed path with
+`TreeSpec.record_path`. The executor then calls `TreeSpec.compact` once, a
+single launch that moves, for every request:
 
-* target KV of the path moves to the window's leading slots
-  (`TreeSpec.compact_kv`, one kernel for every layer);
-* target hidden rows move to the front of each request's window
-  (`TreeSpec.compact_rows`);
-* `predict` is packed along the path by the verify kernel itself.
+* target KV of the path (every layer) to the window's leading slots;
+* target hidden rows to the front of the window;
+* the window positions back from `vc + depth` to `vc + i`.
+
+Everything downstream sees a chain.
 
 A chain is the tree `parent[i] = i - 1`. With `topk == 1` no tree state exists
 and the chain path runs unchanged; with `topk > 1` there is no tree-only commit,
@@ -35,8 +37,8 @@ output or drafting-step-0 code.
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
 `TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
-the forward, and `TreeSpec.chain_positions` shifts them back inside the forward
-after compaction (row `i` then holds the path node at depth `i`).
+the forward, and `TreeSpec.compact` shifts them back after the forward (row `i`
+then holds the path node at depth `i`).
 
 The two shifts must cancel for any `depth_buf`, including graph warmup, which
 replays the forward without the step prep: `depth_buf` and `mask_buf` start as
@@ -101,7 +103,8 @@ refuses tree drafting with them.
 
 ## Scope
 
-EAGLE3 and MTP drafters; `greedy` and `triton` sampling backends; the `trtllm`
+EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
+drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
 attention backend with bf16 KV and one KV cache group, alone or inside the
 hybrid linear-attention backend (GDN, without ReplaySSM); no structured output,
 no mixed batches, no sliding window or attention sinks in the target.

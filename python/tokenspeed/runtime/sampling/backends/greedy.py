@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
-from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree_greedy
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -212,14 +211,13 @@ class GreedySamplingBackend(SamplingBackend):
 
         if tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
-            verify_tree_greedy(
+            tree.verify(
+                bs,
                 predict,
                 accept_length,
                 accept_index,
-                candidates.to(torch.int32),
-                tree.parent_buf[:bs],
+                candidates,
                 target_predict.view(-1),
-                max_depth=tree.max_depth,
             )
         else:
             _verify_chain_greedy(
@@ -240,7 +238,7 @@ class GreedySamplingBackend(SamplingBackend):
         self.broadcast_verify_outputs()
 
         if tree is not None:
-            tree.path_buf[:bs].copy_(accept_index)
+            tree.record_path(bs, accept_index)
             if self.config.enable_output_logprobs:
                 # predict is packed along the path; score it against the path's own rows.
                 logits_output.next_token_logprobs = gather_token_logprobs_torch(

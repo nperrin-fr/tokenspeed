@@ -933,8 +933,7 @@ def _causal_conv1d_tree_update_kernel(
         acc = tl.load(bias_ptr + feats, mask=mask, other=0.0).to(tl.float32)
     else:
         acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    # Window column c (oldest first) is the token's (W - 1 - c)-th ancestor,
-    # falling back to the initial window's column once the path runs out.
+    # Column c is the (W - 1 - c)-th ancestor, else the initial window's column.
     out_rows = output_state_indices_ptr + idx_seq * stride_out_rows_seq
     out_row = tl.load(out_rows + token * stride_out_rows_step).to(tl.int64)
     out_base = (

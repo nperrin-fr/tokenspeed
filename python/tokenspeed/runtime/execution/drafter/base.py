@@ -138,7 +138,10 @@ class BaseDrafter:
 
     def bind_tree(self, tree_spec: TreeSpec) -> None:
         """Draft trees (--speculative-eagle-topk > 1); only EAGLE-style drafters expand lanes."""
-        raise NotImplementedError(f"{type(self).__name__} cannot draft trees")
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot draft trees (--speculative-eagle-topk > 1); "
+            "tree drafting needs an EAGLE-style drafter (EAGLE3, or MTP served by Eagle)"
+        )
 
     @abstractmethod
     def run(

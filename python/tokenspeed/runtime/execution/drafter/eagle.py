@@ -167,8 +167,6 @@ class Eagle(BaseDrafter):
         self.tree_spec: TreeSpec | None = None
         self.draft_tree: DraftTree | None = None
         self.tree_lanes: TreeDraftInputs | None = None
-        # Parents of the tree drafted this round, [max_bs, N].
-        self.tree_parent_out: torch.Tensor | None = None
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -204,7 +202,6 @@ class Eagle(BaseDrafter):
             device=self.device,
         )
         self.attn_backend.bind_tree_draft(self.tree_lanes)
-        self.tree_parent_out = tree_spec.chain_parent.repeat(max_bs, 1)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -537,7 +534,7 @@ class Eagle(BaseDrafter):
         """Expand K lanes for S - 1 steps from the step-0 row, then keep the best tree."""
         tree, lanes = self.draft_tree, self.tree_lanes
         topk = tree.topk
-        expansion = tree.seed(bs, self._tree_logits(logits_output))
+        lane_tokens = tree.seed(bs, self._tree_logits(logits_output))
         hidden = logits_output.hidden_states.repeat_interleave(topk, dim=0)
         lane_mask = lanes.lane_mask[: bs * topk].view(bs, topk)
         lane_mask.copy_(
@@ -565,7 +562,7 @@ class Eagle(BaseDrafter):
             with nvtx_range("draft_tree_forward", color="red"):
                 out = self.draft_model_runner.forward(
                     ctx=ctx,
-                    input_ids=self._map_hot(expansion.lane_tokens.reshape(-1)),
+                    input_ids=self._map_hot(lane_tokens.reshape(-1)),
                     positions=positions + (step - 1),
                     captured_hidden_states=hidden,
                     spec_step_idx=step,
@@ -573,7 +570,7 @@ class Eagle(BaseDrafter):
             lanes.step = None
             last = step == self.spec_num_steps - 1
             next_hidden = None if last else torch.empty_like(out.hidden_states)
-            expansion = tree.expand(
+            lane_tokens = tree.expand(
                 bs,
                 step,
                 self._tree_logits(out),
@@ -583,7 +580,7 @@ class Eagle(BaseDrafter):
 
         tokens, parent = tree.finalize(bs, next_tokens[:, 0])
         tokens[:, 1:] = self._map_hot(tokens[:, 1:].long()).to(torch.int32)
-        self.tree_parent_out[:bs].copy_(parent)
+        self.tree_spec.draft_parent_buf[:bs].copy_(parent)
         return tokens
 
     @staticmethod
@@ -633,8 +630,6 @@ class Eagle(BaseDrafter):
             )
         if self.spec_num_tokens > 1:
             next_tokens[:, 1:] = next_tokens[:, :1]
-        if self.tree_spec is not None:
-            self.tree_parent_out[:bs].copy_(self.tree_spec.chain_parent)
 
         # The runner refreshed the draft decode metadata over the target's
         # post-verify lengths (vc + N). Step 0 narrows to the live rows, whose
@@ -649,6 +644,7 @@ class Eagle(BaseDrafter):
 
         if self.tree_spec is not None:
             if self.input_buffers.all_extends_mid_chunk:
+                self.tree_spec.draft_parent_buf[:bs].copy_(self.tree_spec.chain_parent)
                 return next_tokens
             with self.attn_backend.override_num_extends(0):
                 return self._draft_tree(

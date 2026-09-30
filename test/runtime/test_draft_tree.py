@@ -38,7 +38,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
     record = []  # per request: list of (token path tuple, score)
     lane_paths = [[None] * topk for _ in range(bs)]
     logp = torch.log_softmax(torch.randn(bs, vocab, generator=gen) * 3, -1).to(DEVICE)
-    exp = tree.seed(bs, logp)
+    tree.seed(bs, logp)
     for b in range(bs):
         sc, tk = torch.topk(logp[b].float(), topk)
         record.append([((int(t),), float(s)) for t, s in zip(tk, sc)])
@@ -47,7 +47,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
         logp = torch.log_softmax(
             torch.randn(bs * topk, vocab, generator=gen) * 3, -1
         ).to(DEVICE)
-        exp = tree.expand(bs, step, logp, None)
+        lane_tokens = tree.expand(bs, step, logp, None)
         for b in range(bs):
             cands = []
             for lane in range(topk):
@@ -58,7 +58,7 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
             record[b].extend(cands)
             best = sorted(range(len(cands)), key=lambda i: -cands[i][1])[:topk]
             lane_paths[b] = [cands[i] for i in best]
-            got = exp.lane_tokens[b].tolist()
+            got = lane_tokens[b].tolist()
             assert got == [cands[i][0][-1] for i in best]
     # A strided column, as the drafter passes it.
     roots = (torch.arange(bs, device=DEVICE, dtype=torch.int32) + 7)[:, None].repeat(
@@ -68,6 +68,18 @@ def _drive(bs, topk, steps, nodes, vocab, seed):
     return tokens.cpu(), parent.cpu(), record
 
 
+@pytest.mark.parametrize("nodes", [2, 17, 64])
+def test_tree_ancestry_walks_full_chain(nodes):
+    """Depth is not capped: the default chain of N nodes is N - 1 deep."""
+    parent = torch.arange(-1, nodes - 1, dtype=torch.int32, device=DEVICE)[None]
+    depth = torch.empty_like(parent)
+    mask = torch.empty(parent.shape, dtype=torch.int64, device=DEVICE)
+    tree_ancestry(parent, depth, mask)
+    assert depth[0].tolist() == list(range(nodes))
+    got = [m & ((1 << 64) - 1) for m in mask[0].tolist()]
+    assert got == [(1 << (i + 1)) - 1 for i in range(nodes)]
+
+
 @pytest.mark.parametrize(
     "bs,topk,steps,nodes", [(3, 1, 5, 6), (4, 4, 4, 16), (2, 8, 5, 64), (3, 3, 6, 20)]
 )
@@ -75,7 +87,7 @@ def test_draft_tree_structure(bs, topk, steps, nodes):
     tokens, parent, record = _drive(bs, topk, steps, nodes, vocab=50, seed=nodes)
     depth = torch.empty_like(parent, device=DEVICE)
     mask = torch.empty(parent.shape, dtype=torch.int64, device=DEVICE)
-    tree_ancestry(parent.to(DEVICE), steps, depth, mask)
+    tree_ancestry(parent.to(DEVICE), depth, mask)
     depth, mask = depth.cpu(), mask.cpu()
     for b in range(bs):
         assert tokens[b, 0] == 7 + b and parent[b, 0] == -1
@@ -121,6 +133,14 @@ def test_draft_tree_structure(bs, topk, steps, nodes):
         assert torch.equal(parent, torch.arange(-1, nodes - 1).expand(bs, -1).int())
 
 
+def _parent_lanes(tree, bs, before_entry):
+    """``[bs, K]`` lane each new lane descends from, read off the candidate record."""
+    parent_entry = torch.gather(tree.entry_parent[:bs], 1, tree.lane_entry[:bs])
+    hits = before_entry[:, None, :] == parent_entry[:, :, None]
+    assert torch.all(hits.sum(-1) == 1), "every new lane extends exactly one lane"
+    return hits.int().argmax(-1)
+
+
 def test_nan_scores_keep_lanes_and_tree_valid():
     """A padded request's garbage logits must not leave lanes or nodes unset."""
     bs, topk, steps, nodes, vocab = 2, 4, 3, 8, 50
@@ -131,8 +151,9 @@ def test_nan_scores_keep_lanes_and_tree_valid():
     lane_logits = torch.randn(bs * topk, vocab, device=DEVICE)
     lane_logits[topk:] = float("nan")
     for step in range(1, steps):
-        exp = tree.expand(bs, step, lane_logits, None)
-        assert exp.parent_lane.min() >= 0 and exp.parent_lane.max() < topk
+        before = tree.lane_entry[:bs].clone()
+        tree.expand(bs, step, lane_logits, None)
+        _parent_lanes(tree, bs, before)
     tokens, parent = tree.finalize(
         bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE)
     )
@@ -155,13 +176,14 @@ def test_expand_prepares_next_lanes():
         hidden_src = torch.randn(bs * topk, width, device=DEVICE)
         hidden_dst = torch.empty_like(hidden_src)
         before = lane_mask.clone()
-        exp = tree.expand(
+        before_entry = tree.lane_entry[:bs].clone()
+        tree.expand(
             bs,
             step,
             torch.randn(bs * topk, vocab, device=DEVICE),
             (lane_mask, hidden_src, hidden_dst),
         )
-        parent = exp.parent_lane
+        parent = _parent_lanes(tree, bs, before_entry)
         own = torch.ones_like(parent) << (
             step * topk + torch.arange(topk, device=DEVICE)
         )

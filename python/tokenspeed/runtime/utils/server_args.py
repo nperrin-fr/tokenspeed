@@ -776,23 +776,9 @@ class ServerArgs:
                 f"speculative_eagle_topk={topk} (tree drafting) needs "
                 f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
             )
-        if topk < 1 or not 1 <= steps <= 10:
+        if not 1 <= topk <= 16 or not 1 <= steps <= 10:
             raise ValueError(
-                f"tree drafting needs topk >= 1 and 1..10 steps: {topk=}, {steps=}"
-            )
-        if self.grammar_backend != "none" or self.enable_mixed_batch:
-            raise ValueError(
-                "tree drafting does not support structured output or mixed batches yet: "
-                f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
-            )
-        if topk > 16:
-            raise ValueError(
-                f"tree drafting keeps at most 16 children per node, got topk={topk}"
-            )
-        if self.disaggregation_mode != "null":
-            raise ValueError(
-                "tree drafting does not carry the draft tree across prefill/decode "
-                f"disaggregation yet: {self.disaggregation_mode=}"
+                f"tree drafting needs 1..16 children per node and 1..10 steps: {topk=}, {steps=}"
             )
         if (steps - 1) * topk > 64:
             raise ValueError(
@@ -804,6 +790,16 @@ class ServerArgs:
             raise ValueError(
                 f"speculative_num_draft_tokens={nodes} must be in [2, {min(64, candidates + 1)}] "
                 f"for topk={topk} over {steps} steps (root + drafted nodes, at most 64)"
+            )
+        if self.grammar_backend != "none" or self.enable_mixed_batch:
+            raise ValueError(
+                "tree drafting does not support structured output or mixed batches yet: "
+                f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "tree drafting does not carry the draft tree across prefill/decode "
+                f"disaggregation yet: {self.disaggregation_mode=}"
             )
 
     def resolve_communication(self):
@@ -2041,7 +2037,7 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="Children each draft node expands to per step; above 1 the draft is a tree "
-            "(EAGLE3), and --speculative-num-draft-tokens is its node budget.",
+            "(EAGLE3, or EAGLE-style MTP), and --speculative-num-draft-tokens is its node budget.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

@@ -50,14 +50,19 @@ def _tree_attention_kernel(
     lse_ptr,
     stride_qt,
     stride_qh,
+    stride_qd,
     stride_kt,
     stride_kh,
+    stride_kd,
     stride_vt,
     stride_vh,
+    stride_vd,
     stride_ot,
     stride_oh,
+    stride_od,
     stride_pt,
     stride_ph,
+    stride_pd,
     sm_scale_log2,
     lse_scale,
     ROWS: tl.constexpr,
@@ -84,17 +89,26 @@ def _tree_attention_kernel(
     kv_rows = req * SLOTS + slots
 
     q = tl.load(
-        q_ptr + q_rows[:, None] * stride_qt + head * stride_qh + dims[None, :],
+        q_ptr
+        + q_rows[:, None] * stride_qt
+        + head * stride_qh
+        + dims[None, :] * stride_qd,
         mask=row_ok[:, None] & dim_ok[None, :],
         other=0.0,
     )
     k = tl.load(
-        k_ptr + kv_rows[:, None] * stride_kt + kv_head * stride_kh + dims[None, :],
+        k_ptr
+        + kv_rows[:, None] * stride_kt
+        + kv_head * stride_kh
+        + dims[None, :] * stride_kd,
         mask=slot_ok[:, None] & dim_ok[None, :],
         other=0.0,
     )
     v = tl.load(
-        v_ptr + kv_rows[:, None] * stride_vt + kv_head * stride_vh + dims[None, :],
+        v_ptr
+        + kv_rows[:, None] * stride_vt
+        + kv_head * stride_vh
+        + dims[None, :] * stride_vd,
         mask=slot_ok[:, None] & dim_ok[None, :],
         other=0.0,
     )
@@ -125,7 +139,7 @@ def _tree_attention_kernel(
             prefix_out_ptr
             + q_rows[:, None] * stride_pt
             + head * stride_ph
-            + dims[None, :],
+            + dims[None, :] * stride_pd,
             mask=row_ok[:, None] & dim_ok[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -138,7 +152,10 @@ def _tree_attention_kernel(
     lse = lse2 * lse_scale
 
     tl.store(
-        out_ptr + q_rows[:, None] * stride_ot + head * stride_oh + dims[None, :],
+        out_ptr
+        + q_rows[:, None] * stride_ot
+        + head * stride_oh
+        + dims[None, :] * stride_od,
         out.to(out_ptr.dtype.element_ty),
         mask=row_ok[:, None] & dim_ok[None, :],
     )
@@ -157,7 +174,6 @@ def tree_attention(
     lse_base2: bool = False,
     prefix: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Masked attention of each request's query rows over its tree slots.
 
@@ -174,7 +190,6 @@ def tree_attention(
             other keys (LSE in the basis ``lse_base2`` selects, every row seeing
             at least one key); the result is then the merged state.
         out: optional ``[bs * rows_per_req, num_q_heads, head_dim]`` output.
-        lse: optional ``[bs * rows_per_req, num_q_heads]`` float32 output.
 
     Returns:
         ``(out, lse)``: the partial attention output in ``q.dtype`` and its
@@ -189,8 +204,7 @@ def tree_attention(
     bs = num_rows // rows_per_req
     if out is None:
         out = torch.empty_like(q)
-    if lse is None:
-        lse = torch.empty((num_rows, num_q_heads), dtype=torch.float32, device=q.device)
+    lse = torch.empty((num_rows, num_q_heads), dtype=torch.float32, device=q.device)
     if bs == 0:
         return out, lse
     _tree_attention_kernel[(bs, num_q_heads)](
@@ -202,16 +216,11 @@ def tree_attention(
         mask if prefix is None else prefix[1],
         out,
         lse,
-        q.stride(0),
-        q.stride(1),
-        k.stride(0),
-        k.stride(1),
-        v.stride(0),
-        v.stride(1),
-        out.stride(0),
-        out.stride(1),
-        0 if prefix is None else prefix[0].stride(0),
-        0 if prefix is None else prefix[0].stride(1),
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        *((0, 0, 0) if prefix is None else prefix[0].stride()),
         sm_scale * 1.4426950408889634,
         1.0 if lse_base2 else 0.6931471805599453,
         ROWS=rows_per_req,
@@ -238,10 +247,13 @@ def _tree_decode_split_kernel(
     part_lse_ptr,  # [bs, Hkv, splits, ROWS_PAD] float32, base 2
     stride_qt,
     stride_qh,
+    stride_qd,
     stride_kt,
     stride_kh,
+    stride_kd,
     stride_vt,
     stride_vh,
+    stride_vd,
     stride_table,
     sm_scale_log2,
     num_splits,
@@ -270,7 +282,7 @@ def _tree_decode_split_kernel(
         q_ptr
         + (req * N + node)[:, None] * stride_qt
         + head[:, None] * stride_qh
-        + dims[None, :],
+        + dims[None, :] * stride_qd,
         mask=row_ok[:, None],
         other=0.0,
     )
@@ -294,12 +306,18 @@ def _tree_decode_split_kernel(
         )
         slot = page.to(tl.int64) * PAGE + pos % PAGE
         k = tl.load(
-            k_ptr + slot[:, None] * stride_kt + kv_head * stride_kh + dims[None, :],
+            k_ptr
+            + slot[:, None] * stride_kt
+            + kv_head * stride_kh
+            + dims[None, :] * stride_kd,
             mask=pos_ok[:, None],
             other=0.0,
         )
         v = tl.load(
-            v_ptr + slot[:, None] * stride_vt + kv_head * stride_vh + dims[None, :],
+            v_ptr
+            + slot[:, None] * stride_vt
+            + kv_head * stride_vh
+            + dims[None, :] * stride_vd,
             mask=pos_ok[:, None],
             other=0.0,
         )
@@ -335,6 +353,7 @@ def _tree_decode_reduce_kernel(
     out_ptr,  # [bs * N, Hq, D]
     stride_ot,
     stride_oh,
+    stride_od,
     num_splits,
     N: tl.constexpr,
     GROUP: tl.constexpr,
@@ -374,7 +393,7 @@ def _tree_decode_reduce_kernel(
         out_ptr
         + (req * N + node)[:, None] * stride_ot
         + head[:, None] * stride_oh
-        + dims[None, :],
+        + dims[None, :] * stride_od,
         out.to(out_ptr.dtype.element_ty),
         mask=row_ok[:, None],
     )
@@ -392,7 +411,6 @@ def tree_decode_attention(
     page_size: int,
     sm_scale: float,
     num_splits: int,
-    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Target verify of a draft tree over a paged KV cache in one pass.
 
@@ -412,7 +430,6 @@ def tree_decode_attention(
         page_size: tokens per page.
         sm_scale: softmax scale applied to ``q . k``.
         num_splits: KV splits per (request, KV head).
-        out: optional ``[bs * N, num_q_heads, head_dim]`` output.
 
     Returns:
         The attention output in ``q.dtype``.
@@ -423,8 +440,7 @@ def tree_decode_attention(
     num_kv_heads = k_cache.shape[1]
     group = num_q_heads // num_kv_heads
     bs = num_rows // num_nodes
-    if out is None:
-        out = torch.empty_like(q)
+    out = torch.empty_like(q)
     if bs == 0:
         return out
     rows_pad = max(16, triton.next_power_of_2(num_nodes * group))
@@ -450,12 +466,9 @@ def tree_decode_attention(
         mask,
         part_out,
         part_lse,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        v_cache.stride(0),
-        v_cache.stride(1),
+        *q.stride(),
+        *k_cache.stride(),
+        *v_cache.stride(),
         page_table.stride(0),
         sm_scale * 1.4426950408889634,
         num_splits,
@@ -472,8 +485,7 @@ def tree_decode_attention(
         part_out,
         part_lse,
         out,
-        out.stride(0),
-        out.stride(1),
+        *out.stride(),
         num_splits,
         ROWS_BLOCK=16,
         DIM_BLOCK=dim_block,

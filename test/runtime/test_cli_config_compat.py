@@ -709,28 +709,53 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 1)
         self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
-    def test_speculative_eagle_topk_cli_rejects_non_1(self):
-        # Only chain spec (topk=1) is wired end-to-end; the CLI choices
-        # set is the gate, so non-1 values must fail at parse time.
-        with self.assertRaises(SystemExit):
-            self._parse_args(["--model", "test/model", "--speculative-eagle-topk", "4"])
-
-    def test_speculative_eagle_topk_runtime_rejects_non_1_when_spec_on(self):
-        # ServerArgs can be built programmatically (e.g. by smg_grpc_servicer),
-        # bypassing argparse — keep the resolve-time defensive check covered.
+    def _resolve_tree(self, algorithm, topk, steps, nodes, **overrides):
         args = self._parse_args(
             [
                 "--model",
                 "test/model",
                 "--speculative-algorithm",
-                "EAGLE3",
+                algorithm,
+                "--speculative-eagle-topk",
+                str(topk),
+                "--speculative-num-steps",
+                str(steps),
+                "--speculative-num-draft-tokens",
+                str(nodes),
             ]
         )
         sa = self._from_cli_args_no_init(args)
-        sa.speculative_eagle_topk = 4
         sa.resolve_basic_defaults()
-        with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
-            sa.resolve_speculative_decoding()
+        for name, value in overrides.items():
+            setattr(sa, name, value)
+        sa.resolve_speculative_decoding()
+        return sa
+
+    def test_speculative_eagle_topk_accepts_draft_trees(self):
+        for algorithm in ("EAGLE3", "MTP"):
+            sa = self._resolve_tree(algorithm, 4, 5, 16)
+            self.assertEqual(sa.speculative_eagle_topk, 4)
+        # Largest budgets: 16 children per node; 64 nodes and 64 lane slots.
+        self._resolve_tree("EAGLE3", 16, 5, 64)
+        self._resolve_tree("EAGLE3", 8, 9, 64)
+
+    def test_speculative_eagle_topk_rejects_unsupported_trees(self):
+        cases = [
+            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3 or MTP"),
+            (("EAGLE3", 17, 2, 16), {}, "1..16 children"),
+            (("EAGLE3", 0, 3, 4), {}, "1..16 children"),
+            (("EAGLE3", 4, 11, 16), {}, "1..10 steps"),
+            (("EAGLE3", 16, 6, 64), {}, "lane slots"),
+            (("EAGLE3", 4, 5, 65), {}, "speculative_num_draft_tokens=65"),
+            (("EAGLE3", 2, 2, 8), {}, "speculative_num_draft_tokens=8"),
+            (("EAGLE3", 4, 5, 16), {"grammar_backend": "xgrammar"}, "structured"),
+            (("EAGLE3", 4, 5, 16), {"enable_mixed_batch": True}, "mixed batches"),
+            (("EAGLE3", 4, 5, 16), {"disaggregation_mode": "decode"}, "disaggregation"),
+        ]
+        for (algorithm, topk, steps, nodes), overrides, message in cases:
+            with self.subTest(algorithm=algorithm, topk=topk, steps=steps, nodes=nodes):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._resolve_tree(algorithm, topk, steps, nodes, **overrides)
 
     def test_dp_sampling_is_opt_in(self):
         args = self._parse_args(["--model", "test/model"])

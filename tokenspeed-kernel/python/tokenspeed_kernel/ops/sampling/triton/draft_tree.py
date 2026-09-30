@@ -158,7 +158,6 @@ def _tree_ancestry_kernel(
     mask_ptr,  # [bs, N] int64
     N: tl.constexpr,
     N_PAD: tl.constexpr,
-    MAX_DEPTH: tl.constexpr,
 ):
     req = tl.program_id(0)
     nodes = tl.arange(0, N_PAD)
@@ -166,26 +165,27 @@ def _tree_ancestry_kernel(
     mask = tl.full([N_PAD], 1, tl.int64) << nodes.to(tl.int64)
     depth = tl.zeros([N_PAD], dtype=tl.int32)
     cursor = tl.load(parent_ptr + req * N + nodes, mask=ok, other=-1)
-    for _ in tl.static_range(MAX_DEPTH):
-        live = cursor >= 0
+    live = cursor >= 0
+    while tl.max(live.to(tl.int32), axis=0) > 0:
         safe = tl.where(live, cursor, 0)
         mask |= tl.where(live, tl.full([N_PAD], 1, tl.int64) << safe.to(tl.int64), 0)
         depth += live.to(tl.int32)
         cursor = tl.where(
             live, tl.load(parent_ptr + req * N + safe, mask=live, other=-1), -1
         )
+        live = cursor >= 0
     tl.store(depth_ptr + req * N + nodes, depth, mask=ok)
     tl.store(mask_ptr + req * N + nodes, mask, mask=ok)
 
 
 def tree_ancestry(
-    parent: torch.Tensor, max_depth: int, depth: torch.Tensor, mask: torch.Tensor
+    parent: torch.Tensor, depth: torch.Tensor, mask: torch.Tensor
 ) -> None:
     """Depth and ancestor-or-self mask of every tree node.
 
     Args:
-        parent: ``[bs, N]`` int32 parent node, ``-1`` for the root; ``N <= 64``.
-        max_depth: deepest node depth in the tree.
+        parent: ``[bs, N]`` int32 parent node, ``-1`` for the root, every
+            parent index below its child's; ``N <= 64``.
         depth: ``[bs, N]`` int32 output.
         mask: ``[bs, N]`` int64 output; bit ``j`` marks node ``j`` as an
             ancestor of, or equal to, the row's node.
@@ -201,7 +201,6 @@ def tree_ancestry(
         mask,
         N=num_nodes,
         N_PAD=max(16, triton.next_power_of_2(num_nodes)),
-        MAX_DEPTH=max_depth,
     )
 
 

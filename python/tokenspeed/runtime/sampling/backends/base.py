@@ -336,4 +336,5 @@ class SamplingBackend(ABC):
         tree: TreeSpec | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Verify each request's draft window; ``tree`` is the draft tree
-        (``None`` for a chain) and needs ``supports_tree_verify``."""
+        (``None`` for a chain) and needs ``supports_tree_verify``. A tree
+        verify stores the agreed accepted path with ``tree.record_path``."""

@@ -202,6 +202,12 @@ def test_wire_dflash_keeps_own_embed_head():
     target.model.get_embed_and_head.assert_not_called()
 
 
+def test_multi_depth_mtp_refuses_draft_trees():
+    drafter = mock.MagicMock(spec=Mtp)
+    with pytest.raises(NotImplementedError, match="cannot draft trees"):
+        Mtp.bind_tree(drafter, mock.MagicMock())
+
+
 def test_base_wire_target_is_a_noop():
     drafter = mock.MagicMock(spec=BaseDrafter)
     target_model = mock.MagicMock()

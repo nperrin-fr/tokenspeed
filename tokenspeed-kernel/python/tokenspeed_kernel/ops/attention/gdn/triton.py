@@ -249,8 +249,7 @@ def _fused_gdn_decode_update_kernel(
         )
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Step operands are loaded one step ahead, so their latency overlaps the
-    # dependent state update of the current step.
+    # Prefetch the next step's operands to overlap the current state update.
     b_A_log = tl.load(p_A_log).to(tl.float32)
     b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
     n_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -411,8 +410,7 @@ def _launch_fused_gdn_decode_update(
 
     o = q.new_empty(B, T, HV, V)
 
-    # Tree verify is serial over its nodes; narrower V tiles buy the parallelism
-    # (B200, K=V=128). Chains keep their tiling, and with it their numerics.
+    # Serial tree verify needs narrow V tiles for parallelism; chains keep BV=32 numerics.
     BK, BV = triton.next_power_of_2(K), min(
         triton.next_power_of_2(V), 8 if parent_indices is not None else 32
     )

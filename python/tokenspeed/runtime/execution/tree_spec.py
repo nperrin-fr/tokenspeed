@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import tree_ancestry
+from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
 
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -111,6 +112,8 @@ class TreeSpec:
         # Next round's tree per request pool slot; the drafter writes it next to future_input_map.
         self.future_parent_map = self.chain_parent.repeat(pool_size, 1)
         self.parent_buf = self.chain_parent.repeat(max_bs, 1)
+        # The tree the drafter built this round; the executor publishes it to future_parent_map.
+        self.draft_parent_buf = self.chain_parent.repeat(max_bs, 1)
         # The chain the parents describe, so graph warmup's compact (no load_step) is a no-op.
         self.depth_buf = torch.arange(n, dtype=torch.int32, device=device).repeat(
             max_bs, 1
@@ -122,7 +125,7 @@ class TreeSpec:
         self.mask_buf = torch.tensor(
             chain_mask, dtype=torch.int64, device=device
         ).repeat(max_bs)
-        # Verify writes the accepted path here (root first, -1 past it).
+        # The accepted path (root first, -1 past it), stored by record_path.
         self.path_buf = torch.full((max_bs, n), -1, dtype=torch.int32, device=device)
         self._node_offsets = torch.arange(n, dtype=torch.int64, device=device)
         # Base addresses of the target's per-layer K/V buffers (bind_kv).
@@ -133,17 +136,12 @@ class TreeSpec:
     def num_nodes(self) -> int:
         return self.config.num_nodes
 
-    @property
-    def max_depth(self) -> int:
-        return self.config.num_steps
-
     def load_step(self, bs: int, req_pool_indices: torch.Tensor) -> None:
         """Read this step's trees and derive depth and ancestor masks."""
         parent = self.parent_buf[:bs]
         torch.index_select(self.future_parent_map, 0, req_pool_indices, out=parent)
         tree_ancestry(
             parent,
-            self.max_depth,
             self.depth_buf[:bs],
             self.mask_buf[: bs * self.num_nodes].view(bs, self.num_nodes),
         )
@@ -152,6 +150,38 @@ class TreeSpec:
         """Turn the verify window's ``vc + i`` positions into ``vc + depth``."""
         view = positions.view(bs, self.num_nodes)
         view.add_(self.depth_buf[:bs] - self._node_offsets.to(view.dtype))
+
+    def verify(
+        self,
+        bs: int,
+        predict: torch.Tensor,
+        accept_length: torch.Tensor,
+        accept_index: torch.Tensor,
+        candidates: torch.Tensor,
+        target: torch.Tensor,
+    ) -> None:
+        """Accept the longest root path whose drafts match the target's picks.
+
+        Args:
+            predict: ``[bs * N]`` int32 output, the picks packed along the path.
+            accept_length: ``[bs]`` int32 output, accepted drafts plus the bonus.
+            accept_index: ``[bs, N]`` int32 output, the accepted path (root
+                first, ``-1`` past it); ``record_path`` stores it once agreed.
+            candidates: ``[bs, N]`` node tokens, node 0 the root.
+            target: ``[bs * N]`` int32 target pick at every node.
+        """
+        verify_tree(
+            predict,
+            accept_length,
+            accept_index,
+            candidates.to(torch.int32),
+            self.parent_buf[:bs],
+            target,
+        )
+
+    def record_path(self, bs: int, accept_index: torch.Tensor) -> None:
+        """Store the accepted path (after the TP broadcast) for compaction."""
+        self.path_buf[:bs].copy_(accept_index)
 
     def path_rows(self, bs: int) -> torch.Tensor:
         """``[bs * N]`` source row of each packed row: the accepted path first, then identity."""

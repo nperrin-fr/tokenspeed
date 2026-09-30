@@ -32,11 +32,11 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["verify_tree_greedy"]
+__all__ = ["verify_tree"]
 
 
 @triton.jit
-def _verify_tree_greedy_kernel(
+def _verify_tree_kernel(
     predicts_ptr,
     accept_length_ptr,
     path_ptr,
@@ -44,7 +44,6 @@ def _verify_tree_greedy_kernel(
     parent_ptr,
     target_ptr,
     NUM_NODES: tl.constexpr,
-    MAX_DEPTH: tl.constexpr,
     NODES_PAD: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -60,31 +59,29 @@ def _verify_tree_greedy_kernel(
 
     current = tl.full((), 0, tl.int32)
     depth = tl.full((), 0, tl.int32)
-    active = tl.full((), 1, tl.int32)
-    for step in tl.static_range(1, MAX_DEPTH + 1):
+    found = tl.full((), True, tl.int1)
+    while found:
         pick = tl.load(target_ptr + base + current)
-        match = (parents == current) & (tokens == pick) & node_ok & (active != 0)
+        match = (parents == current) & (tokens == pick) & node_ok
         child = tl.min(tl.where(match, nodes, NODES_PAD), axis=0)
         found = child < NODES_PAD
-        tl.store(predicts_ptr + base + step - 1, pick, mask=found)
-        tl.store(path_ptr + base + step, child, mask=found)
-        current = tl.where(found, child, current)
-        depth = tl.where(found, step, depth)
-        active = tl.where(found, 1, 0)
+        if found:
+            depth += 1
+            tl.store(predicts_ptr + base + depth - 1, pick)
+            tl.store(path_ptr + base + depth, child)
+            current = child
 
     tl.store(predicts_ptr + base + depth, tl.load(target_ptr + base + current))
     tl.store(accept_length_ptr + req, depth + 1)
 
 
-def verify_tree_greedy(
+def verify_tree(
     predicts: torch.Tensor,
     accept_length: torch.Tensor,
     path: torch.Tensor,
     candidates: torch.Tensor,
     parent: torch.Tensor,
     target: torch.Tensor,
-    *,
-    max_depth: int,
 ) -> None:
     """Accept the longest root path whose tokens match the target's picks.
 
@@ -97,13 +94,13 @@ def verify_tree_greedy(
             ``-1`` past the path.
         candidates: ``[bs, N]`` int32 node tokens, node 0 the root.
         parent: ``[bs, N]`` int32 parent node index, ``-1`` for the root.
-        target: ``[bs * N]`` int32 target pick at every node.
-        max_depth: deepest node depth in the tree.
+        target: ``[bs * N]`` int32 target pick at every node (greedy argmax
+            or a sampled pick).
     """
     bs, num_nodes = candidates.shape
     if bs == 0:
         return
-    _verify_tree_greedy_kernel[(bs,)](
+    _verify_tree_kernel[(bs,)](
         predicts,
         accept_length,
         path,
@@ -111,6 +108,5 @@ def verify_tree_greedy(
         parent,
         target,
         NUM_NODES=num_nodes,
-        MAX_DEPTH=max_depth,
         NODES_PAD=triton.next_power_of_2(num_nodes),
     )
