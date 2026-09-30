@@ -921,10 +921,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
+        KDA refuses draft trees)."""
         if not self._replay_active:
-            return super().commit_verified_state(accepted_length)
+            return super().commit_verified_state(
+                accepted_length, accepted_path=accepted_path
+            )
         ctx = self._verify_commit_ctx
         if ctx is None:
             return

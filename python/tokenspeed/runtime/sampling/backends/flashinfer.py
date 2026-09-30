@@ -64,10 +64,10 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
@@ -432,7 +432,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
         *,
-        tree: TreeSpec | None,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tree is not None:
             raise NotImplementedError(

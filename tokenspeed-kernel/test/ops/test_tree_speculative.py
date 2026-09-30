@@ -26,6 +26,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tree import tree_attention, tree_decode_attention
+from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
 
@@ -467,3 +468,34 @@ def test_logprob_topk_matches_torch(rows, vocab, k, dtype):
     picked = torch.log_softmax(logits.float(), -1).gather(1, ids)
     torch.testing.assert_close(picked, scores, atol=1e-4, rtol=1e-5)
     assert all(len(set(r)) == k for r in ids.tolist())
+
+
+@pytest.mark.parametrize("nodes", [8, 64])
+def test_compact_window_rows_moves_every_buffer(nodes):
+    """Every buffer (bf16 and fp8 planes alike) packs each accepted path to the window front."""
+    gen = torch.Generator().manual_seed(nodes)
+    bs, slots, heads, dim = 3, 4096, 2, 128
+    buffers = [
+        torch.randn(slots, heads, dim, generator=gen).bfloat16().cuda()
+        for _ in range(3)
+    ] + [
+        torch.randn(slots, heads, 2 * dim, generator=gen).to(torch.float8_e4m3fn).cuda()
+    ]  # same bytes per token row as the bf16 planes
+    locs = torch.randperm(slots, generator=gen)[: bs * nodes].int().cuda()
+    paths = [[0, 2, 5], [0, 1, 2, 3], [0]]  # jump, identity, root only
+    path = torch.full((bs, nodes), -1, dtype=torch.int32)
+    for b, p in enumerate(paths):
+        path[b, : len(p)] = torch.tensor(p, dtype=torch.int32)
+    expected = [buf.view(torch.uint8).clone() for buf in buffers]
+    for want in expected:
+        for b, p in enumerate(paths):
+            window = locs[b * nodes : (b + 1) * nodes].long()
+            want[window[: len(p)]] = want[window[torch.tensor(p)]]
+
+    addresses = torch.tensor(
+        [buf.data_ptr() for buf in buffers], dtype=torch.int64, device="cuda"
+    )
+    compact_window_rows(addresses, locs, path.cuda(), row_bytes=heads * dim * 2)
+
+    for got, want in zip(buffers, expected):
+        assert torch.equal(got.view(torch.uint8), want)

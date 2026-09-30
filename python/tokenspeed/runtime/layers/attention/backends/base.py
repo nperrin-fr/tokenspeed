@@ -448,9 +448,17 @@ class AttentionBackend(CachePoolBinding, ABC):
         for backend in self.child_backends():
             backend.bind_tree_draft(inputs)
 
-    def tree_verify_write_locations(self) -> torch.Tensor:
-        """The last verify window's ``[bs * N]`` KV write slots."""
-        raise NotImplementedError(f"{type(self).__name__} cannot verify draft trees")
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        """After a draft-tree verify, move each request's accepted path to the
+        front of its verify window in the cache this node owns; nodes that own
+        none forward to their children.
+
+        Args:
+            path: ``[bs, N]`` int32 accepted window row at each depth, root
+                first, ``-1`` past the path.
+        """
+        for backend in self.child_backends():
+            backend.compact_verify_window(path)
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
@@ -478,12 +486,18 @@ class AttentionBackend(CachePoolBinding, ABC):
         self.step_counter = step_counter
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         """Commit live acceptance after drafted decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
+        draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
+        Stateless backends inherit this no-op.
         """
 
     @contextmanager

@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
+from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -48,14 +49,15 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 _GUMBEL_BLOCK_SIZE = 1024
@@ -635,7 +637,7 @@ class TritonSamplingBackend(SamplingBackend):
         logits: torch.Tensor,
         req_pool_indices: torch.Tensor,
         offsets_pool: torch.Tensor,
-        tree: TreeSpec,
+        tree: TreeVerifyBatch,
         bs: int,
     ) -> torch.Tensor:
         """Per-node target picks keyed by the node's position (vc + depth), not its row.
@@ -644,15 +646,16 @@ class TritonSamplingBackend(SamplingBackend):
         gathered per row, and its noise offset advanced by its depth, so the
         accepted token at each position is exactly what plain decoding samples there.
         """
-        rows = bs * tree.num_nodes
-        row_pool = req_pool_indices[:bs].long().repeat_interleave(tree.num_nodes)
+        num_nodes = tree.parents.shape[1]
+        rows = bs * num_nodes
+        row_pool = req_pool_indices[:bs].long().repeat_interleave(num_nodes)
         pools = (
             self._temperature_pool[row_pool],
             self._top_k_pool[row_pool],
             self._top_p_pool[row_pool],
             self._seed_pool[row_pool],
         )
-        offsets = offsets_pool[row_pool] + tree.depth_buf[:bs].reshape(-1)
+        offsets = offsets_pool[row_pool] + tree.depths.reshape(-1)
         row_ids = torch.arange(rows, dtype=torch.int32, device=logits.device)
         return self._sample_verify_targets(logits, row_ids, pools, offsets, rows, 1)
 
@@ -663,7 +666,7 @@ class TritonSamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
         *,
-        tree: TreeSpec | None,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -700,12 +703,12 @@ class TritonSamplingBackend(SamplingBackend):
                 logits, req_pool_indices, offsets_pool, tree, bs
             )
             # The accepted path rides in accept_index so the TP broadcast below carries it.
-            tree.verify(
-                bs,
+            verify_tree(
                 predict,
                 accept_length,
                 accept_index,
-                candidates,
+                candidates.to(torch.int32),
+                tree.parents,
                 target_sampled,
             )
         else:
@@ -737,7 +740,7 @@ class TritonSamplingBackend(SamplingBackend):
         if self.config.enable_output_logprobs:
             if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.
-                logits = logits.index_select(0, tree.path_rows(accept_index))
+                logits = logits.index_select(0, accepted_path_rows(accept_index))
             self._write_logprob_outputs(
                 logits_output,
                 logits,

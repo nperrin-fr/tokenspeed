@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -34,13 +35,14 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 def _verify_chain_greedy_torch(
@@ -184,7 +186,7 @@ class GreedySamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
         *,
-        tree: TreeSpec | None,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]
@@ -211,12 +213,12 @@ class GreedySamplingBackend(SamplingBackend):
 
         if tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
-            tree.verify(
-                bs,
+            verify_tree(
                 predict,
                 accept_length,
                 accept_index,
-                candidates,
+                candidates.to(torch.int32),
+                tree.parents,
                 target_predict.view(-1),
             )
         else:
@@ -241,7 +243,7 @@ class GreedySamplingBackend(SamplingBackend):
             if self.config.enable_output_logprobs:
                 # predict is packed along the path; score it against the path's own rows.
                 logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                    logits.index_select(0, tree.path_rows(accept_index)), predict
+                    logits.index_select(0, accepted_path_rows(accept_index)), predict
                 )
         elif self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

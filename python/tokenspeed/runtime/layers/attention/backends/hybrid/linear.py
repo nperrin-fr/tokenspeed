@@ -321,11 +321,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         return TreeSupport(verify_blocker=None, draft_blocker=None)
 
-    def tree_verify_write_locations(self) -> torch.Tensor:
-        return self.full_attn_backend.tree_verify_write_locations()
-
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+            self.linear_attn_backend.commit_verified_state(
+                accepted_lengths, accepted_path=accepted_path
+            )

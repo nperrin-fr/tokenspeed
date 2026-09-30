@@ -935,8 +935,11 @@ class MambaAttnBackend(AttentionBackend):
             )
         return write_stack, steps
 
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Commit the accepted draft prefix with fused per-group page resolves."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Commit the accepted draft prefix with fused per-group page resolves;
+        ``accepted_path`` is the accepted draft-tree path, ``None`` for a chain."""
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
@@ -953,10 +956,10 @@ class MambaAttnBackend(AttentionBackend):
             device=accepted_length.device,
         ).unbind(0)
         source_steps = steps
-        if self.tree_verify is not None:
+        if accepted_path is not None:
             # Scratch row step s holds node s - 1: the last accepted node is path[steps - 1].
             last = (steps - 1).long().unsqueeze(1)
-            source_steps = self.tree_verify.path[:bs].gather(1, last).squeeze(1) + 1
+            source_steps = accepted_path.gather(1, last).squeeze(1) + 1
         state_verify_commit_rows(
             source_steps,
             write_stack,

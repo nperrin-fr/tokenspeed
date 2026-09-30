@@ -100,6 +100,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -586,7 +587,6 @@ class ModelExecutor:
                 self.tree_spec.mask_buf,
                 config.spec_num_tokens,
                 parent=self.tree_spec.parent_buf,
-                path=self.tree_spec.path_buf,
             )
         )
         self.drafter.bind_tree(self.tree_spec)
@@ -597,10 +597,10 @@ class ModelExecutor:
         """Pack each request's accepted path to the front of its verify window:
         target hidden rows, target KV, and the window positions back to ``vc + i``."""
         tree = self.tree_spec
-        tree.record_path(bs, self.sampling_backend.accepted_path(bs, tree.num_nodes))
-        tree.compact(
-            bs,
-            self.attn_backend.tree_verify_write_locations(),
+        path = self.sampling_backend.accepted_path(bs, tree.num_nodes)
+        self.attn_backend.compact_verify_window(path)
+        tree.compact_rows(
+            path,
             logits_output.hidden_states,
             self.input_buffers.positions_buf[: bs * tree.num_nodes],
         )
@@ -630,15 +630,6 @@ class ModelExecutor:
         # mask can see. A block drafter additionally borrows the target's
         # full-history group -- it writes at the target's cache locations.
         bind_cache_groups(self.model_runner.model, self.token_to_kv_pool)
-        if self.tree_spec is not None:
-            pool = self.token_to_kv_pool
-            self.tree_spec.bind_kv(
-                [
-                    buf
-                    for layer in sorted(pool.history_group_by_layer())
-                    for buf in pool.get_kv_buffer(layer)
-                ]
-            )
         draft_runner = self._draft_model_runner
         if draft_runner is not None and self.draft_token_to_kv_pool is not None:
             bind_cache_groups(draft_runner.model, self.draft_token_to_kv_pool)
@@ -1148,7 +1139,17 @@ class ModelExecutor:
             return self.sampling_backend.sample(logits_output, sampling_info)
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
-                logits_output, sampling_info, candidates, tree=self.tree_spec
+                logits_output,
+                sampling_info,
+                candidates,
+                tree=(
+                    None
+                    if self.tree_spec is None
+                    else TreeVerifyBatch(
+                        parents=self.tree_spec.parent_buf[:num_decodes],
+                        depths=self.tree_spec.depth_buf[:num_decodes],
+                    )
+                ),
             )
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids

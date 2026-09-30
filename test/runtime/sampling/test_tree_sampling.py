@@ -35,6 +35,7 @@ from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -99,6 +100,10 @@ def _tree(parent: list[int], req: torch.Tensor) -> TreeSpec:
     return spec
 
 
+def _batch(tree: TreeSpec) -> TreeVerifyBatch:
+    return TreeVerifyBatch(parents=tree.parent_buf[:BS], depths=tree.depth_buf[:BS])
+
+
 @pytest.mark.parametrize("route", list(PARAMS))
 def test_chain_shaped_tree_verifies_like_chain(route):
     torch.manual_seed(0)
@@ -136,7 +141,7 @@ def test_chain_shaped_tree_verifies_like_chain(route):
         LogitsProcessorOutput(next_token_logits=logits.clone()),
         _info(req, offsets),
         candidates,
-        tree=tree,
+        tree=_batch(tree),
     )
     assert torch.equal(chain_accept, tree_accept)
     assert torch.all(tree_accept == 3)
@@ -181,9 +186,9 @@ def test_nodes_sample_the_chain_draw_at_their_depth(route):
     logits = torch.gather(by_depth, 1, depth[:, :, None].expand(-1, -1, VOCAB)).view(
         BS * N, VOCAB
     )
-    picks = backend._sample_tree_targets(logits, req.int(), offsets, tree, BS).view(
-        BS, N
-    )
+    picks = backend._sample_tree_targets(
+        logits, req.int(), offsets, _batch(tree), BS
+    ).view(BS, N)
     assert torch.equal(picks, torch.gather(chain, 1, depth))
 
 
@@ -209,7 +214,9 @@ def test_greedy_tree_verify_walks_the_argmax_with_logprobs(backend_name):
     candidates[0, 3] = target[0, 2]
 
     out = LogitsProcessorOutput(next_token_logits=logits.clone())
-    predict, accept = backend.verify(out, _info(req, offsets), candidates, tree=tree)
+    predict, accept = backend.verify(
+        out, _info(req, offsets), candidates, tree=_batch(tree)
+    )
     path = backend.accepted_path(BS, N).cpu().tolist()
 
     logprobs = torch.log_softmax(logits.float(), -1)

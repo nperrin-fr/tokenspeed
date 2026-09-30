@@ -67,10 +67,10 @@ from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P = "triton_full_min_p"
@@ -485,7 +485,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
         *,
-        tree: TreeSpec | None,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tree is not None:
             raise NotImplementedError(

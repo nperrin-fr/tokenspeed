@@ -28,11 +28,11 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -321,7 +321,7 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
-    # Backends whose verify() takes a draft tree (tree=TreeSpec).
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False
 
     @abstractmethod
@@ -338,7 +338,7 @@ class SamplingBackend(ABC):
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
         *,
-        tree: TreeSpec | None,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Verify each request's draft window; ``tree`` is the draft tree
         (``None`` for a chain) and needs ``supports_tree_verify``; a tree

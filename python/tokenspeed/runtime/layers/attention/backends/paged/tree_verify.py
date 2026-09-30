@@ -42,7 +42,6 @@ class TreeVerifyInputs:
         mask: torch.Tensor,
         num_nodes: int,
         parent: torch.Tensor,
-        path: torch.Tensor,
     ) -> None:
         """Args:
         mask: ``[max_bs * N]`` int64 ancestor-or-self mask per window row,
@@ -50,14 +49,10 @@ class TreeVerifyInputs:
         num_nodes: ``N``, verify window width.
         parent: ``[max_bs, N]`` int32 parent node per window row (``-1`` for
             the root), refreshed every step by the executor.
-        path: ``[max_bs, N]`` int32 accepted path, stored by
-            ``TreeSpec.record_path`` (root first, ``-1`` past it); recurrent
-            state commits read it.
         """
         self.mask = mask
         self.num_nodes = num_nodes
         self.parent = parent
-        self.path = path
 
 
 class TreeDraftInputs:
