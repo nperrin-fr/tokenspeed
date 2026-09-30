@@ -41,6 +41,10 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -316,6 +320,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             ), f"GDN scan batched rank expected leading 1, got {ret.shape}"
             ret = ret.flatten(0, 1)
         return ret
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        self.full_attn_backend.bind_tree_verify(inputs)
+        self.linear_attn_backend.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        self.full_attn_backend.bind_tree_draft(inputs)
+
+    def tree_verify_write_locations(self) -> torch.Tensor:
+        return self.full_attn_backend.tree_verify_write_locations()
 
     def commit_speculative_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int

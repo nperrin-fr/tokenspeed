@@ -568,7 +568,12 @@ class ModelExecutor:
             device=torch.device(self.device),
         )
         self.attn_backend.bind_tree_verify(
-            TreeVerifyInputs(self.tree_spec.mask_buf, config.spec_num_tokens)
+            TreeVerifyInputs(
+                self.tree_spec.mask_buf,
+                config.spec_num_tokens,
+                parent=self.tree_spec.parent_buf,
+                path=self.tree_spec.path_buf,
+            )
         )
         self.drafter.bind_tree(self.tree_spec)
 
@@ -614,7 +619,7 @@ class ModelExecutor:
             self.tree_spec.bind_kv(
                 [
                     buf
-                    for layer in range(pool.layer_num)
+                    for layer in sorted(pool.history_group_by_layer())
                     for buf in pool.get_kv_buffer(layer)
                 ]
             )

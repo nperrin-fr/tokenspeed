@@ -157,6 +157,7 @@ def _fused_gdn_decode_update_kernel(
     output_state_indices,
     intermediate_states_buffer,
     per_token_output_state_indices,
+    parent_indices,
     scale,
     T,
     H: tl.constexpr,
@@ -170,6 +171,7 @@ def _fused_gdn_decode_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_PARENT_INDICES: tl.constexpr,
     Q_STRIDES: tl.constexpr,
     K_STRIDES: tl.constexpr,
     V_STRIDES: tl.constexpr,
@@ -200,6 +202,11 @@ def _fused_gdn_decode_update_kernel(
       matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
+
+    HAS_PARENT_INDICES (draft trees, with per-token output rows): step t
+    continues from the state after step ``parent_indices[i_n, t]`` (the initial
+    state when negative) instead of step t - 1, reloading it from that step's
+    output row when the parent is not t - 1.
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -243,6 +250,28 @@ def _fused_gdn_decode_update_kernel(
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for step_idx in range(0, T):
+        if HAS_PARENT_INDICES:
+            parent = tl.load(parent_indices + i_n * T + step_idx)
+            if parent != step_idx - 1:
+                # The parent's row was written by this program over the same tile.
+                tl.debug_barrier()
+                row = tl.where(
+                    parent < 0,
+                    idx,
+                    tl.load(
+                        per_token_output_state_indices + i_n * T + tl.maximum(parent, 0)
+                    ).to(tl.int64),
+                )
+                p_parent = (
+                    h0_source
+                    + row * HV * V * K
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                b_h = tl.load(p_parent, mask=mask_h & (row >= 0), other=0).to(
+                    tl.float32
+                )
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -349,6 +378,7 @@ def _launch_fused_gdn_decode_update(
     output_state_indices: torch.Tensor | None,
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
+    parent_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
@@ -385,6 +415,7 @@ def _launch_fused_gdn_decode_update(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=per_token_output_state_indices,
+        parent_indices=parent_indices,
         scale=scale,
         T=T,
         H=H,
@@ -398,6 +429,7 @@ def _launch_fused_gdn_decode_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
+        HAS_PARENT_INDICES=parent_indices is not None,
         Q_STRIDES=q.stride(),
         K_STRIDES=k.stride(),
         V_STRIDES=v.stride(),
@@ -458,6 +490,7 @@ def triton_gdn_decode_step(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=None,
         per_token_output_state_indices=None,
+        parent_indices=None,
     )
 
 
@@ -488,6 +521,7 @@ def triton_gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    parent_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
@@ -510,6 +544,7 @@ def triton_gdn_decode_mtp(
         output_state_indices=None,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
+        parent_indices=parent_indices,
     )
 
 

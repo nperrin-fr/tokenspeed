@@ -594,6 +594,7 @@ def _causal_conv1d_update_kernel(
     num_accepted_tokens_ptr,
     intermediate_conv_window_ptr,
     output_state_indices_ptr,
+    parent_indices_ptr,  # (batch, seqlen) draft-tree parents
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -617,6 +618,8 @@ def _causal_conv1d_update_kernel(
     stride_inter_win: tl.constexpr,
     stride_output_state_indices_seq: tl.constexpr,
     stride_output_state_indices_step: tl.constexpr,
+    stride_parent_seq: tl.constexpr,
+    stride_parent_step: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
@@ -633,6 +636,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_PARENT_INDICES: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # ruff: noqa: E501
@@ -782,6 +786,33 @@ def _causal_conv1d_update_kernel(
 
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
+        if HAS_PARENT_INDICES and idx_token > 0:
+            # Draft trees: a token's window ends at its parent, not at token - 1.
+            parent = tl.load(
+                parent_indices_ptr
+                + idx_seq * stride_parent_seq
+                + idx_token * stride_parent_step
+            )
+            if parent != idx_token - 1:
+                tl.debug_barrier()
+                parent_row = tl.load(
+                    output_state_indices_ptr
+                    + idx_seq * stride_output_state_indices_seq
+                    + tl.maximum(parent, 0) * stride_output_state_indices_step
+                ).to(tl.int64)
+                window = tl.where(
+                    parent < 0,
+                    prior_tokens,
+                    conv_state_ptr
+                    + parent_row * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim,
+                )
+                if KERNEL_WIDTH >= 2:
+                    col0 = tl.load(window, mask_w, 0.0)
+                if KERNEL_WIDTH >= 3:
+                    col1 = tl.load(window + 1 * stride_conv_state_tok, mask_w, 0.0)
+                if KERNEL_WIDTH >= 4:
+                    col2 = tl.load(window + 2 * stride_conv_state_tok, mask_w, 0.0)
         acc = acc_preload
 
         matrix_w = w_col0
@@ -887,6 +918,7 @@ def causal_conv1d_update(
     num_accepted_tokens: torch.Tensor | None = None,
     intermediate_conv_window: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    parent_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
 ):
@@ -912,9 +944,22 @@ def causal_conv1d_update(
             for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
+    parent_indices: (batch, seqlen), dtype int32; requires
+        output_state_indices. Draft trees: token t's
+        window ends at token parent_indices[b, t] (the initial window when
+        negative) instead of token t - 1.
     out: (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
+    if parent_indices is not None and (
+        output_state_indices is None
+        or parent_indices.shape != output_state_indices.shape
+        or num_accepted_tokens is not None
+    ):
+        raise ValueError(
+            "parent_indices needs output_state_indices of its shape and no "
+            "num_accepted_tokens"
+        )
     if validate_data:
         assert cache_seqlens is None
         assert pad_slot_id is not None
@@ -988,6 +1033,10 @@ def causal_conv1d_update(
         )
     else:
         stride_output_state_indices_seq = stride_output_state_indices_step = 0
+    if parent_indices is not None:
+        stride_parent_seq, stride_parent_step = parent_indices.stride()
+    else:
+        stride_parent_seq = stride_parent_step = 0
 
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
@@ -1000,6 +1049,7 @@ def causal_conv1d_update(
         num_accepted_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
         output_state_indices if output_state_indices is not None else x,
+        parent_indices if parent_indices is not None else x,
         out,
         # Matrix dimensions
         batch,
@@ -1023,6 +1073,8 @@ def causal_conv1d_update(
         stride_inter_win,
         stride_output_state_indices_seq,
         stride_output_state_indices_step,
+        stride_parent_seq,
+        stride_parent_step,
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
@@ -1039,6 +1091,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        HAS_PARENT_INDICES=parent_indices is not None,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

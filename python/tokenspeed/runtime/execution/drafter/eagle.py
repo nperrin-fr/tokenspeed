@@ -562,6 +562,7 @@ class Eagle(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, bs, topk),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
                 input_num_tokens=bs * topk,

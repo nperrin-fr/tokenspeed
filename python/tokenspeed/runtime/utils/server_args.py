@@ -767,14 +767,14 @@ class ServerArgs:
             self._validate_tree_speculation()
 
     def _validate_tree_speculation(self) -> None:
-        """Draft trees: EAGLE3 with a node budget the draft can fill and a mask word can hold."""
+        """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
         topk = self.speculative_eagle_topk
         steps = self.speculative_num_steps
         nodes = self.speculative_num_draft_tokens
-        if self.speculative_algorithm != "EAGLE3":
+        if self.speculative_algorithm not in ("EAGLE3", "MTP"):
             raise ValueError(
                 f"speculative_eagle_topk={topk} (tree drafting) needs "
-                f"--speculative-algorithm EAGLE3, got {self.speculative_algorithm}"
+                f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
             )
         if topk < 1 or not 1 <= steps <= 10:
             raise ValueError(

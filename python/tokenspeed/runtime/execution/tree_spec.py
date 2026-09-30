@@ -147,7 +147,8 @@ class TreeSpec:
         """Record the target's K/V buffers compaction moves rows in.
 
         Args:
-            kv_buffers: per-layer bf16 K and V buffers of contiguous token rows.
+            kv_buffers: the attention layers' bf16 K and V buffers of contiguous
+                token rows (state layers own none).
         """
         rows = {buf[0].numel() for buf in kv_buffers}
         if len(rows) != 1 or any(
@@ -157,8 +158,9 @@ class TreeSpec:
                 "draft-tree KV compaction needs contiguous bf16 K/V rows of one width"
             )
         self.kv_row_elems = rows.pop()
+        # Layers may alias one region through the memory plan; move each region once.
         self.kv_buffer_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in kv_buffers],
+            sorted({buf.data_ptr() for buf in kv_buffers}),
             dtype=torch.int64,
             device=kv_buffers[0].device,
         )

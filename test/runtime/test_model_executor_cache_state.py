@@ -132,6 +132,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
+    executor.tree_spec = None
     executor.dspark_context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
@@ -227,6 +228,7 @@ def test_non_spec_decode_routes_through_verify():
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.drafter = None
+    executor.tree_spec = None
     executor.config = SimpleNamespace(output_length=1)
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(8, dtype=torch.int32),

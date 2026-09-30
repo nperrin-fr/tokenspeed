@@ -829,6 +829,101 @@ def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
         )
 
 
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
+    device: str, state_dtype: torch.dtype, require
+):
+    """Draft trees: each node continues from its parent's state, not the previous row."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+
+    T = 6
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device, dtype=torch.bfloat16, T=T, pool_size=32, state_dtype=state_dtype
+    )
+    parents = [
+        [-1, 0, 1, 1, 0, 4],  # branches under node 1 and at the root
+        [-1, -1, 1, -1, 3, 3],  # several children of the root
+        [-1, 0, 1, 2, 3, 4],  # a chain
+        [-1, 0, 0, 0, 0, 0],  # one level, five siblings
+    ]
+    parent_idx = torch.tensor(parents, device=device, dtype=torch.int32)
+    read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
+    output_idx = torch.arange(8, 8 + 4 * T, device=device, dtype=torch.int32).view(4, T)
+    scale = q.shape[-1] ** -0.5
+
+    pool_copy = pool.clone()
+    out = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=pool_copy,
+        initial_state_indices=read_idx,
+        output_state_indices=output_idx,
+        parent_indices=parent_idx,
+        scale=scale,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+
+    for bi, par in enumerate(parents):
+        for t in range(T):
+            path, node = [], t
+            while node >= 0:
+                path.append(node)
+                node = par[node]
+            path = path[::-1]
+            pick = lambda x: x[bi : bi + 1, path]
+            ref_out, ref_states = _torch_gdn_decode_reference(
+                pick(q),
+                pick(k),
+                pick(v),
+                pick(a),
+                pick(b),
+                A_log,
+                dt_bias,
+                pool[read_idx[bi : bi + 1].long()],
+                scale,
+            )
+            torch.testing.assert_close(
+                out[bi, t].float(),
+                ref_out[0, -1].to(out.dtype).float(),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+            torch.testing.assert_close(
+                pool_copy[int(output_idx[bi, t])].float(),
+                ref_states[-1][0].to(pool.dtype).float(),
+                rtol=2e-2,
+                atol=3e-2,
+            )
+
+    # A chain given as parents never reloads: it matches the parent-less kernel to rounding.
+    chain_pool = pool.clone()
+    chain_out = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=chain_pool,
+        initial_state_indices=read_idx,
+        output_state_indices=output_idx,
+        scale=scale,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+        solution="triton",
+    )
+    torch.testing.assert_close(out[2], chain_out[2])
+    rows = output_idx[2].long()
+    torch.testing.assert_close(pool_copy[rows], chain_pool[rows])
+
+
 @pytest.mark.parametrize(
     ("solution", "state_dtype"),
     [

@@ -93,6 +93,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.metadata import PrepTape
 
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -443,6 +446,8 @@ class MambaAttnBackend(AttentionBackend):
         linear_attn = config.component(LinearAttnConfig)
         self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
         self._gdn_replay: _GDNReplayWorkspace | None = None
+        # Draft-tree verify (bind_tree_verify): per-node parents and the accepted path.
+        self.tree_verify: TreeVerifyInputs | None = None
         self._verify_scratch = None
         self._verify_commit_ctx = None
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
@@ -858,6 +863,18 @@ class MambaAttnBackend(AttentionBackend):
                 dst_row_strides=tables["ssm_scratch_stride"],
             )
 
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Verify draft trees: each node's conv window and recurrent state
+        continue from its parent's scratch row; commit reads the accepted path."""
+        if self.replay_ssm:
+            raise NotImplementedError(
+                "draft-tree verify keeps a recurrent state per node; ReplaySSM keeps none"
+            )
+        self.tree_verify = inputs
+
+    def _tree_parents(self, bs: int) -> torch.Tensor | None:
+        return None if self.tree_verify is None else self.tree_verify.parent[:bs]
+
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
         the seeded init window, rows ``req*(T+1)+1+t`` the per-position
@@ -928,8 +945,13 @@ class MambaAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=accepted_length.device,
         ).unbind(0)
+        source_steps = steps
+        if self.tree_verify is not None:
+            # Scratch row step s holds node s - 1: the last accepted node is path[steps - 1].
+            last = (steps - 1).clamp_min(0).long().unsqueeze(1)
+            source_steps = self.tree_verify.path[:bs].gather(1, last).squeeze(1) + 1
         state_verify_commit_rows(
-            steps,
+            source_steps,
             write_stack,
             src_tiled,
             dst_rows,
@@ -2128,6 +2150,7 @@ class MambaAttnBackend(AttentionBackend):
                 activation,
                 conv_state_indices=conv_read,
                 output_state_indices=conv_out,
+                parent_indices=self._tree_parents(batch_size),
             )
             # needn't contiguous here.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
@@ -2456,6 +2479,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state_indices=mtp_initial_indices,
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
+            parent_indices=self._tree_parents(batch_size),
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)

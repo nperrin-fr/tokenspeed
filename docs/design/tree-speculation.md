@@ -1,7 +1,7 @@
 # Draft-tree speculation
 
 This document records the invariants of draft-tree speculative decoding
-(`--speculative-eagle-topk > 1`, EAGLE3). A deviation from the rules here is a
+(`--speculative-eagle-topk > 1`, EAGLE3 and MTP drafters). A deviation from the rules here is a
 bug unless this document is updated in the same change.
 
 ## The problem this solves
@@ -51,6 +51,20 @@ prefix + tree cascade). The draft lanes keep the cascade (prefix context kernel
 + `tree_attention` over a side buffer) because their ancestors' K/V never enter
 the paged cache.
 
+### Recurrent state follows the parent
+
+Linear-attention (GDN) layers keep one conv window and one recurrent state per
+verify node in the backend's verify scratch. Node `t` starts from the state
+after its parent, not after node `t - 1`: `causal_conv1d_update` and
+`gdn_decode_mtp` take `parent_indices` and reload the parent's scratch row at
+branch points (a chain never reloads). The commit copies the scratch row of the
+last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
+familiar `accept_len`. ReplaySSM keeps no per-node state and refuses trees; the
+fused KDA verify kernel follows a chain and refuses them too.
+
+KV compaction covers the attention layers only (`history_group_by_layer`) and
+moves each physical region once.
+
 ### Draft lanes never write the paged cache
 
 Drafting steps `1 .. S-1` run `K` lane rows per request. Their K/V go to a
@@ -79,9 +93,10 @@ refuses tree drafting with them.
 
 ## Scope
 
-EAGLE3 drafters; `greedy` and `triton` sampling backends; the `trtllm`
-attention backend with bf16 KV and one cache group; no structured output, no
-mixed batches, no sliding window or attention sinks in the target.
+EAGLE3 and MTP drafters; `greedy` and `triton` sampling backends; the `trtllm`
+attention backend with bf16 KV and one KV cache group, alone or inside the
+hybrid linear-attention backend (GDN, without ReplaySSM); no structured output,
+no mixed batches, no sliding window or attention sinks in the target.
 
 ## Tests
 
@@ -92,3 +107,6 @@ mixed batches, no sliding window or attention sinks in the target.
 * `test/runtime/test_tree_spec.py` — KV compaction; the fresh-spec chain.
 * `test/runtime/sampling/test_tree_sampling.py` — a chain-shaped tree verifies
   like the chain; every node samples the chain's draw at its depth.
+* `tokenspeed-kernel/test/ops/test_attention_gdn.py`,
+  `test/runtime/test_causal_conv1d_tree.py` — per-node GDN states and conv
+  windows against a per-path reference.

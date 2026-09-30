@@ -316,6 +316,7 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    parent_indices: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -358,6 +359,11 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
+        parent_indices: Optional int32 ``[B, T]`` draft-tree parents: step
+            ``t`` continues from the state after step ``parent_indices[i, t]``
+            (the initial state when negative) instead of step ``t - 1``.
+            Requires ``output_state_indices`` and runs the Triton solution;
+            ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -384,6 +390,20 @@ def gdn_decode_mtp(
             )
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
+
+    if parent_indices is not None:
+        if output_state_indices is None:
+            raise ValueError("parent_indices requires output_state_indices")
+        if parent_indices.shape != q.shape[:2] or parent_indices.dtype != torch.int32:
+            raise ValueError(
+                f"parent_indices must be int32 {tuple(q.shape[:2])}, got "
+                f"{parent_indices.dtype} {tuple(parent_indices.shape)}"
+            )
+        if solution not in (None, "triton"):
+            raise ValueError(
+                f"draft-tree GDN verify runs the Triton solution, got {solution}"
+            )
+        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
@@ -421,6 +441,7 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
+            parent_indices=parent_indices,
         )
 
 
