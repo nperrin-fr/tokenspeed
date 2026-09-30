@@ -81,6 +81,7 @@ from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
 )
+from tokenspeed.runtime.layers.attention.backends.support import resolve_tree_support
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
@@ -564,6 +565,11 @@ class ModelExecutor:
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
                 "use --sampling-backend greedy or triton"
             )
+        if self.draft_attn_backend is self.attn_backend:
+            raise NotImplementedError(
+                "draft trees bind verify and lanes on distinct target and draft backends"
+            )
+        resolve_tree_support(self.attn_backend, self.draft_attn_backend)
         config = self.config
         self.tree_spec = TreeSpec(
             TreeSpecConfig(

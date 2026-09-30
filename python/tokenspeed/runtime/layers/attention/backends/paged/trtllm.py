@@ -49,10 +49,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
-from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
-    TreeDraftInputs,
-    TreeVerifyInputs,
-)
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -107,8 +104,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
-    supports_tree_verify = True
-    supports_tree_draft = True
     # Both kernel call sites forward layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
 
@@ -476,21 +471,15 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
-        if self.kv_cache_dtype != self.dtype:
-            raise NotImplementedError(
-                f"draft-tree verify reads the window K/V back unquantized; "
-                f"kv_cache_dtype {self.kv_cache_dtype} is not supported yet"
-            )
-        super().bind_tree_verify(inputs)
-
-    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
-        if self.kv_cache_dtype != self.dtype:
-            raise NotImplementedError(
-                f"draft-tree lanes keep bf16 side K/V; kv_cache_dtype {self.kv_cache_dtype} "
-                "is not supported yet"
-            )
-        super().bind_tree_draft(inputs)
+    def tree_support(self) -> TreeSupport:
+        if self.kv_cache_dtype == self.dtype:
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        return TreeSupport(
+            verify_blocker=f"{type(self).__name__} reads the verify window K/V back "
+            f"unquantized; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
+            draft_blocker=f"{type(self).__name__} keeps the lanes' side K/V in "
+            f"{self.dtype}; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
+        )
 
     def _forward_tree_verify(
         self,

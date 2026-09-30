@@ -39,12 +39,9 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
-        TreeDraftInputs,
-        TreeVerifyInputs,
-    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -321,12 +318,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
-    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
-        self.full_attn_backend.bind_tree_verify(inputs)
-        self.linear_attn_backend.bind_tree_verify(inputs)
-
-    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
-        self.full_attn_backend.bind_tree_draft(inputs)
+    def tree_support(self) -> TreeSupport:
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
 
     def tree_verify_write_locations(self) -> torch.Tensor:
         return self.full_attn_backend.tree_verify_write_locations()

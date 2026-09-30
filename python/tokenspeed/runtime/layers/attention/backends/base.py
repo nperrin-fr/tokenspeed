@@ -51,6 +51,7 @@ import torch
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
+    TreeSupport,
     resolve_cuda_graph_support,
 )
 
@@ -426,13 +427,26 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} owns no draft write locations"
         )
 
+    def tree_support(self) -> TreeSupport:
+        """This node's own draft-tree capability; ``resolve_tree_support`` asks
+        every node before any bind. Nodes without a tree path keep this."""
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no draft-tree verify path",
+            draft_blocker=f"{name} has no draft-tree lane path",
+        )
+
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
-        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every leaf."""
-        raise NotImplementedError(f"{type(self).__name__} cannot verify draft trees")
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every node,
+        after ``resolve_tree_support``; leaves that verify trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_verify(inputs)
 
     def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
-        """Arm draft-tree lanes on the drafter's leaves."""
-        raise NotImplementedError(f"{type(self).__name__} cannot draft trees")
+        """Arm draft-tree lanes on every node of the drafter's backend, after
+        ``resolve_tree_support``; leaves that draft trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_draft(inputs)
 
     def tree_verify_write_locations(self) -> torch.Tensor:
         """The last verify window's ``[bs * N]`` KV write slots."""

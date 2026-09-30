@@ -77,6 +77,7 @@ from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     _gather_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
@@ -863,13 +864,19 @@ class MambaAttnBackend(AttentionBackend):
                 dst_row_strides=tables["ssm_scratch_stride"],
             )
 
+    def tree_support(self) -> TreeSupport:
+        return TreeSupport(
+            verify_blocker=(
+                "draft-tree verify keeps a recurrent state per node; ReplaySSM keeps none"
+                if self.replay_ssm
+                else None
+            ),
+            draft_blocker="draft-tree lanes have no linear-attention path",
+        )
+
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
         """Verify draft trees: each node's conv window and recurrent state
         continue from its parent's scratch row; commit reads the accepted path."""
-        if self.replay_ssm:
-            raise NotImplementedError(
-                "draft-tree verify keeps a recurrent state per node; ReplaySSM keeps none"
-            )
         self.tree_verify = inputs
 
     def _tree_parents(self, bs: int) -> torch.Tensor | None:

@@ -59,12 +59,10 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
-        TreeVerifyInputs,
-    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -698,10 +696,9 @@ class KdaAttnBackend(MambaAttnBackend):
         return core_attn_out.squeeze(0)
 
     @override
-    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
-        raise NotImplementedError(
-            "the fused KDA verify kernel follows a chain; no draft trees yet"
-        )
+    def tree_support(self) -> TreeSupport:
+        blocker = "the fused KDA verify kernel follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
 
     @override
     def _verify(

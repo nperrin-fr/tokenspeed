@@ -112,6 +112,14 @@ no mixed batches, no pipeline parallelism, no sliding window or attention
 sinks in the target or draft layers, and no
 target that reads request token history or n-gram (Engram) input history.
 
+Each attention backend node declares its own part through `tree_support()`
+(verify and lanes, each supported or refused with a reason);
+`resolve_tree_support` composes it over the target and draft backend trees
+through `child_backends()` once at startup, before any bind, and reports every
+blocker together. Composites never forward the question, so a new composite
+cannot silently skip a child. Sliding window and attention sinks are the named
+exception: they are per layer and per call, so the trtllm forward refuses them.
+
 ## Tests
 
 * `tokenspeed-kernel/test/ops/test_tree_speculative.py` — tree kernels against
@@ -119,6 +127,8 @@ target that reads request token history or n-gram (Engram) input history.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — KV compaction; the fresh-spec chain.
+* `test/runtime/test_tree_support_resolution.py` — backend capability
+  resolution: supported trees, a draft with linear layers, each named blocker.
 * `test/runtime/sampling/test_tree_sampling.py` — a chain-shaped tree verifies
   like the chain; every node samples the chain's draw at its depth.
 * `tokenspeed-kernel/test/ops/test_attention_gdn.py`,
