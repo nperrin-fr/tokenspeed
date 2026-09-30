@@ -18,12 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Top-``k`` log-probabilities of every row of a logits matrix in one pass.
+"""Top-``k`` log-probabilities of every row of a logits matrix.
 
 Equivalent to ``torch.topk(torch.log_softmax(logits.float(), -1), k)`` for
-small ``k`` without materialising the float log-softmax: each row streams its
-vocabulary once, keeping an online log-sum-exp and a running top-``k``.
-Draft-tree expansion calls this once per drafting step.
+small ``k`` without materialising the float log-softmax. Each row's
+vocabulary is split across programs: every split streams its slice once,
+keeping an online log-sum-exp and a running top-``k``; a second pass merges
+the splits. Draft-tree expansion calls this once per drafting step.
 """
 
 from __future__ import annotations
@@ -33,19 +34,27 @@ from tokenspeed_kernel._triton import tl, triton
 
 __all__ = ["logprob_topk"]
 
+# Vocabulary per split: enough splits to fill the GPU at small row counts.
+_SPLIT_VOCAB = 8192
+
 
 @triton.jit
-def _logprob_topk_kernel(
+def _logprob_topk_split_kernel(
     logits_ptr,
-    scores_ptr,
-    ids_ptr,
+    part_v_ptr,  # [rows, SPLITS, K_PAD] float32 split top-k logits (-inf padded)
+    part_i_ptr,  # [rows, SPLITS, K_PAD] int64
+    part_m_ptr,  # [rows, SPLITS] float32 split max
+    part_s_ptr,  # [rows, SPLITS] float32 split sum of exp(x - max)
     stride_row,
     vocab,
+    split_len,
+    SPLITS: tl.constexpr,
     K: tl.constexpr,
     K_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
+    split = tl.program_id(1)
     offs = tl.arange(0, BLOCK)
     slots = tl.arange(0, K_PAD)
     # Padding slots hold +inf so the running minimum never picks them.
@@ -53,10 +62,12 @@ def _logprob_topk_kernel(
     best_i = tl.zeros([K_PAD], dtype=tl.int64)
     run_max = float("-inf")
     run_sum = 0.0
-    for start in range(0, vocab, BLOCK):
+    lo = split * split_len
+    hi = tl.minimum(lo + split_len, vocab)
+    for start in range(lo, hi, BLOCK):
         cols = start + offs
         x = tl.load(
-            logits_ptr + row * stride_row + cols, mask=cols < vocab, other=float("-inf")
+            logits_ptr + row * stride_row + cols, mask=cols < hi, other=float("-inf")
         ).to(tl.float32)
         new_max = tl.maximum(run_max, tl.max(x, axis=0))
         safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)
@@ -74,17 +85,50 @@ def _logprob_topk_kernel(
             best_v = tl.where(hit, top, best_v)
             best_i = tl.where(hit, col.to(tl.int64), best_i)
             x = tl.where(cols == col, float("-inf"), x)
-    lse = run_max + tl.log(run_sum)
-    # Emit best first; ``left`` marks slots not yet written.
-    left = slots < K
+    part = row * SPLITS + split
+    tl.store(
+        part_v_ptr + part * K_PAD + slots, tl.where(slots < K, best_v, float("-inf"))
+    )
+    tl.store(part_i_ptr + part * K_PAD + slots, best_i)
+    tl.store(part_m_ptr + part, run_max)
+    tl.store(part_s_ptr + part, run_sum)
+
+
+@triton.jit
+def _logprob_topk_merge_kernel(
+    part_v_ptr,
+    part_i_ptr,
+    part_m_ptr,
+    part_s_ptr,
+    scores_ptr,
+    ids_ptr,
+    SPLITS: tl.constexpr,
+    SPLITS_PAD: tl.constexpr,
+    K: tl.constexpr,
+    K_PAD: tl.constexpr,
+):
+    row = tl.program_id(0)
+    splits = tl.arange(0, SPLITS_PAD)
+    split_ok = splits < SPLITS
+    m = tl.load(part_m_ptr + row * SPLITS + splits, mask=split_ok, other=float("-inf"))
+    s = tl.load(part_s_ptr + row * SPLITS + splits, mask=split_ok, other=0.0)
+    top_m = tl.max(m, axis=0)
+    safe_m = tl.where(m == float("-inf"), top_m, m)
+    lse = top_m + tl.log(tl.sum(s * tl.exp(safe_m - top_m), axis=0))
+
+    cand = tl.arange(0, SPLITS_PAD * K_PAD)
+    cand_ok = (cand // K_PAD) < SPLITS
+    v = tl.load(
+        part_v_ptr + row * SPLITS * K_PAD + cand, mask=cand_ok, other=float("-inf")
+    )
+    ids = tl.load(part_i_ptr + row * SPLITS * K_PAD + cand, mask=cand_ok, other=0)
+    # Best first; ties go to the lower candidate slot.
     for j in tl.static_range(K):
-        top = tl.max(tl.where(left, best_v, float("-inf")), axis=0)
-        slot = tl.min(tl.where(left & (best_v == top), slots, K_PAD), axis=0)
+        top = tl.max(v, axis=0)
+        pick = tl.min(tl.where(v == top, cand, SPLITS_PAD * K_PAD), axis=0)
         tl.store(scores_ptr + row * K + j, top - lse)
-        tl.store(
-            ids_ptr + row * K + j, tl.sum(tl.where(slots == slot, best_i, 0), axis=0)
-        )
-        left = left & (slots != slot)
+        tl.store(ids_ptr + row * K + j, tl.sum(tl.where(cand == pick, ids, 0), axis=0))
+        v = tl.where(cand == pick, float("-inf"), v)
 
 
 def logprob_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -107,15 +151,39 @@ def logprob_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tens
     ids = torch.empty((rows, k), dtype=torch.int64, device=logits.device)
     if rows == 0:
         return scores, ids
-    _logprob_topk_kernel[(rows,)](
+    splits = triton.cdiv(vocab, _SPLIT_VOCAB)
+    k_pad = max(2, triton.next_power_of_2(k))
+    part_v = torch.empty(
+        (rows, splits, k_pad), dtype=torch.float32, device=logits.device
+    )
+    part_i = torch.empty((rows, splits, k_pad), dtype=torch.int64, device=logits.device)
+    part_m = torch.empty((rows, splits), dtype=torch.float32, device=logits.device)
+    part_s = torch.empty((rows, splits), dtype=torch.float32, device=logits.device)
+    _logprob_topk_split_kernel[(rows, splits)](
         logits,
-        scores,
-        ids,
+        part_v,
+        part_i,
+        part_m,
+        part_s,
         logits.stride(0),
         vocab,
+        _SPLIT_VOCAB,
+        SPLITS=splits,
         K=k,
-        K_PAD=max(2, triton.next_power_of_2(k)),
+        K_PAD=k_pad,
         BLOCK=min(4096, triton.next_power_of_2(vocab)),
         num_warps=8,
+    )
+    _logprob_topk_merge_kernel[(rows,)](
+        part_v,
+        part_i,
+        part_m,
+        part_s,
+        scores,
+        ids,
+        SPLITS=splits,
+        SPLITS_PAD=triton.next_power_of_2(splits),
+        K=k,
+        K_PAD=k_pad,
     )
     return scores, ids

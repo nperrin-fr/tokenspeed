@@ -343,7 +343,8 @@ def test_tree_decode_attention_matches_reference(n, splits, prefix_lens):
 
 
 @pytest.mark.parametrize(
-    "rows,vocab,k", [(1, 32000, 1), (32, 32000, 4), (64, 128256, 8), (5, 10, 8)]
+    "rows,vocab,k",
+    [(1, 32000, 1), (32, 32000, 4), (64, 128256, 8), (5, 10, 8), (4, 248320, 4)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_logprob_topk_matches_torch(rows, vocab, k, dtype):
