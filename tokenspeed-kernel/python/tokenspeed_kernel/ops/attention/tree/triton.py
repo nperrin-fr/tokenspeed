@@ -33,7 +33,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["tree_attention"]
+__all__ = ["tree_attention", "tree_decode_attention"]
 
 MAX_TREE_SLOTS = 64
 
@@ -44,7 +44,6 @@ def _tree_attention_kernel(
     k_ptr,
     v_ptr,
     mask_ptr,
-    kv_rows_ptr,
     prefix_out_ptr,
     prefix_lse_ptr,
     out_ptr,
@@ -68,7 +67,6 @@ def _tree_attention_kernel(
     ROWS_PAD: tl.constexpr,
     SLOTS_PAD: tl.constexpr,
     DIM_PAD: tl.constexpr,
-    HAS_KV_ROWS: tl.constexpr,
     HAS_PREFIX: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -84,8 +82,6 @@ def _tree_attention_kernel(
 
     q_rows = req * ROWS + rows
     kv_rows = req * SLOTS + slots
-    if HAS_KV_ROWS:
-        kv_rows = tl.load(kv_rows_ptr + kv_rows, mask=slot_ok, other=0).to(tl.int64)
 
     q = tl.load(
         q_ptr + q_rows[:, None] * stride_qt + head * stride_qh + dims[None, :],
@@ -159,7 +155,6 @@ def tree_attention(
     slots_per_req: int,
     sm_scale: float,
     lse_base2: bool = False,
-    kv_rows: torch.Tensor | None = None,
     prefix: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
@@ -168,16 +163,13 @@ def tree_attention(
 
     Args:
         q: ``[bs * rows_per_req, num_q_heads, head_dim]`` queries.
-        k: ``[bs * slots_per_req, num_kv_heads, head_dim]`` keys, or any
-            ``[rows, num_kv_heads, head_dim]`` store when ``kv_rows`` is given.
-        v: values, laid out like ``k``.
+        k: ``[bs * slots_per_req, num_kv_heads, head_dim]`` keys.
+        v: ``[bs * slots_per_req, num_kv_heads, head_dim]`` values.
         mask: ``[bs * rows_per_req]`` int64; bit ``j`` lets a row see slot ``j``.
         rows_per_req: query rows per request.
         slots_per_req: key/value slots per request, at most 64.
         sm_scale: softmax scale applied to ``q . k``.
         lse_base2: return the LSE in base 2 (trtllm-gen's basis) instead of natural log.
-        kv_rows: optional ``[bs * slots_per_req]`` integer row of each slot in
-            ``k``/``v`` (e.g. the KV cache slots); slots are dense when omitted.
         prefix: optional ``(out, lse)`` attention state of the same rows over
             other keys (LSE in the basis ``lse_base2`` selects, every row seeing
             at least one key); the result is then the merged state.
@@ -194,8 +186,6 @@ def tree_attention(
     num_kv_heads = k.shape[1]
     if num_q_heads % num_kv_heads:
         raise ValueError(f"{num_q_heads} query heads over {num_kv_heads} kv heads")
-    if kv_rows is not None and kv_rows.stride(0) != 1:
-        raise ValueError("kv_rows must be contiguous")
     bs = num_rows // rows_per_req
     if out is None:
         out = torch.empty_like(q)
@@ -208,7 +198,6 @@ def tree_attention(
         k,
         v,
         mask,
-        mask if kv_rows is None else kv_rows,
         q if prefix is None else prefix[0],
         mask if prefix is None else prefix[1],
         out,
@@ -232,7 +221,245 @@ def tree_attention(
         ROWS_PAD=max(16, triton.next_power_of_2(rows_per_req)),
         SLOTS_PAD=max(16, triton.next_power_of_2(slots_per_req)),
         DIM_PAD=max(16, triton.next_power_of_2(head_dim)),
-        HAS_KV_ROWS=kv_rows is not None,
         HAS_PREFIX=prefix is not None,
     )
     return out, lse
+
+
+@triton.jit
+def _tree_decode_split_kernel(
+    q_ptr,  # [bs * N, Hq, D]
+    k_ptr,  # [slots, Hkv, D] token rows of the paged cache
+    v_ptr,
+    table_ptr,  # [bs, max_pages] int32
+    seq_lens_ptr,  # [bs] int32, including the N window keys
+    mask_ptr,  # [bs * N] int64
+    part_out_ptr,  # [bs, Hkv, SPLITS, ROWS_PAD, D] float32
+    part_lse_ptr,  # [bs, Hkv, SPLITS, ROWS_PAD] float32, base 2
+    stride_qt,
+    stride_qh,
+    stride_kt,
+    stride_kh,
+    stride_vt,
+    stride_vh,
+    stride_table,
+    sm_scale_log2,
+    N: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE: tl.constexpr,
+    SPLITS: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+
+    # Row r is (node r // GROUP, query head kv_head * GROUP + r % GROUP).
+    rows = tl.arange(0, ROWS_PAD)
+    row_ok = rows < N * GROUP
+    node = rows // GROUP
+    head = kv_head * GROUP + rows % GROUP
+    dims = tl.arange(0, HEAD_DIM)
+    q = tl.load(
+        q_ptr
+        + (req * N + node)[:, None] * stride_qt
+        + head[:, None] * stride_qh
+        + dims[None, :],
+        mask=row_ok[:, None],
+        other=0.0,
+    )
+    bits = tl.load(mask_ptr + req * N + node, mask=row_ok, other=0)
+
+    seq_len = tl.load(seq_lens_ptr + req)
+    window = seq_len - N
+    span = tl.cdiv(tl.cdiv(seq_len, SPLITS), BLOCK) * BLOCK
+    start = split * span
+    end = tl.minimum(seq_len, start + span)
+
+    run_max = tl.full([ROWS_PAD], float("-inf"), tl.float32)
+    run_sum = tl.zeros([ROWS_PAD], dtype=tl.float32)
+    acc = tl.zeros([ROWS_PAD, HEAD_DIM], dtype=tl.float32)
+    cols = tl.arange(0, BLOCK)
+    for tile in range(start, end, BLOCK):
+        pos = tile + cols
+        pos_ok = pos < end
+        page = tl.load(
+            table_ptr + req * stride_table + pos // PAGE, mask=pos_ok, other=0
+        )
+        slot = page.to(tl.int64) * PAGE + pos % PAGE
+        k = tl.load(
+            k_ptr + slot[:, None] * stride_kt + kv_head * stride_kh + dims[None, :],
+            mask=pos_ok[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            v_ptr + slot[:, None] * stride_vt + kv_head * stride_vh + dims[None, :],
+            mask=pos_ok[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
+        in_window = pos >= window
+        bit = (
+            (bits[:, None] >> tl.maximum(pos - window, 0).to(tl.int64)[None, :]) & 1
+        ) != 0
+        visible = pos_ok[None, :] & (~in_window[None, :] | bit)
+        scores = tl.where(visible, scores, float("-inf"))
+        new_max = tl.maximum(run_max, tl.max(scores, axis=1))
+        safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)
+        alpha = tl.exp2(run_max - safe_max)
+        probs = tl.exp2(scores - safe_max[:, None])
+        run_sum = run_sum * alpha + tl.sum(probs, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(probs.to(v.dtype), v)
+        run_max = new_max
+
+    part = (req * tl.num_programs(1) + kv_head) * SPLITS + split
+    safe_sum = tl.where(run_sum > 0.0, run_sum, 1.0)
+    tl.store(
+        part_out_ptr + (part * ROWS_PAD + rows)[:, None] * HEAD_DIM + dims[None, :],
+        acc / safe_sum[:, None],
+    )
+    lse = tl.where(run_sum > 0.0, run_max + tl.log2(safe_sum), float("-inf"))
+    tl.store(part_lse_ptr + part * ROWS_PAD + rows, lse)
+
+
+@triton.jit
+def _tree_decode_reduce_kernel(
+    part_out_ptr,
+    part_lse_ptr,
+    out_ptr,  # [bs * N, Hq, D]
+    stride_ot,
+    stride_oh,
+    N: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    SPLITS: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    ROWS_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    rows = tl.program_id(2) * ROWS_BLOCK + tl.arange(0, ROWS_BLOCK)
+    row_ok = rows < N * GROUP
+    dims = tl.arange(0, HEAD_DIM)
+    base = (req * tl.num_programs(1) + kv_head) * SPLITS
+    top = tl.full([ROWS_BLOCK], float("-inf"), tl.float32)
+    for s in tl.static_range(SPLITS):
+        top = tl.maximum(top, tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows))
+    safe_top = tl.where(top == float("-inf"), 0.0, top)
+    total = tl.zeros([ROWS_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([ROWS_BLOCK, HEAD_DIM], dtype=tl.float32)
+    for s in tl.static_range(SPLITS):
+        weight = tl.exp2(
+            tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows) - safe_top
+        )
+        part = tl.load(
+            part_out_ptr
+            + ((base + s) * ROWS_PAD + rows)[:, None] * HEAD_DIM
+            + dims[None, :]
+        )
+        acc += part * weight[:, None]
+        total += weight
+    out = acc / tl.where(total > 0.0, total, 1.0)[:, None]
+    node = rows // GROUP
+    head = kv_head * GROUP + rows % GROUP
+    tl.store(
+        out_ptr
+        + (req * N + node)[:, None] * stride_ot
+        + head[:, None] * stride_oh
+        + dims[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=row_ok[:, None],
+    )
+
+
+def tree_decode_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    num_nodes: int,
+    page_size: int,
+    sm_scale: float,
+    num_splits: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Target verify of a draft tree over a paged KV cache in one pass.
+
+    Each request's last ``num_nodes`` keys are its tree window: query row
+    ``i`` sees every earlier key and window key ``j`` when bit ``j`` of its
+    mask is set. Split-KV (flash decoding) with all of a KV head's query rows
+    in one tile.
+
+    Args:
+        q: ``[bs * N, num_q_heads, head_dim]`` queries.
+        k_cache: ``[slots, num_kv_heads, head_dim]`` token rows of the cache.
+        v_cache: laid out like ``k_cache``.
+        page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size + offset.
+        seq_lens: ``[bs]`` int32 keys per request, the window included (>= N).
+        mask: ``[bs * N]`` int64 window visibility per query row.
+        num_nodes: ``N``, window width, at most 64.
+        page_size: tokens per page.
+        sm_scale: softmax scale applied to ``q . k``.
+        num_splits: KV splits per (request, KV head).
+        out: optional ``[bs * N, num_q_heads, head_dim]`` output.
+
+    Returns:
+        The attention output in ``q.dtype``.
+    """
+    if num_nodes > MAX_TREE_SLOTS:
+        raise ValueError(f"tree has {num_nodes} nodes, at most {MAX_TREE_SLOTS}")
+    num_rows, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    group = num_q_heads // num_kv_heads
+    bs = num_rows // num_nodes
+    if out is None:
+        out = torch.empty_like(q)
+    if bs == 0:
+        return out
+    rows_pad = max(16, triton.next_power_of_2(num_nodes * group))
+    part_out = torch.empty(
+        (bs, num_kv_heads, num_splits, rows_pad, head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    part_lse = torch.empty(
+        (bs, num_kv_heads, num_splits, rows_pad), dtype=torch.float32, device=q.device
+    )
+    common = dict(
+        N=num_nodes,
+        GROUP=group,
+        HEAD_DIM=head_dim,
+        SPLITS=num_splits,
+        ROWS_PAD=rows_pad,
+    )
+    _tree_decode_split_kernel[(bs, num_kv_heads, num_splits)](
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        mask,
+        part_out,
+        part_lse,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        page_table.stride(0),
+        sm_scale * 1.4426950408889634,
+        PAGE=page_size,
+        BLOCK=64,
+        num_warps=8 if rows_pad >= 128 else 4,
+        **common,
+    )
+    _tree_decode_reduce_kernel[(bs, num_kv_heads, rows_pad // 16)](
+        part_out, part_lse, out, out.stride(0), out.stride(1), ROWS_BLOCK=16, **common
+    )
+    return out

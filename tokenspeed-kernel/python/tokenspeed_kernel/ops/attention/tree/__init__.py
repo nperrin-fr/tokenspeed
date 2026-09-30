@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.ops.attention.tree.triton import MAX_TREE_SLOTS, tree_attention
+from tokenspeed_kernel.ops.attention.tree.triton import (
+    MAX_TREE_SLOTS,
+    tree_attention,
+    tree_decode_attention,
+)
 
-__all__ = ["MAX_TREE_SLOTS", "tree_attention"]
+__all__ = ["MAX_TREE_SLOTS", "tree_attention", "tree_decode_attention"]

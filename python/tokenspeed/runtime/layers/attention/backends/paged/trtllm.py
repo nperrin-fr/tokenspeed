@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
-from tokenspeed_kernel.ops.attention.tree import tree_attention
+from tokenspeed_kernel.ops.attention.tree import tree_attention, tree_decode_attention
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
@@ -98,12 +98,6 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
 
 
-# Largest verify window that runs as one xqa kernel; wider trees run the
-# prefix + tree cascade, which is faster there.
-XQA_MAX_TREE_NODES = 16
-XQA_WORKSPACE_BYTES = 128 << 20
-
-
 class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
@@ -127,8 +121,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # the forward with the pool frozen, and under --disable-autotune no
         # earlier forward will have grown the block by then.
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
-        # Draft-tree verify through xqa (bind_tree_verify): its own zeroed workspace.
-        self.xqa_workspace: torch.Tensor | None = None
+        # KV splits per (request, KV head) of draft-tree verify, by batch size.
+        self.tree_verify_splits: dict[int, int] = {}
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
         # per decode forward and needs non-causal (block-diffusion) attention.
@@ -314,8 +308,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
         self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
-        if self.tree_verify is not None and num_extends == 0:
-            self.tree_verify.refresh(bs, seq_lens)
         # Pure verify (and the draft's multi-token step 1) reads the prefill
         # slot. An extend/mixed draft refresh only seeds later decode steps and
         # must preserve the ragged prefill metadata built immediately before it.
@@ -448,13 +440,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 raise NotImplementedError(
                     "draft-tree verify has no sliding-window or attention-sink path yet"
                 )
-            if self.tree_verify.num_nodes <= XQA_MAX_TREE_NODES:
-                return self._forward_tree_verify_xqa(
-                    q, layer, token_to_kv_pool, metadata, bs
-                )
-            return self._forward_tree_verify(
-                q, layer, out_cache_loc, token_to_kv_pool, bs
-            )
+            return self._forward_tree_verify(q, layer, token_to_kv_pool, metadata, bs)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
@@ -485,12 +471,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 f"kv_cache_dtype {self.kv_cache_dtype} is not supported yet"
             )
         super().bind_tree_verify(inputs)
-        if inputs.num_nodes <= XQA_MAX_TREE_NODES:
-            # xqa keeps semaphores in its workspace that must start zeroed;
-            # trtllm-gen dirties the shared one.
-            self.xqa_workspace = torch.zeros(
-                XQA_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
-            )
 
     def bind_tree_draft(self, inputs) -> None:
         if self.kv_cache_dtype != self.dtype:
@@ -500,87 +480,40 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             )
         super().bind_tree_draft(inputs)
 
-    def _forward_tree_verify_xqa(
-        self,
-        q: torch.Tensor,
-        layer: PagedAttention,
-        token_to_kv_pool,
-        metadata,
-        bs: int,
-    ) -> torch.Tensor:
-        """Verify a draft tree in one xqa kernel: the window rows carry the tree mask."""
-        tree = self.tree_verify
-        nodes = tree.num_nodes
-        heads, kv_heads, dim = layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim
-        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
-        out = trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=(
-                k_cache.view(-1, self.kernel_page_size, kv_heads, dim),
-                v_cache.view(-1, self.kernel_page_size, kv_heads, dim),
-            ),
-            workspace_buffer=self.xqa_workspace,
-            block_tables=metadata.page_table,
-            seq_lens=metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            out_dtype=self.dtype,
-            q_len_per_req=nodes,
-            backend="xqa",
-            mask=tree.packed_mask[: bs * nodes].view(bs, nodes, -1),
-            kv_layout="NHD",
-        )
-        return out.view(-1, heads * dim)
-
     def _forward_tree_verify(
         self,
         q: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
+        metadata: TRTLLMMHAMetadata,
         bs: int,
     ) -> torch.Tensor:
-        """Verify a draft tree: non-causal prefix with its LSE, masked window, merged."""
-        tree = self.tree_verify
-        nodes = tree.num_nodes
-        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
-        prefix_out, prefix_lse = trtllm_batch_context_with_kv_cache(
-            query=q,
-            kv_cache=(k_cache, v_cache),
-            workspace_buffer=self.workspace_buffer,
-            block_tables=self.page_table_buf[:bs],
-            seq_lens=tree.prefix_lens[:bs],
-            max_q_len=nodes,
-            max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            batch_size=bs,
-            cum_seq_lens_q=tree.cu_query_lens[: bs + 1],
-            cum_seq_lens_kv=tree.cu_prefix_lens[: bs + 1],
-            out_dtype=self.dtype,
-            causal=False,
-            return_lse=True,
-        )
+        """Verify a draft tree: every window row sees the prefix and its masked ancestors."""
         kv_heads, dim = layer.tp_k_head_num, layer.head_dim
-        raw_k, raw_v = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # trtllm-gen reports its LSE in base 2.
-        out, _ = tree_attention(
+        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        bmm1_scale, _ = self._compute_scales(layer)
+        out = tree_decode_attention(
             q,
-            raw_k.view(-1, kv_heads, dim),
-            raw_v.view(-1, kv_heads, dim),
-            tree.mask[: bs * nodes],
-            rows_per_req=nodes,
-            slots_per_req=nodes,
+            k_cache.view(-1, kv_heads, dim),
+            v_cache.view(-1, kv_heads, dim),
+            metadata.page_table,
+            metadata.cache_seqlens_int32,
+            self.tree_verify.mask[: bs * self.tree_verify.num_nodes],
+            num_nodes=self.tree_verify.num_nodes,
+            page_size=self.kernel_page_size,
             sm_scale=bmm1_scale,
-            lse_base2=True,
-            kv_rows=out_cache_loc[: bs * nodes],
-            prefix=(prefix_out, prefix_lse),
-            out=prefix_out,
+            num_splits=self._tree_verify_splits(bs, kv_heads),
         )
-        return out.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return out.view(-1, layer.tp_q_head_num * dim)
+
+    def _tree_verify_splits(self, bs: int, kv_heads: int) -> int:
+        """Enough KV splits to give every SM about two (request, KV head, split) programs."""
+        if bs not in self.tree_verify_splits:
+            sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+            self.tree_verify_splits[bs] = max(
+                1, min(32, -(-2 * sms // (bs * kv_heads)))
+            )
+        return self.tree_verify_splits[bs]
 
     def _forward_tree_lanes(
         self,

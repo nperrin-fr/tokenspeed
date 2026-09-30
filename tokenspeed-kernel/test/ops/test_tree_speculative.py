@@ -25,7 +25,7 @@ import random
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import attn_merge_state
-from tokenspeed_kernel.ops.attention.tree import tree_attention
+from tokenspeed_kernel.ops.attention.tree import tree_attention, tree_decode_attention
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree_greedy
 
@@ -74,23 +74,6 @@ def test_tree_attention_matches_reference(rows, slots):
     assert torch.equal(seen, torch.isfinite(lse))
     torch.testing.assert_close(lse[seen], ref_lse[seen], atol=1e-3, rtol=1e-3)
     assert torch.all(out[0] == 0)
-
-
-def test_tree_attention_reads_rows_in_place():
-    gen = torch.Generator().manual_seed(3)
-    bs, n, hq, hkv, d, store = 3, 8, 16, 2, 128, 97
-    q = torch.randn(bs * n, hq, d, generator=gen).bfloat16().cuda()
-    k_store = torch.randn(store, hkv, d, generator=gen).bfloat16().cuda()
-    v_store = torch.randn(store, hkv, d, generator=gen).bfloat16().cuda()
-    rows = torch.randperm(store, generator=gen)[: bs * n].int().cuda()
-    mask = _random_masks(bs, n, n, gen)
-    args = dict(rows_per_req=n, slots_per_req=n, sm_scale=d**-0.5)
-    out, lse = tree_attention(q, k_store, v_store, mask, kv_rows=rows, **args)
-    ref_out, ref_lse = tree_attention(
-        q, k_store[rows.long()], v_store[rows.long()], mask, **args
-    )
-    assert torch.equal(out, ref_out)
-    assert torch.equal(lse, ref_lse)
 
 
 def test_merge_with_prefix_equals_full_attention():
@@ -251,7 +234,9 @@ def _paged_tree_problem(bs, n, prefix_lens, hq, hkv, d, page, gen):
             while cur >= 0:
                 bits |= 1 << cur
                 cur = parent[cur]
-            mask[b * n + i] = bits
+            mask[b * n + i] = (
+                bits - (1 << 64) if bits >> 63 else bits
+            )  # bit 63 is the sign
         group = hq // hkv
         kk = keys.float().repeat_interleave(group, 1)
         vv = vals.float().repeat_interleave(group, 1)
@@ -331,45 +316,30 @@ def test_trtllm_prefix_cascade_matches_reference():
     torch.testing.assert_close(fused.float().cpu(), ref, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="xqa tree masks are checked on sm100",
+@pytest.mark.parametrize(
+    "n,splits", [(8, 1), (8, 5), (16, 3), (4, 8), (32, 4), (64, 2)]
 )
-@pytest.mark.parametrize("n", [8, 16])
 @pytest.mark.parametrize("prefix_lens", [[5, 70, 131], [1, 2, 64]])
-def test_xqa_tree_mask_matches_reference(n, prefix_lens):
-    from tokenspeed_kernel.ops.attention.mha.flashinfer import (
-        trtllm_batch_decode_with_kv_cache,
-    )
-
-    gen = torch.Generator().manual_seed(n)
-    bs, hq, hkv, d, page = 3, 32, 8, 128, 64
+def test_tree_decode_attention_matches_reference(n, splits, prefix_lens):
+    gen = torch.Generator().manual_seed(n * 10 + splits)
+    bs, hq, hkv, d, page = 3, 32, 8, 128, 32
     q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
         bs, n, prefix_lens, hq, hkv, d, page, gen
     )
-    # The backend's layout: NHD pages, the int64 mask split into uint16 halves.
-    packed = mask.view(torch.uint16).view(bs * n, 4)[:, : (n + 31) // 32 * 2]
-    out = trtllm_batch_decode_with_kv_cache(
-        query=q.cuda(),
-        kv_cache=(
-            k_cache.permute(0, 2, 1, 3).contiguous().cuda(),
-            v_cache.permute(0, 2, 1, 3).contiguous().cuda(),
-        ),
-        workspace_buffer=torch.zeros(256 << 20, dtype=torch.uint8, device="cuda"),
-        block_tables=tables.cuda(),
-        seq_lens=torch.tensor(prefix_lens, dtype=torch.int32).cuda() + n,
-        max_seq_len=4096,
-        bmm1_scale=scale,
-        bmm2_scale=1.0,
-        out_dtype=torch.bfloat16,
-        q_len_per_req=n,
-        backend="xqa",
-        mask=packed.contiguous().view(bs, n, -1).cuda(),
-        kv_layout="NHD",
+    rows = lambda cache: cache.permute(0, 2, 1, 3).reshape(-1, hkv, d).cuda()
+    out = tree_decode_attention(
+        q.cuda(),
+        rows(k_cache),
+        rows(v_cache),
+        tables.cuda(),
+        torch.tensor(prefix_lens, dtype=torch.int32).cuda() + n,
+        mask.cuda(),
+        num_nodes=n,
+        page_size=page,
+        sm_scale=scale,
+        num_splits=splits,
     )
-    torch.testing.assert_close(
-        out.float().cpu().view(bs * n, hq, d), ref, atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(
