@@ -79,6 +79,9 @@ CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P = "triton_full_top_k_top_p_min_
 class TritonFullSamplingBackend(TritonSamplingBackend):
     """Full sampling backend with TokenSpeed-owned state and Triton kernels."""
 
+    # verify() here adds penalties and logit processors with no tree path yet.
+    supports_tree_verify = False
+
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
         if config.max_req_pool_size <= 0 or config.vocab_size <= 0:
