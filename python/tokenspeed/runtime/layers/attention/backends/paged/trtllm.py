@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
+from tokenspeed_kernel.ops.attention.tree import tree_attention
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
@@ -101,6 +102,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
+    supports_tree_verify = True
     # Both kernel call sites forward layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
 
@@ -158,7 +160,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # writes KV from fresh metadata.
         if is_breakable_capture_active():
             return False
-        return True
+        # Draft-tree lanes keep their K/V out of the paged cache (side buffer).
+        return not self.tree_lane_step_active
 
     # ------------------------------------------------------------------
     # Metadata initialisation
@@ -303,6 +306,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
         self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
+        if self.tree_verify is not None and num_extends == 0:
+            self.tree_verify.refresh(bs, seq_lens)
         # Pure verify (and the draft's multi-token step 1) reads the prefill
         # slot. An extend/mixed draft refresh only seeds later decode steps and
         # must preserve the ragged prefill metadata built immediately before it.
@@ -409,6 +414,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        if self.tree_lane_step_active:
+            return self._forward_tree_lanes(q, k, v, layer, token_to_kv_pool, bs)
         if self.block_decode_active:
             # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
             # single-query entries, so use the decode slot directly. Inferring
@@ -428,6 +435,14 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         q = self._save_kv_and_prepare_q(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
         )
+        if self.tree_verify is not None and metadata.max_seq_len_q > 1:
+            if layer.sliding_window_size >= 0 or kwargs.get("sinks") is not None:
+                raise NotImplementedError(
+                    "draft-tree verify has no sliding-window or attention-sink path yet"
+                )
+            return self._forward_tree_verify(
+                q, layer, out_cache_loc, token_to_kv_pool, bs
+            )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
@@ -450,6 +465,123 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             q_len_per_req=metadata.max_seq_len_q,
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def bind_tree_verify(self, inputs) -> None:
+        if self.kv_cache_dtype != self.dtype:
+            raise NotImplementedError(
+                f"draft-tree verify reads the window K/V back unquantized; "
+                f"kv_cache_dtype {self.kv_cache_dtype} is not supported yet"
+            )
+        super().bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs) -> None:
+        if self.kv_cache_dtype != self.dtype:
+            raise NotImplementedError(
+                f"draft-tree lanes keep bf16 side K/V; kv_cache_dtype {self.kv_cache_dtype} "
+                "is not supported yet"
+            )
+        super().bind_tree_draft(inputs)
+
+    def _forward_tree_verify(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+    ) -> torch.Tensor:
+        """Verify a draft tree: non-causal prefix with its LSE, masked window, merged."""
+        tree = self.tree_verify
+        nodes = tree.num_nodes
+        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
+        bmm1_scale, bmm2_scale = self._compute_scales(layer)
+        prefix_out, prefix_lse = trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=self.page_table_buf[:bs],
+            seq_lens=tree.prefix_lens[:bs],
+            max_q_len=nodes,
+            max_kv_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=bs,
+            cum_seq_lens_q=tree.cu_query_lens[: bs + 1],
+            cum_seq_lens_kv=tree.cu_prefix_lens[: bs + 1],
+            out_dtype=self.dtype,
+            causal=False,
+            return_lse=True,
+        )
+        kv_heads, dim = layer.tp_k_head_num, layer.head_dim
+        raw_k, raw_v = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # trtllm-gen reports its LSE in base 2.
+        out, _ = tree_attention(
+            q,
+            raw_k.view(-1, kv_heads, dim),
+            raw_v.view(-1, kv_heads, dim),
+            tree.mask[: bs * nodes],
+            rows_per_req=nodes,
+            slots_per_req=nodes,
+            sm_scale=bmm1_scale,
+            lse_base2=True,
+            kv_rows=out_cache_loc[: bs * nodes],
+            prefix=(prefix_out, prefix_lse),
+            out=prefix_out,
+        )
+        return out.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_tree_lanes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        bs: int,
+    ) -> torch.Tensor:
+        """One drafting step of a draft tree: K lane rows per request over the
+        accepted prefix (paged, non-causal) and their ancestors (side buffer)."""
+        lanes = self.tree_draft
+        topk, slots = lanes.topk, lanes.num_slots
+        heads, kv_heads, dim = layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim
+        q = q.contiguous().view(-1, heads, dim)
+        side_k, side_v = lanes.side_k[layer.layer_id], lanes.side_v[layer.layer_id]
+        rows = lanes.slot_rows[lanes.step - 1][: bs * topk]
+        side_k.index_copy_(0, rows, k.view(-1, kv_heads, dim))
+        side_v.index_copy_(0, rows, v.view(-1, kv_heads, dim))
+
+        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
+        bmm1_scale, bmm2_scale = self._compute_scales(layer)
+        prefix_out, prefix_lse = trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=self.page_table_buf[:bs],
+            seq_lens=lanes.prefix_lens[:bs],
+            max_q_len=topk,
+            max_kv_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=bs,
+            cum_seq_lens_q=lanes.cu_query_lens[: bs + 1],
+            cum_seq_lens_kv=lanes.cu_prefix_lens[: bs + 1],
+            out_dtype=self.dtype,
+            causal=False,
+            return_lse=True,
+        )
+        out, _ = tree_attention(
+            q,
+            side_k[: bs * slots],
+            side_v[: bs * slots],
+            lanes.lane_mask[: bs * topk],
+            rows_per_req=topk,
+            slots_per_req=slots,
+            sm_scale=bmm1_scale,
+            lse_base2=True,
+            prefix=(prefix_out, prefix_lse),
+            out=prefix_out,
+        )
+        return out.view(-1, heads * dim)
 
     def forward_extend(
         self,

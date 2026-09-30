@@ -70,6 +70,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -410,6 +414,26 @@ class CacheGroupRouter(AttentionBackend):
             raise RuntimeError("extend spans requested before init_forward_metadata")
         gid = self.group_ids[self._draft_history_index()]
         return self._extend_write_locations[gid]
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        if len(self.leaves) != 1:
+            raise NotImplementedError(
+                f"draft-tree verify supports one cache group; this router serves {self.group_ids}"
+            )
+        for leaf in self.leaves.values():
+            leaf.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        if len(self.leaves) != 1:
+            raise NotImplementedError(
+                f"draft-tree drafting supports one cache group; this router serves {self.group_ids}"
+            )
+        for leaf in self.leaves.values():
+            leaf.bind_tree_draft(inputs)
+
+    def tree_verify_write_locations(self) -> torch.Tensor:
+        (gid,) = self.leaves
+        return self.decode_write_locations.by_group[gid]
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode

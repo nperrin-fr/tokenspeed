@@ -56,6 +56,10 @@ from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -419,6 +423,18 @@ class AttentionBackend(CachePoolBinding, ABC):
         raise NotImplementedError(
             f"{type(self).__name__} owns no draft write locations"
         )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every leaf."""
+        raise NotImplementedError(f"{type(self).__name__} cannot verify draft trees")
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        """Arm draft-tree lanes on the drafter's leaves."""
+        raise NotImplementedError(f"{type(self).__name__} cannot draft trees")
+
+    def tree_verify_write_locations(self) -> torch.Tensor:
+        """The last verify window's ``[bs * N]`` KV write slots."""
+        raise NotImplementedError(f"{type(self).__name__} cannot verify draft trees")
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
