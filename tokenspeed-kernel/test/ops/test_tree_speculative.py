@@ -331,6 +331,47 @@ def test_trtllm_prefix_cascade_matches_reference():
     torch.testing.assert_close(fused.float().cpu(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="xqa tree masks are checked on sm100",
+)
+@pytest.mark.parametrize("n", [8, 16])
+@pytest.mark.parametrize("prefix_lens", [[5, 70, 131], [1, 2, 64]])
+def test_xqa_tree_mask_matches_reference(n, prefix_lens):
+    from tokenspeed_kernel.ops.attention.mha.flashinfer import (
+        trtllm_batch_decode_with_kv_cache,
+    )
+
+    gen = torch.Generator().manual_seed(n)
+    bs, hq, hkv, d, page = 3, 32, 8, 128, 64
+    q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
+        bs, n, prefix_lens, hq, hkv, d, page, gen
+    )
+    # The backend's layout: NHD pages, the int64 mask split into uint16 halves.
+    packed = mask.view(torch.uint16).view(bs * n, 4)[:, : (n + 31) // 32 * 2]
+    out = trtllm_batch_decode_with_kv_cache(
+        query=q.cuda(),
+        kv_cache=(
+            k_cache.permute(0, 2, 1, 3).contiguous().cuda(),
+            v_cache.permute(0, 2, 1, 3).contiguous().cuda(),
+        ),
+        workspace_buffer=torch.zeros(256 << 20, dtype=torch.uint8, device="cuda"),
+        block_tables=tables.cuda(),
+        seq_lens=torch.tensor(prefix_lens, dtype=torch.int32).cuda() + n,
+        max_seq_len=4096,
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        out_dtype=torch.bfloat16,
+        q_len_per_req=n,
+        backend="xqa",
+        mask=packed.contiguous().view(bs, n, -1).cuda(),
+        kv_layout="NHD",
+    )
+    torch.testing.assert_close(
+        out.float().cpu().view(bs * n, hq, d), ref, atol=2e-2, rtol=2e-2
+    )
+
+
 @pytest.mark.parametrize(
     "rows,vocab,k", [(1, 32000, 1), (32, 32000, 4), (64, 128256, 8), (5, 10, 8)]
 )

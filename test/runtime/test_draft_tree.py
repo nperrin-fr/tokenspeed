@@ -119,3 +119,23 @@ def test_draft_tree_structure(bs, topk, steps, nodes):
             node = kids[0]
     if topk == 1:
         assert torch.equal(parent, torch.arange(-1, nodes - 1).expand(bs, -1).int())
+
+
+def test_nan_scores_keep_lanes_and_tree_valid():
+    """A padded request's garbage logits must not leave lanes or nodes unset."""
+    bs, topk, steps, nodes, vocab = 2, 4, 3, 8, 50
+    tree = DraftTree(bs, topk, steps, nodes, torch.device(DEVICE))
+    logits = torch.randn(bs, vocab, device=DEVICE)
+    logits[1] = float("nan")
+    tree.seed(bs, logits)
+    lane_logits = torch.randn(bs * topk, vocab, device=DEVICE)
+    lane_logits[topk:] = float("nan")
+    for step in range(1, steps):
+        exp = tree.expand(bs, step, lane_logits)
+        assert exp.parent_lane.min() >= 0 and exp.parent_lane.max() < topk
+    tokens, parent = tree.finalize(
+        bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    )
+    for b in range(bs):
+        for j in range(1, nodes):
+            assert 0 <= int(parent[b, j]) < j
