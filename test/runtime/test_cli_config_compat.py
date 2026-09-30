@@ -751,6 +751,7 @@ class TestCLIConfigCompat(unittest.TestCase):
             (("EAGLE3", 4, 5, 16), {"grammar_backend": "xgrammar"}, "structured"),
             (("EAGLE3", 4, 5, 16), {"enable_mixed_batch": True}, "mixed batches"),
             (("EAGLE3", 4, 5, 16), {"disaggregation_mode": "decode"}, "disaggregation"),
+            (("EAGLE3", 4, 5, 16), {"pipeline_parallel_size": 2}, "pipeline stages"),
         ]
         for (algorithm, topk, steps, nodes), overrides, message in cases:
             with self.subTest(algorithm=algorithm, topk=topk, steps=steps, nodes=nodes):

@@ -49,6 +49,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeDraftInputs,
+    TreeVerifyInputs,
+)
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -417,6 +421,15 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        tree_step = self.tree_lane_step_active or (
+            self.tree_verify is not None and q.shape[0] > bs
+        )
+        if tree_step and (
+            layer.sliding_window_size >= 0 or kwargs.get("sinks") is not None
+        ):
+            raise NotImplementedError(
+                "draft trees have no sliding-window or attention-sink path yet"
+            )
         if self.tree_lane_step_active:
             return self._forward_tree_lanes(q, k, v, layer, token_to_kv_pool, bs)
         if self.block_decode_active:
@@ -439,10 +452,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
         )
         if self.tree_verify is not None and metadata.max_seq_len_q > 1:
-            if layer.sliding_window_size >= 0 or kwargs.get("sinks") is not None:
-                raise NotImplementedError(
-                    "draft-tree verify has no sliding-window or attention-sink path yet"
-                )
             return self._forward_tree_verify(q, layer, token_to_kv_pool, metadata, bs)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         bmm1_scale, bmm2_scale = self._compute_scales(layer)
@@ -467,7 +476,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def bind_tree_verify(self, inputs) -> None:
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
         if self.kv_cache_dtype != self.dtype:
             raise NotImplementedError(
                 f"draft-tree verify reads the window K/V back unquantized; "
@@ -475,7 +484,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             )
         super().bind_tree_verify(inputs)
 
-    def bind_tree_draft(self, inputs) -> None:
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
         if self.kv_cache_dtype != self.dtype:
             raise NotImplementedError(
                 f"draft-tree lanes keep bf16 side K/V; kv_cache_dtype {self.kv_cache_dtype} "

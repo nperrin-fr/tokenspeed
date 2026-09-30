@@ -130,7 +130,7 @@ class TreeSpec:
         self._node_offsets = torch.arange(n, dtype=torch.int64, device=device)
         # Base addresses of the target's per-layer K/V buffers (bind_kv).
         self.kv_buffer_ptrs: torch.Tensor | None = None
-        self.kv_row_elems = 0
+        self.kv_row_elems: int | None = None
 
     @property
     def num_nodes(self) -> int:

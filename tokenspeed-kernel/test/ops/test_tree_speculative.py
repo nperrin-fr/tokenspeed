@@ -185,8 +185,11 @@ def test_merge_with_prefix_equals_full_attention():
         bs * n, hq, d
     )
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-    for base2 in (False, True):
+    for base2, strided_lse in ((False, False), (True, False), (True, True)):
         scale = 1.4426950408889634 if base2 else 1.0
+        prefix_lse = pre_lse * scale
+        if strided_lse:
+            prefix_lse = prefix_lse.t().contiguous().t()
         fused, fused_lse = tree_attention(
             q,
             kt,
@@ -196,7 +199,7 @@ def test_merge_with_prefix_equals_full_attention():
             slots_per_req=n,
             sm_scale=d**-0.5,
             lse_base2=base2,
-            prefix=(pre_out.bfloat16(), pre_lse * scale),
+            prefix=(pre_out.bfloat16(), prefix_lse),
         )
         torch.testing.assert_close(fused.float(), ref, atol=2e-2, rtol=2e-2)
         full_lse = (

@@ -64,6 +64,8 @@ def _tree_attention_kernel(
     stride_pt,
     stride_ph,
     stride_pd,
+    stride_lt,
+    stride_lh,
     sm_scale_log2,
     lse_scale,
     ROWS: tl.constexpr,
@@ -136,7 +138,9 @@ def _tree_attention_kernel(
     if HAS_PREFIX:
         # Merge with the prefix part's state; its LSE is in the output basis.
         p_lse2 = tl.load(
-            prefix_lse_ptr + q_rows * tl.num_programs(1) + head, mask=row_ok, other=0.0
+            prefix_lse_ptr + q_rows * stride_lt + head * stride_lh,
+            mask=row_ok,
+            other=0.0,
         )
         p_lse2 = p_lse2 / lse_scale
         p_out = tl.load(
@@ -225,6 +229,7 @@ def tree_attention(
         *v.stride(),
         *out.stride(),
         *((0, 0, 0) if prefix is None else prefix[0].stride()),
+        *((0, 0) if prefix is None else prefix[1].stride()),
         sm_scale * 1.4426950408889634,
         1.0 if lse_base2 else 0.6931471805599453,
         ROWS=rows_per_req,

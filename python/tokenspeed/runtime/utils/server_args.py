@@ -816,10 +816,11 @@ class ServerArgs:
                 "tree drafting does not support structured output or mixed batches yet: "
                 f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
             )
-        if self.disaggregation_mode != "null":
+        if self.disaggregation_mode != "null" or self.pipeline_parallel_size > 1:
             raise ValueError(
                 "tree drafting does not carry the draft tree across prefill/decode "
-                f"disaggregation yet: {self.disaggregation_mode=}"
+                f"disaggregation or pipeline stages yet: {self.disaggregation_mode=}, "
+                f"{self.pipeline_parallel_size=}"
             )
 
     def resolve_communication(self):

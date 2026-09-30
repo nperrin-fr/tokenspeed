@@ -86,8 +86,8 @@ ops before the lane forward reads them.
 ### Tree construction is deterministic
 
 `DraftTree` keeps the best `N - 1` of the `K + (S - 1) K^2` scored candidates;
-a per-depth tie-break puts every parent strictly ahead of its children, so the
-kept set is a tree. Nodes are numbered depth first with each node's best child
+a child's cumulative log-probability never exceeds its parent's and ties go to
+the lower candidate id (the parent's), so the kept set is a tree. Nodes are numbered depth first with each node's best child
 first, so the most likely path is `0, 1, 2, ...`. NaN scores (padded requests)
 rank last, so lanes and nodes are always fully written.
 
@@ -108,7 +108,8 @@ EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
 attention backend with bf16 KV and one KV cache group, alone or inside the
 hybrid linear-attention backend (GDN, without ReplaySSM); no structured output,
-no mixed batches, no sliding window or attention sinks in the target, and no
+no mixed batches, no pipeline parallelism, no sliding window or attention
+sinks in the target or draft layers, and no
 target that reads request token history or n-gram (Engram) input history.
 
 ## Tests
