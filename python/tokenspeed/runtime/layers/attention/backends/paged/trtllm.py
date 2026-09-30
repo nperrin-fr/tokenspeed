@@ -98,6 +98,12 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
 
 
+# Largest verify window that runs as one xqa kernel; wider trees run the
+# prefix + tree cascade, which is faster there.
+XQA_MAX_TREE_NODES = 16
+XQA_WORKSPACE_BYTES = 128 << 20
+
+
 class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
@@ -121,6 +127,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # the forward with the pool frozen, and under --disable-autotune no
         # earlier forward will have grown the block by then.
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
+        # Draft-tree verify through xqa (bind_tree_verify): its own zeroed workspace.
+        self.xqa_workspace: torch.Tensor | None = None
 
         # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
         # per decode forward and needs non-causal (block-diffusion) attention.
@@ -440,6 +448,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 raise NotImplementedError(
                     "draft-tree verify has no sliding-window or attention-sink path yet"
                 )
+            if self.tree_verify.num_nodes <= XQA_MAX_TREE_NODES:
+                return self._forward_tree_verify_xqa(
+                    q, layer, token_to_kv_pool, metadata, bs
+                )
             return self._forward_tree_verify(
                 q, layer, out_cache_loc, token_to_kv_pool, bs
             )
@@ -473,6 +485,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 f"kv_cache_dtype {self.kv_cache_dtype} is not supported yet"
             )
         super().bind_tree_verify(inputs)
+        if inputs.num_nodes <= XQA_MAX_TREE_NODES:
+            # xqa keeps semaphores in its workspace that must start zeroed;
+            # trtllm-gen dirties the shared one.
+            self.xqa_workspace = torch.zeros(
+                XQA_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
+            )
 
     def bind_tree_draft(self, inputs) -> None:
         if self.kv_cache_dtype != self.dtype:
@@ -481,6 +499,40 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 "is not supported yet"
             )
         super().bind_tree_draft(inputs)
+
+    def _forward_tree_verify_xqa(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        metadata,
+        bs: int,
+    ) -> torch.Tensor:
+        """Verify a draft tree in one xqa kernel: the window rows carry the tree mask."""
+        tree = self.tree_verify
+        nodes = tree.num_nodes
+        heads, kv_heads, dim = layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim
+        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        bmm1_scale, bmm2_scale = self._compute_scales(layer)
+        out = trtllm_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=(
+                k_cache.view(-1, self.kernel_page_size, kv_heads, dim),
+                v_cache.view(-1, self.kernel_page_size, kv_heads, dim),
+            ),
+            workspace_buffer=self.xqa_workspace,
+            block_tables=metadata.page_table,
+            seq_lens=metadata.cache_seqlens_int32,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out_dtype=self.dtype,
+            q_len_per_req=nodes,
+            backend="xqa",
+            mask=tree.packed_mask[: bs * nodes].view(bs, nodes, -1),
+            kv_layout="NHD",
+        )
+        return out.view(-1, heads * dim)
 
     def _forward_tree_verify(
         self,

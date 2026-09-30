@@ -65,6 +65,7 @@ def _draft_tree_finalize_kernel(
     depth = tl.load(depth_ptr + base + ent, mask=ent_ok, other=0)
     score = tl.load(scores_ptr + base + ent, mask=ent_ok, other=float("-inf"))
     score = score - tie_break * depth.to(tl.float32)
+    score = tl.where(score == score, score, float("-inf"))
     parent = tl.load(parent_ptr + base + ent, mask=ent_ok, other=-1)
 
     # Global rank: entries strictly better, ties to the lower entry id.
@@ -77,6 +78,7 @@ def _draft_tree_finalize_kernel(
             scores_ptr + base + other, mask=other_ok, other=float("-inf")
         )
         other_score = other_score - tie_break * other_depth.to(tl.float32)
+        other_score = tl.where(other_score == other_score, other_score, float("-inf"))
         better = (other_score[None, :] > score[:, None]) | (
             (other_score[None, :] == score[:, None]) & (other[None, :] < ent[:, None])
         )
@@ -228,6 +230,8 @@ def _draft_tree_expand_kernel(
     child = tl.load(child_scores_ptr + req * K * K + idx, mask=ok, other=float("-inf"))
     token = tl.load(child_tokens_ptr + req * K * K + idx, mask=ok, other=0)
     score = tl.load(lane_scores_ptr + req * K + lane, mask=ok, other=0.0) + child
+    # NaN (e.g. a padded request's garbage logits) ranks last, so ranks stay a permutation.
+    score = tl.where(score == score, score, float("-inf"))
     parent = tl.load(lane_entry_ptr + req * K + lane, mask=ok, other=-1)
 
     entry = req * num_entries + start + idx
@@ -242,6 +246,7 @@ def _draft_tree_expand_kernel(
         other = tl.load(child_scores_ptr + req * K * K + j) + tl.load(
             lane_scores_ptr + req * K + j // K
         )
+        other = tl.where(other == other, other, float("-inf"))
         rank += ((other > score) | ((other == score) & (j < idx))).to(tl.int32)
     tl.debug_barrier()
     best = ok & (rank < K)

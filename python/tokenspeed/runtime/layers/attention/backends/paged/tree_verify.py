@@ -56,11 +56,19 @@ class TreeVerifyInputs:
         self.cu_query_lens = torch.arange(
             0, (max_bs + 1) * num_nodes, num_nodes, dtype=torch.int32, device=device
         )
+        # The mask as rows of 32-bit words split into uint16 halves (xqa's draft-mask layout).
+        self.mask_words = (num_nodes + 31) // 32 * 2
+        self.packed_mask = torch.zeros(
+            (max_bs * num_nodes, self.mask_words), dtype=torch.uint16, device=device
+        )
 
     def refresh(self, bs: int, seq_lens: torch.Tensor) -> None:
         """Prefix length per request: the window's keys excluded (padded rows keep one key)."""
         torch.clamp_min(seq_lens[:bs] - self.num_nodes, 1, out=self.prefix_lens[:bs])
         torch.cumsum(self.prefix_lens[:bs], 0, out=self.cu_prefix_lens[1 : bs + 1])
+        rows = bs * self.num_nodes
+        halves = self.mask[:rows].view(torch.uint16).view(rows, 4)
+        self.packed_mask[:rows].copy_(halves[:, : self.mask_words])
 
 
 class TreeDraftInputs:
