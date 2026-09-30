@@ -249,7 +249,33 @@ def _fused_gdn_decode_update_kernel(
         )
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    # Step operands are loaded one step ahead, so their latency overlaps the
+    # dependent state update of the current step.
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    n_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+    n_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+    n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+    n_b = tl.load(p_b).to(tl.float32)
+    n_a = tl.load(p_a).to(tl.float32)
     for step_idx in range(0, T):
+        b_q = n_q
+        b_k = n_k
+        b_v = n_v
+        b_b = n_b
+        b_a = n_a
+        has_next = step_idx + 1 < T
+        n_q = tl.load(p_q + Q_STRIDES[1], mask=mask_k & has_next, other=0).to(
+            tl.float32
+        )
+        n_k = tl.load(p_k + K_STRIDES[1], mask=mask_k & has_next, other=0).to(
+            tl.float32
+        )
+        n_v = tl.load(p_v + V_STRIDES[1], mask=mask_v & has_next, other=0).to(
+            tl.float32
+        )
+        n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
         if HAS_PARENT_INDICES:
             parent = tl.load(parent_indices + i_n * T + step_idx)
             if parent != step_idx - 1:
@@ -272,15 +298,6 @@ def _fused_gdn_decode_update_kernel(
                 b_h = tl.load(p_parent, mask=mask_h & (row >= 0), other=0).to(
                     tl.float32
                 )
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_b = tl.load(p_b).to(tl.float32)
-
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
-
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
         softplus_x = tl.where(
