@@ -479,6 +479,17 @@ class ServerArgs:
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
+        if self.speculative_eagle_topk != 1:
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    f"--speculative-eagle-topk {self.speculative_eagle_topk} needs "
+                    "--speculative-algorithm"
+                )
+            if self.speculative_num_draft_tokens is None:
+                raise ValueError(
+                    "--speculative-eagle-topk > 1 drafts a tree; set its node budget "
+                    "with --speculative-num-draft-tokens"
+                )
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
@@ -765,6 +776,15 @@ class ServerArgs:
 
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             self._validate_tree_speculation()
+        elif (
+            self.speculative_algorithm in ("EAGLE3", "MTP")
+            and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+        ):
+            raise ValueError(
+                f"a draft chain verifies speculative_num_steps + 1 = "
+                f"{self.speculative_num_steps + 1} tokens, got "
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
+            )
 
     def _validate_tree_speculation(self) -> None:
         """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""

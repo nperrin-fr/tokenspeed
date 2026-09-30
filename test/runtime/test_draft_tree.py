@@ -81,7 +81,16 @@ def test_tree_ancestry_walks_full_chain(nodes):
 
 
 @pytest.mark.parametrize(
-    "bs,topk,steps,nodes", [(3, 1, 5, 6), (4, 4, 4, 16), (2, 8, 5, 64), (3, 3, 6, 20)]
+    "bs,topk,steps,nodes",
+    [
+        (3, 1, 5, 6),
+        (4, 4, 4, 16),
+        (2, 8, 5, 64),
+        (3, 3, 6, 20),
+        # The largest candidate records validation accepts.
+        (2, 16, 5, 64),
+        (2, 8, 9, 64),
+    ],
 )
 def test_draft_tree_structure(bs, topk, steps, nodes):
     tokens, parent, record = _drive(bs, topk, steps, nodes, vocab=50, seed=nodes)

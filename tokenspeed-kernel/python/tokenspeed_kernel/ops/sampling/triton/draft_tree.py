@@ -24,7 +24,7 @@ Drafting records ``E`` scored candidates per request: token, cumulative
 log-probability, parent candidate (``-1`` under the root) and depth. The tree
 keeps the best ``N - 1`` of them under the root and numbers them depth first,
 each node's children best first, so the most likely path is ``0, 1, 2, ..``.
-One program per request does the whole selection.
+Selection ranks candidates in parallel blocks; ordering runs on the kept nodes only.
 """
 
 from __future__ import annotations
@@ -36,115 +36,113 @@ __all__ = ["draft_tree_expand", "draft_tree_finalize", "tree_ancestry"]
 
 
 @triton.jit
-def _draft_tree_finalize_kernel(
+def _adjusted_scores(scores_ptr, depth_ptr, offs, ok, tie_break):
+    depth = tl.load(depth_ptr + offs, mask=ok, other=0)
+    score = tl.load(scores_ptr + offs, mask=ok, other=float("-inf"))
+    score = score - tie_break * depth.to(tl.float32)
+    return tl.where(score == score, score, float("-inf"))
+
+
+@triton.jit
+def _draft_tree_select_kernel(
     scores_ptr,  # [bs, E] float32
-    parent_ptr,  # [bs, E] int64 parent candidate, -1 under the root
     depth_ptr,  # [bs, E] int64, 1 under the root
-    tokens_ptr,  # [bs, E] int64
-    root_ptr,  # [bs] root token
-    out_tokens_ptr,  # [bs, N] int32
-    out_parent_ptr,  # [bs, N] int32
-    rank_ptr,  # [bs, E_PAD] int32 scratch
-    sibling_ptr,  # [bs, E_PAD] int32 scratch
-    key_ptr,  # [bs, E_PAD] int64 scratch
-    pos_ptr,  # [bs, E_PAD] int32 scratch
-    root_stride,
+    kept_ptr,  # [bs, N - 1] int32 out: kept entry of each global rank
+    slot_ptr,  # [bs, E] int32 out: global rank of each kept entry
     tie_break,
     E: tl.constexpr,
     N: tl.constexpr,
-    MAX_DEPTH: tl.constexpr,
-    RANK_BITS: tl.constexpr,
-    E_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
+    """Program (req, block): global rank of BLOCK entries -- entries strictly
+    better, ties to the lower entry id -- and the best N - 1 by rank."""
     req = tl.program_id(0)
     base = req * E
-    scratch = req * E_PAD
-    ent = tl.arange(0, E_PAD)
+    ent = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     ent_ok = ent < E
-    depth = tl.load(depth_ptr + base + ent, mask=ent_ok, other=0)
-    score = tl.load(scores_ptr + base + ent, mask=ent_ok, other=float("-inf"))
-    score = score - tie_break * depth.to(tl.float32)
-    score = tl.where(score == score, score, float("-inf"))
-    parent = tl.load(parent_ptr + base + ent, mask=ent_ok, other=-1)
-
-    # Global rank: entries strictly better, ties to the lower entry id.
-    rank = tl.zeros([E_PAD], dtype=tl.int32)
-    for start in tl.static_range(0, E_PAD, CHUNK):
+    score = _adjusted_scores(scores_ptr, depth_ptr, base + ent, ent_ok, tie_break)
+    rank = tl.zeros([BLOCK], dtype=tl.int32)
+    for start in range(0, E, CHUNK):
         other = start + tl.arange(0, CHUNK)
         other_ok = other < E
-        other_depth = tl.load(depth_ptr + base + other, mask=other_ok, other=0)
-        other_score = tl.load(
-            scores_ptr + base + other, mask=other_ok, other=float("-inf")
+        other_score = _adjusted_scores(
+            scores_ptr, depth_ptr, base + other, other_ok, tie_break
         )
-        other_score = other_score - tie_break * other_depth.to(tl.float32)
-        other_score = tl.where(other_score == other_score, other_score, float("-inf"))
         better = (other_score[None, :] > score[:, None]) | (
             (other_score[None, :] == score[:, None]) & (other[None, :] < ent[:, None])
         )
         rank += tl.sum((better & other_ok[None, :]).to(tl.int32), axis=1)
-    # A child scores strictly below its parent, so kept nodes form a tree.
+    # A child scores strictly below its parent, so kept entries form a tree.
     kept = ent_ok & (rank < N - 1)
-    tl.store(rank_ptr + scratch + ent, rank)
-    tl.debug_barrier()
+    tl.store(kept_ptr + req * (N - 1) + rank, ent.to(tl.int32), mask=kept)
+    tl.store(slot_ptr + base + ent, rank, mask=kept)
 
-    # Sibling rank among kept nodes, in global rank order.
-    sibling = tl.zeros([E_PAD], dtype=tl.int32)
-    for start in tl.static_range(0, E_PAD, CHUNK):
-        other = start + tl.arange(0, CHUNK)
-        other_ok = other < E
-        other_parent = tl.load(parent_ptr + base + other, mask=other_ok, other=-2)
-        other_rank = tl.load(rank_ptr + scratch + other, mask=other_ok, other=N)
-        ahead = (
-            (other_parent[None, :] == parent[:, None])
-            & (other_rank[None, :] < rank[:, None])
-            & (other_rank[None, :] < N - 1)
-            & other_ok[None, :]
-        )
-        sibling += tl.sum(ahead.to(tl.int32), axis=1)
-    tl.store(sibling_ptr + scratch + ent, sibling)
+
+@triton.jit
+def _draft_tree_order_kernel(
+    parent_ptr,  # [bs, E] int64 parent candidate, -1 under the root
+    depth_ptr,  # [bs, E] int64
+    tokens_ptr,  # [bs, E] int64
+    root_ptr,  # [bs] root token
+    kept_ptr,  # [bs, N - 1] int32 kept entry by global rank
+    slot_ptr,  # [bs, E] int32 global rank of each kept entry
+    out_tokens_ptr,  # [bs, N] int32
+    out_parent_ptr,  # [bs, N] int32
+    sibling_ptr,  # [bs, K_PAD] int32 scratch
+    pos_ptr,  # [bs, K_PAD] int32 scratch
+    root_stride,
+    E: tl.constexpr,
+    N: tl.constexpr,
+    MAX_DEPTH: tl.constexpr,
+    RANK_BITS: tl.constexpr,
+    K_PAD: tl.constexpr,
+):
+    """Number the kept entries depth first, children best first."""
+    req = tl.program_id(0)
+    base = req * E
+    scratch = req * K_PAD
+    slots = tl.arange(0, K_PAD)
+    ok = slots < N - 1
+    ent = tl.load(kept_ptr + req * (N - 1) + slots, mask=ok, other=0)
+    parent = tl.load(parent_ptr + base + ent, mask=ok, other=-2)
+
+    # Sibling rank: kept siblings of better global rank.
+    ahead = (parent[None, :] == parent[:, None]) & (slots[None, :] < slots[:, None])
+    sibling = tl.sum((ahead & ok[None, :]).to(tl.int32), axis=1)
+    tl.store(sibling_ptr + scratch + slots, sibling)
     tl.debug_barrier()
 
     # Depth-first key: (sibling rank + 1) per level from the root down.
-    key = tl.zeros([E_PAD], dtype=tl.int64)
-    cursor = tl.where(kept, ent.to(tl.int64), -1)
+    key = tl.zeros([K_PAD], dtype=tl.int64)
+    cursor = tl.where(ok, slots, -1)
     for _ in tl.static_range(MAX_DEPTH):
         live = cursor >= 0
         safe = tl.where(live, cursor, 0)
-        level = tl.load(depth_ptr + base + safe, mask=live, other=0)
-        digit = (
-            tl.load(sibling_ptr + scratch + safe, mask=live, other=0).to(tl.int64) + 1
-        )
-        key += tl.where(live, digit << ((MAX_DEPTH - level) * RANK_BITS), 0)
+        cur_ent = tl.load(kept_ptr + req * (N - 1) + safe, mask=live, other=0)
+        level = tl.load(depth_ptr + base + cur_ent, mask=live, other=0)
+        digit = tl.load(sibling_ptr + scratch + safe, mask=live, other=0).to(tl.int64)
+        key += tl.where(live, (digit + 1) << ((MAX_DEPTH - level) * RANK_BITS), 0)
+        up = tl.load(parent_ptr + base + cur_ent, mask=live, other=-1)
         cursor = tl.where(
-            live, tl.load(parent_ptr + base + safe, mask=live, other=-1), -1
+            up >= 0,
+            tl.load(slot_ptr + base + tl.where(up >= 0, up, 0), mask=up >= 0, other=-1),
+            -1,
         )
-    tl.store(key_ptr + scratch + ent, key)
+
+    pos = tl.sum(((key[None, :] < key[:, None]) & ok[None, :]).to(tl.int32), axis=1)
+    tl.store(pos_ptr + scratch + slots, pos)
     tl.debug_barrier()
 
-    pos = tl.zeros([E_PAD], dtype=tl.int32)
-    for start in tl.static_range(0, E_PAD, CHUNK):
-        other = start + tl.arange(0, CHUNK)
-        other_ok = other < E
-        other_key = tl.load(key_ptr + scratch + other, mask=other_ok, other=0)
-        other_rank = tl.load(rank_ptr + scratch + other, mask=other_ok, other=N)
-        before = (
-            (other_key[None, :] < key[:, None])
-            & (other_rank < N - 1)[None, :]
-            & other_ok[None, :]
-        )
-        pos += tl.sum(before.to(tl.int32), axis=1)
-    tl.store(pos_ptr + scratch + ent, pos)
-    tl.debug_barrier()
-
-    has_parent = kept & (parent >= 0)
-    parent_pos = tl.load(
-        pos_ptr + scratch + tl.where(has_parent, parent, 0), mask=has_parent, other=-1
+    has_parent = ok & (parent >= 0)
+    parent_slot = tl.load(
+        slot_ptr + base + tl.where(has_parent, parent, 0), mask=has_parent, other=0
     )
+    parent_pos = tl.load(pos_ptr + scratch + parent_slot, mask=has_parent, other=-1)
     node = pos + 1
-    tokens = tl.load(tokens_ptr + base + ent, mask=kept, other=0)
-    tl.store(out_tokens_ptr + req * N + node, tokens.to(tl.int32), mask=kept)
-    tl.store(out_parent_ptr + req * N + node, parent_pos + 1, mask=kept)
+    tokens = tl.load(tokens_ptr + base + ent, mask=ok, other=0)
+    tl.store(out_tokens_ptr + req * N + node, tokens.to(tl.int32), mask=ok)
+    tl.store(out_parent_ptr + req * N + node, parent_pos + 1, mask=ok)
     tl.store(
         out_tokens_ptr + req * N, tl.load(root_ptr + req * root_stride).to(tl.int32)
     )
@@ -397,30 +395,39 @@ def draft_tree_finalize(
     out_parent = torch.empty((bs, num_nodes), dtype=torch.int32, device=device)
     if bs == 0:
         return out_tokens, out_parent
-    e_pad = max(16, triton.next_power_of_2(num_entries))
-    rank = torch.empty((bs, e_pad), dtype=torch.int32, device=device)
-    sibling = torch.empty_like(rank)
-    pos = torch.empty_like(rank)
-    key = torch.empty((bs, e_pad), dtype=torch.int64, device=device)
-    _draft_tree_finalize_kernel[(bs,)](
+    kept = torch.empty((bs, num_nodes - 1), dtype=torch.int32, device=device)
+    slot = torch.empty((bs, num_entries), dtype=torch.int32, device=device)
+    block = 64
+    _draft_tree_select_kernel[(bs, triton.cdiv(num_entries, block))](
         scores,
+        depth,
+        kept,
+        slot,
+        tie_break,
+        E=num_entries,
+        N=num_nodes,
+        BLOCK=block,
+        CHUNK=64,
+    )
+    k_pad = max(16, triton.next_power_of_2(num_nodes - 1))
+    sibling = torch.empty((bs, k_pad), dtype=torch.int32, device=device)
+    pos = torch.empty_like(sibling)
+    _draft_tree_order_kernel[(bs,)](
         parent,
         depth,
         tokens,
         root_tokens,
+        kept,
+        slot,
         out_tokens,
         out_parent,
-        rank,
         sibling,
-        key,
         pos,
         root_tokens.stride(0),
-        tie_break,
         E=num_entries,
         N=num_nodes,
         MAX_DEPTH=max_depth,
         RANK_BITS=rank_bits,
-        E_PAD=e_pad,
-        CHUNK=min(e_pad, 32),
+        K_PAD=k_pad,
     )
     return out_tokens, out_parent

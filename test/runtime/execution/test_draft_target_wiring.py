@@ -208,6 +208,36 @@ def test_multi_depth_mtp_refuses_draft_trees():
         Mtp.bind_tree(drafter, mock.MagicMock())
 
 
+def test_eagle_tree_drafting_ranks_full_vocab_logits():
+    """A fused distributed argmax would leave each TP rank only its vocab shard."""
+    from tokenspeed.runtime.execution.tree_spec import TreeSpecConfig
+
+    drafter = mock.MagicMock(spec=Eagle)
+    drafter.draft_reads_token_history = False
+    drafter.dp_size = 1
+    drafter.device = torch.device("cpu")
+    drafter.hot_token_ids = None
+    drafter.input_buffers = SimpleNamespace(max_bs=2)
+    drafter.token_to_kv_pool = SimpleNamespace(
+        layer_num=1, head_num=1, head_dim=8, dtype=torch.bfloat16
+    )
+    processor = SimpleNamespace(do_argmax=True, config=SimpleNamespace(vocab_size=50))
+    drafter.draft_model_runner = SimpleNamespace(
+        model=SimpleNamespace(logits_processor=processor)
+    )
+    drafter.attn_backend = mock.MagicMock()
+    tree_spec = SimpleNamespace(config=TreeSpecConfig(topk=2, num_steps=3, num_nodes=6))
+
+    Eagle.bind_tree(drafter, tree_spec)
+
+    assert processor.do_argmax is False
+    full = SimpleNamespace(next_token_logits=torch.zeros(2, 50))
+    assert Eagle._tree_logits(drafter, full) is full.next_token_logits
+    shard = SimpleNamespace(next_token_logits=torch.zeros(2, 25))
+    with pytest.raises(RuntimeError, match="ranks all 50 draft tokens"):
+        Eagle._tree_logits(drafter, shard)
+
+
 def test_base_wire_target_is_a_noop():
     drafter = mock.MagicMock(spec=BaseDrafter)
     target_model = mock.MagicMock()

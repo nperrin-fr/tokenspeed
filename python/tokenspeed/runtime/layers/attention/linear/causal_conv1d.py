@@ -1058,20 +1058,24 @@ def causal_conv1d_update(
             in this case, the kernel will not process entries at
             indices 0 and 3
     parent_indices: (batch, seqlen), dtype int32; requires
-        output_state_indices. Draft trees: token t's
+        conv_state_indices and int32 output_state_indices. Draft trees: token t's
         window ends at token parent_indices[b, t] (the initial window when
         negative) instead of token t - 1.
     out: (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
     if parent_indices is not None and (
-        output_state_indices is None
+        conv_state_indices is None
+        or output_state_indices is None
         or parent_indices.shape != output_state_indices.shape
+        or conv_state_indices.shape != parent_indices.shape[:1]
+        or {parent_indices.dtype, output_state_indices.dtype, conv_state_indices.dtype}
+        != {torch.int32}
         or num_accepted_tokens is not None
     ):
         raise ValueError(
-            "parent_indices needs output_state_indices of its shape and no "
-            "num_accepted_tokens"
+            "parent_indices needs int32 conv_state_indices (batch,) and "
+            "output_state_indices of its shape, and no num_accepted_tokens"
         )
     if parent_indices is not None:
         return _causal_conv1d_tree_update(

@@ -91,3 +91,22 @@ def test_tree_windows_match_per_path_reference():
     chain_out = _run(x, chain_state, weight, bias, base, out_rows, None)
     assert torch.equal(out[2], chain_out[2])
     assert torch.equal(state[out_rows[2].long()], chain_state[out_rows[2].long()])
+
+
+@pytest.mark.parametrize("broken", ["no_base", "int64_parents", "base_shape"])
+def test_tree_update_rejects_incomplete_index_state(broken):
+    bs, dim, width, t = 2, 64, 4, 3
+    x = torch.randn(bs, dim, t, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.zeros(1 + bs * (t + 1), dim, width - 1, device="cuda")
+    base = torch.arange(bs, device="cuda", dtype=torch.int32) * (t + 1) + 1
+    out_rows = base[:, None] + 1 + torch.arange(t, device="cuda", dtype=torch.int32)
+    parents = torch.tensor([[-1, 0, 0]] * bs, device="cuda", dtype=torch.int32)
+    if broken == "no_base":
+        base = None
+    elif broken == "int64_parents":
+        parents = parents.long()
+    else:
+        base = base[:1]
+    with pytest.raises(ValueError, match="parent_indices needs int32"):
+        _run(x, conv_state.bfloat16(), weight, None, base, out_rows, parents)

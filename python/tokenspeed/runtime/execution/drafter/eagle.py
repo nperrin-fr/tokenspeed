@@ -167,6 +167,8 @@ class Eagle(BaseDrafter):
         self.tree_spec: TreeSpec | None = None
         self.draft_tree: DraftTree | None = None
         self.tree_lanes: TreeDraftInputs | None = None
+        # Width of the full draft vocabulary the tree ranks (bind_tree).
+        self.tree_vocab_size: int | None = None
 
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
@@ -187,6 +189,14 @@ class Eagle(BaseDrafter):
         config = tree_spec.config
         max_bs = self.input_buffers.max_bs
         pool = self.token_to_kv_pool
+        logits_processor = self.draft_model_runner.model.logits_processor
+        # The fused distributed argmax leaves each TP rank only its vocab shard of the logits.
+        logits_processor.do_argmax = False
+        self.tree_vocab_size = (
+            self.hot_token_ids.numel()
+            if self.hot_token_ids is not None
+            else logits_processor.config.vocab_size
+        )
         self.tree_spec = tree_spec
         self.draft_tree = DraftTree(
             max_bs, config.topk, config.num_steps, config.num_nodes, self.device
@@ -583,11 +593,13 @@ class Eagle(BaseDrafter):
         self.tree_spec.draft_parent_buf[:bs].copy_(parent)
         return tokens
 
-    @staticmethod
-    def _tree_logits(logits_output: LogitsProcessorOutput) -> torch.Tensor:
+    def _tree_logits(self, logits_output: LogitsProcessorOutput) -> torch.Tensor:
         logits = logits_output.next_token_logits
-        if logits is None:
-            raise RuntimeError("tree drafting needs draft logits, not fused token ids")
+        if logits.shape[-1] != self.tree_vocab_size:
+            raise RuntimeError(
+                f"tree drafting ranks all {self.tree_vocab_size} draft tokens, "
+                f"got logits of width {logits.shape[-1]}"
+            )
         return logits
 
     # ------------------------------------------------------------------

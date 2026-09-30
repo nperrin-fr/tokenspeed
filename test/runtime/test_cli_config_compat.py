@@ -757,6 +757,32 @@ class TestCLIConfigCompat(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self._resolve_tree(algorithm, topk, steps, nodes, **overrides)
 
+    def test_speculative_eagle_topk_requires_algorithm_and_node_budget(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--speculative-eagle-topk", "4"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(ValueError, "needs --speculative-algorithm"):
+            sa.resolve_basic_defaults()
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                "EAGLE3",
+                "--speculative-eagle-topk",
+                "4",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(ValueError, "node budget"):
+            sa.resolve_basic_defaults()
+
+    def test_speculative_chain_rejects_mismatched_draft_tokens(self):
+        with self.assertRaisesRegex(ValueError, "draft chain verifies"):
+            self._resolve_tree("EAGLE3", 1, 3, 8)
+        self._resolve_tree("EAGLE3", 1, 3, 4)
+
     def test_dp_sampling_is_opt_in(self):
         args = self._parse_args(["--model", "test/model"])
         sa = self._from_cli_args_no_init(args)
