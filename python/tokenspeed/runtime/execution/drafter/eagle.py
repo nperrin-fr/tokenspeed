@@ -29,11 +29,15 @@ from typing_extensions import override
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.tree import DraftTree
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeDraftInputs,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -42,6 +46,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -158,6 +163,13 @@ class Eagle(BaseDrafter):
                 self.input_buffers.max_bs + 1, dtype=torch.int32, device=self.device
             )
 
+        # Draft-tree state (bind_tree); None for chains.
+        self.tree_spec: TreeSpec | None = None
+        self.draft_tree: DraftTree | None = None
+        self.tree_lanes: TreeDraftInputs | None = None
+        # Parents of the tree drafted this round, [max_bs, N].
+        self.tree_parent_out: torch.Tensor | None = None
+
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
         self.padded_gather_ids_offsets_buf = (
@@ -167,6 +179,32 @@ class Eagle(BaseDrafter):
             * spec_num_tokens
             - 1
         )
+
+    def bind_tree(self, tree_spec: TreeSpec) -> None:
+        """Draft trees: top-K lanes per step (tree.py), lanes attend via the side buffer."""
+        if self.draft_reads_token_history or self.dp_size > 1:
+            raise NotImplementedError(
+                "tree drafting supports neither draft token history nor attention DP yet"
+            )
+        config = tree_spec.config
+        max_bs = self.input_buffers.max_bs
+        pool = self.token_to_kv_pool
+        self.tree_spec = tree_spec
+        self.draft_tree = DraftTree(
+            max_bs, config.topk, config.num_steps, config.num_nodes, self.device
+        )
+        self.tree_lanes = TreeDraftInputs(
+            topk=config.topk,
+            num_steps=config.num_steps,
+            max_bs=max_bs,
+            num_layers=pool.layer_num,
+            num_kv_heads=pool.head_num,
+            head_dim=pool.head_dim,
+            dtype=pool.dtype,
+            device=self.device,
+        )
+        self.attn_backend.bind_tree_draft(self.tree_lanes)
+        self.tree_parent_out = tree_spec.chain_parent.repeat(max_bs, 1)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -487,6 +525,77 @@ class Eagle(BaseDrafter):
                     positions.add_(1)
                     draft_seq_lens.add_(1)
 
+    @nvtx_range("draft_tree", color="purple")
+    def _draft_tree(
+        self,
+        bs: int,
+        draft_input: EagleDraftInput,
+        logits_output: LogitsProcessorOutput,
+        frontier: torch.Tensor,
+        next_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand K lanes for S - 1 steps from the step-0 row, then keep the best tree."""
+        tree, lanes = self.draft_tree, self.tree_lanes
+        topk = tree.topk
+        expansion = tree.seed(bs, self._tree_logits(logits_output))
+        hidden = logits_output.hidden_states.repeat_interleave(topk, dim=0)
+        lane_bits = torch.ones(
+            topk, dtype=torch.int64, device=self.device
+        ) << torch.arange(topk, device=self.device)
+        lane_mask = lanes.lane_mask[: bs * topk].view(bs, topk)
+        lane_mask.copy_(lane_bits.expand(bs, -1))
+        lanes.set_prefix(bs, frontier)
+        positions = frontier.repeat_interleave(topk)
+
+        for step in range(1, self.spec_num_steps):
+            if step > 1:
+                parent = expansion.parent_lane
+                lane_mask.copy_(
+                    torch.gather(lane_mask, 1, parent)
+                    | (lane_bits << ((step - 1) * topk))
+                )
+                hidden = torch.gather(
+                    hidden_out.view(bs, topk, -1),
+                    1,
+                    parent[:, :, None].expand(-1, -1, hidden_out.shape[-1]),
+                ).view(bs * topk, -1)
+            ctx = ForwardContext(
+                bs=bs,
+                num_extends=0,
+                attn_backend=self.attn_backend,
+                token_to_kv_pool=self.token_to_kv_pool,
+                input_num_tokens=bs * topk,
+                forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                global_num_tokens=draft_input.global_num_tokens,
+                global_bs=draft_input.global_bs,
+                all_decode_or_idle=draft_input.all_decode_or_idle,
+            )
+            lanes.step = step
+            with nvtx_range("draft_tree_forward", color="red"):
+                out = self.draft_model_runner.forward(
+                    ctx=ctx,
+                    input_ids=self._map_hot(expansion.lane_tokens.reshape(-1)),
+                    positions=positions + (step - 1),
+                    captured_hidden_states=hidden,
+                    spec_step_idx=step,
+                )
+            lanes.step = None
+            expansion = tree.expand(bs, step, self._tree_logits(out))
+            hidden_out = out.hidden_states
+
+        tokens, parent = tree.finalize(bs, next_tokens[:, 0])
+        tokens[:, 1:] = self._map_hot(tokens[:, 1:].long()).to(torch.int32)
+        self.tree_parent_out[:bs].copy_(parent)
+        return tokens
+
+    @staticmethod
+    def _tree_logits(logits_output: LogitsProcessorOutput) -> torch.Tensor:
+        logits = logits_output.next_token_logits
+        if logits is None:
+            raise RuntimeError("tree drafting needs draft logits, not fused token ids")
+        return logits
+
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)
     # ------------------------------------------------------------------
@@ -502,7 +611,7 @@ class Eagle(BaseDrafter):
         # Layout: column 0 holds the last verified id (the base model's accepted token);
         # columns 1..spec_num_steps hold the drafter's speculative tokens.
         next_tokens = torch.empty(
-            (bs, self.spec_num_steps + 1),
+            (bs, self.spec_num_tokens),
             dtype=torch.int32,
             device=self.device,
         )
@@ -525,8 +634,10 @@ class Eagle(BaseDrafter):
                 indices,
                 out=next_tokens[num_extends:, 0],
             )
-        if self.spec_num_steps > 0:
+        if self.spec_num_tokens > 1:
             next_tokens[:, 1:] = next_tokens[:, :1]
+        if self.tree_spec is not None:
+            self.tree_parent_out[:bs].copy_(self.tree_spec.chain_parent)
 
         # The runner refreshed the draft decode metadata over the target's
         # post-verify lengths (vc + N). Step 0 narrows to the live rows, whose
@@ -538,6 +649,14 @@ class Eagle(BaseDrafter):
         # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
+
+        if self.tree_spec is not None:
+            if self.input_buffers.all_extends_mid_chunk:
+                return next_tokens
+            with self.attn_backend.override_num_extends(0):
+                return self._draft_tree(
+                    bs, draft_input, logits_output, frontier, next_tokens
+                )
 
         if logits_output.next_token_ids is not None:
             draft_ids = logits_output.next_token_ids

@@ -763,12 +763,38 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Only chain speculative decoding is supported.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            self._validate_tree_speculation()
+
+    def _validate_tree_speculation(self) -> None:
+        """Draft trees: EAGLE3 with a node budget the draft can fill and a mask word can hold."""
+        topk = self.speculative_eagle_topk
+        steps = self.speculative_num_steps
+        nodes = self.speculative_num_draft_tokens
+        if self.speculative_algorithm != "EAGLE3":
             raise ValueError(
-                "speculative_eagle_topk > 1 (tree spec) is not currently "
-                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
-                "(topk=1) is wired end-to-end."
+                f"speculative_eagle_topk={topk} (tree drafting) needs "
+                f"--speculative-algorithm EAGLE3, got {self.speculative_algorithm}"
+            )
+        if topk < 1 or not 1 <= steps <= 10:
+            raise ValueError(
+                f"tree drafting needs topk >= 1 and 1..10 steps: {topk=}, {steps=}"
+            )
+        if self.grammar_backend != "none" or self.enable_mixed_batch:
+            raise ValueError(
+                "tree drafting does not support structured output or mixed batches yet: "
+                f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
+            )
+        if (steps - 1) * topk > 64:
+            raise ValueError(
+                f"tree drafting keeps (steps - 1) * topk = {(steps - 1) * topk} lane slots per "
+                "request under a 64-bit ancestor mask; lower topk or steps"
+            )
+        candidates = topk + (steps - 1) * topk * topk
+        if not 2 <= nodes <= min(64, candidates + 1):
+            raise ValueError(
+                f"speculative_num_draft_tokens={nodes} must be in [2, {min(64, candidates + 1)}] "
+                f"for topk={topk} over {steps} steps (root + drafted nodes, at most 64)"
             )
 
     def resolve_communication(self):
@@ -2005,8 +2031,8 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1],
+            help="Children each draft node expands to per step; above 1 the draft is a tree "
+            "(EAGLE3), and --speculative-num-draft-tokens is its node budget.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

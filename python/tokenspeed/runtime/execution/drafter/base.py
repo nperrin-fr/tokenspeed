@@ -136,6 +136,10 @@ class BaseDrafter:
         """
 
     @abstractmethod
+    def bind_tree(self, tree_spec) -> None:
+        """Draft trees (--speculative-eagle-topk > 1); only EAGLE-style drafters expand lanes."""
+        raise NotImplementedError(f"{type(self).__name__} cannot draft trees")
+
     def run(
         self,
         base_ctx: ForwardContext,

@@ -60,6 +60,7 @@ from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
@@ -76,6 +77,9 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeVerifyInputs,
 )
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -226,8 +230,10 @@ class ModelExecutorConfig:
     # ====== SPEC =========
     spec_algo: str | None = None
     spec_num_steps: int | None = None
-    # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
+    # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
+    # Children per draft node per step; above 1 the draft is a tree (tree_spec.py).
+    spec_topk: int = 1
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -327,6 +333,11 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            spec_topk=(
+                server_args.speculative_eagle_topk
+                if server_args.speculative_algorithm
+                else 1
+            ),
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -454,6 +465,10 @@ class ModelExecutor:
         else:
             self.drafter = None
 
+        self.tree_spec: TreeSpec | None = None
+        if config.spec_topk > 1:
+            self._init_tree_spec(max_bs)
+
         self.grammar_runtime = create_grammar_runtime(
             grammar_backend=config.grammar_backend,
             disable_capturable=config.disable_capturable_grammar,
@@ -534,6 +549,41 @@ class ModelExecutor:
 
         logger.info("ModelExecutor initialized")
 
+    def _init_tree_spec(self, max_bs: int) -> None:
+        """Arm draft-tree speculation: shared tree state, verify leaves, drafter."""
+        if not self.sampling_backend.supports_tree_verify:
+            raise NotImplementedError(
+                f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
+                "use --sampling-backend greedy"
+            )
+        config = self.config
+        self.tree_spec = TreeSpec(
+            TreeSpecConfig(
+                topk=config.spec_topk,
+                num_steps=config.spec_num_steps,
+                num_nodes=config.spec_num_tokens,
+            ),
+            max_bs=max_bs,
+            pool_size=self.runtime_states.future_input_map.shape[0],
+            device=torch.device(self.device),
+        )
+        self.attn_backend.bind_tree_verify(
+            TreeVerifyInputs(self.tree_spec.mask_buf, config.spec_num_tokens, max_bs)
+        )
+        self.drafter.bind_tree(self.tree_spec)
+
+    def _compact_accepted_tree(
+        self, bs: int, logits_output: LogitsProcessorOutput
+    ) -> None:
+        """Pack each request's accepted path to the front of its verify window:
+        target hidden rows, target KV, and the window positions back to ``vc + i``."""
+        tree = self.tree_spec
+        tree.compact_rows(bs, logits_output.hidden_states)
+        tree.compact_kv(bs, self.attn_backend.tree_verify_write_locations())
+        tree.chain_positions(
+            bs, self.input_buffers.positions_buf[: bs * tree.num_nodes]
+        )
+
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
         self.attn_backend.configure_runtime(
@@ -559,6 +609,15 @@ class ModelExecutor:
         # mask can see. A block drafter additionally borrows the target's
         # full-history group -- it writes at the target's cache locations.
         bind_cache_groups(self.model_runner.model, self.token_to_kv_pool)
+        if self.tree_spec is not None:
+            pool = self.token_to_kv_pool
+            self.tree_spec.bind_kv(
+                [
+                    buf
+                    for layer in range(pool.layer_num)
+                    for buf in pool.get_kv_buffer(layer)
+                ]
+            )
         draft_runner = self._draft_model_runner
         if draft_runner is not None and self.draft_token_to_kv_pool is not None:
             bind_cache_groups(draft_runner.model, self.draft_token_to_kv_pool)
@@ -1067,9 +1126,14 @@ class ModelExecutor:
         if num_decodes == 0 and num_prefill_outputs == num_extends:
             return self.sampling_backend.sample(logits_output, sampling_info)
         if num_extends == 0:
-            output_tokens, accept_lengths = self.sampling_backend.verify(
-                logits_output, sampling_info, candidates
-            )
+            if self.tree_spec is not None:
+                output_tokens, accept_lengths = self.sampling_backend.verify(
+                    logits_output, sampling_info, candidates, tree=self.tree_spec
+                )
+            else:
+                output_tokens, accept_lengths = self.sampling_backend.verify(
+                    logits_output, sampling_info, candidates
+                )
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
@@ -1237,6 +1301,9 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
+        if self.tree_spec is not None and ctx.num_extends == 0:
+            self._compact_accepted_tree(ctx.bs, logits_output)
+
         if self.drafter is not None:
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
@@ -1256,6 +1323,10 @@ class ModelExecutor:
                 self.runtime_states.future_input_map[indices[requests]] = (
                     next_round_input_ids[requests].to(torch.int32)
                 )
+                if self.tree_spec is not None:
+                    self.tree_spec.future_parent_map[indices[requests]] = (
+                        self.drafter.tree_parent_out[requests]
+                    )
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1638,6 +1709,13 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 ngram_inputs=ngram_inputs,
             )
+            if self.tree_spec is not None and num_extends == 0 and bs > 0:
+                self.tree_spec.load_step(
+                    bs, self.input_buffers.req_pool_indices_buf[:bs]
+                )
+                self.tree_spec.depth_positions(
+                    bs, self.input_buffers.positions_buf[:total_tokens]
+                )
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)
             if self.drafter is not None and hasattr(

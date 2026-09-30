@@ -315,6 +315,9 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
+    # Backends whose verify() takes a draft tree (tree=TreeSpec).
+    supports_tree_verify: bool = False
+
     @abstractmethod
     def sample(
         self,
