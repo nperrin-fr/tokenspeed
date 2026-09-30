@@ -92,9 +92,7 @@ def test_gdn_target_verifies_trees():
 
 def test_draft_with_linear_layers_is_refused():
     with pytest.raises(NotImplementedError, match="draft: .*linear-attention"):
-        resolve_tree_support(
-            _router(_trtllm()), _hybrid(_router(_trtllm()), _mamba())
-        )
+        resolve_tree_support(_router(_trtllm()), _hybrid(_router(_trtllm()), _mamba()))
 
 
 @pytest.mark.parametrize(

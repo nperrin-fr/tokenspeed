@@ -23,6 +23,7 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
+    draft_tree_expand,
     draft_tree_finalize,
     tree_ancestry,
 )
@@ -83,6 +84,46 @@ def test_finalize_keeps_the_best_scores_even_when_nearly_tied():
     )
     assert out_tokens.tolist() == [[9, 10, 11]]
     assert out_parent.tolist() == [[-1, 0, 1]]
+
+
+def test_positive_child_score_cannot_outrank_its_parent():
+    """A child scoring above its parent would leave a kept node's parent unkept."""
+    dev = torch.device(DEVICE)
+    # Two seed lanes: entry 1 (-0.5) and entry 0 (-1.0); each has two children.
+    entry_scores = torch.tensor([[-1.0, -0.5, 0, 0, 0, 0]], device=dev)
+    entry_parent = torch.tensor([[-1, -1, -1, -1, -1, -1]], device=dev)
+    entry_depth = torch.tensor([[1, 1, 0, 0, 0, 0]], device=dev)
+    entry_tokens = torch.tensor([[10, 11, 0, 0, 0, 0]], device=dev)
+    lane_scores = torch.tensor([[-0.5, -1.0]], device=dev)
+    lane_entry = torch.tensor([[1, 0]], device=dev)
+    # Lane 1 (entry 0) proposes a child at +0.6: raw, it would outscore entry 0.
+    child_scores = torch.tensor([[-3.0, -4.0, 0.6, -5.0]], device=dev)
+    child_tokens = torch.tensor([[20, 21, 22, 23]], device=dev)
+    draft_tree_expand(
+        child_scores,
+        child_tokens,
+        lane_scores,
+        lane_entry,
+        entry_scores,
+        entry_parent,
+        entry_depth,
+        entry_tokens,
+        start=2,
+        depth=2,
+        next_lanes=None,
+    )
+    tokens, parent = draft_tree_finalize(
+        entry_scores,
+        entry_parent,
+        entry_depth,
+        entry_tokens,
+        torch.tensor([9], device=dev),
+        num_nodes=3,
+        max_depth=2,
+        rank_bits=6,
+    )
+    for j in range(1, 3):
+        assert 0 <= int(parent[0, j]) < j
 
 
 def test_finalize_keeps_a_parent_tied_with_its_child():

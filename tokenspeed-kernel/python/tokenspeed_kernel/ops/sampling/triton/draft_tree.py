@@ -227,6 +227,8 @@ def _draft_tree_expand_kernel(
     ok = idx < K * K
     lane = idx // K
     child = tl.load(child_scores_ptr + req * K * K + idx, mask=ok, other=float("-inf"))
+    # A child never scores above its parent, which keeps finalize's kept set a tree.
+    child = tl.where(child > 0.0, 0.0, child)
     token = tl.load(child_tokens_ptr + req * K * K + idx, mask=ok, other=0)
     score = tl.load(lane_scores_ptr + req * K + lane, mask=ok, other=0.0) + child
     # NaN (e.g. a padded request's garbage logits) ranks last, so ranks stay a permutation.
@@ -242,7 +244,8 @@ def _draft_tree_expand_kernel(
     # Rank among the K * K children, ties to the lower index; the best K become the lanes.
     rank = tl.zeros([KK_PAD], dtype=tl.int32)
     for j in tl.static_range(K * K):
-        other = tl.load(child_scores_ptr + req * K * K + j) + tl.load(
+        other_child = tl.load(child_scores_ptr + req * K * K + j)
+        other = tl.where(other_child > 0.0, 0.0, other_child) + tl.load(
             lane_scores_ptr + req * K + j // K
         )
         other = tl.where(other == other, other, float("-inf"))
@@ -356,7 +359,9 @@ def draft_tree_finalize(
     """Keep the best ``num_nodes - 1`` candidates under the root, depth first.
 
     Args:
-        scores: ``[bs, E]`` float32 cumulative log-probability per candidate.
+        scores: ``[bs, E]`` float32 cumulative log-probability per candidate;
+            a child never scores above its parent (``draft_tree_expand``
+            guarantees it).
         parent: ``[bs, E]`` int64 parent candidate, ``-1`` under the root; a
             parent precedes its children.
         depth: ``[bs, E]`` int64 candidate depth, 1 under the root.
