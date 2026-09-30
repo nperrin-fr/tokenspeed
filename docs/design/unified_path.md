@@ -478,6 +478,14 @@ the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
 "Write locations have one owner").
 
+One named exception: draft-tree lanes (`docs/design/tree-speculation.md`)
+read `TreeDraftInputs`, which the drafter writes inside the round -- the
+accepted-frontier prefix lengths once, then each step's lane masks, plus the
+lane step index, a Python value fixed per lane forward. The buffers are bound
+once, live at fixed addresses and are written by in-graph ops before each lane
+forward reads them; the draft leaf's decode metadata itself is still
+refreshed only as above.
+
 **Step 0 narrows rows; the drafter owns the lengths, the model names the
 moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
 decode request), writes KV for every row, and continues from one live row

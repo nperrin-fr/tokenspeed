@@ -72,6 +72,14 @@ per-layer side buffer of `(S - 1) * K` slots per request and are valid only
 while the round's tree is drafted; KV prewrite is off on lane steps
 (`support_kv_cache_prewrite`).
 
+Lane attention reads `TreeDraftInputs` (prefix lengths over the accepted
+frontier, the lanes' ancestor masks, and the step index, a Python value fixed
+per lane forward), which the drafter owns and writes within the round: prefix
+lengths once per round, masks by `draft_tree_expand` for the next step. This is the one exception to the
+refresh-only draft metadata contract of `unified_path.md`; it is graph-safe
+because the buffers are bound once at fixed addresses and written by in-graph
+ops before the lane forward reads them.
+
 ### Tree construction is deterministic
 
 `DraftTree` keeps the best `N - 1` of the `K + (S - 1) K^2` scored candidates;

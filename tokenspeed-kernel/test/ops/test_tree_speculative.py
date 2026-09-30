@@ -323,6 +323,26 @@ def test_trtllm_prefix_cascade_matches_reference():
 def test_tree_decode_attention_matches_reference(n, splits, prefix_lens):
     gen = torch.Generator().manual_seed(n * 10 + splits)
     bs, hq, hkv, d, page = 3, 32, 8, 128, 32
+    _check_tree_decode(bs, n, splits, prefix_lens, hq, hkv, d, page, gen)
+
+
+@pytest.mark.parametrize(
+    "hq,hkv,d,n",
+    [
+        (16, 2, 256, 64),
+        (16, 2, 256, 17),
+        (24, 4, 256, 64),
+        (32, 4, 128, 64),
+        (32, 2, 128, 64),
+    ],
+)
+def test_tree_decode_attention_large_query_tiles(hq, hkv, d, n):
+    """N x GQA group beyond one on-chip tile (e.g. GQA 8 at head_dim 256) still launches and matches."""
+    gen = torch.Generator().manual_seed(hq * n + d)
+    _check_tree_decode(2, n, 3, [40, 97], hq, hkv, d, 64, gen)
+
+
+def _check_tree_decode(bs, n, splits, prefix_lens, hq, hkv, d, page, gen):
     q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
         bs, n, prefix_lens, hq, hkv, d, page, gen
     )
@@ -340,6 +360,16 @@ def test_tree_decode_attention_matches_reference(n, splits, prefix_lens):
         num_splits=splits,
     )
     torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_logprob_topk_row_offset_beyond_int32():
+    """rows x vocab past 2**31 elements must address rows in 64 bits."""
+    vocab, rows = 248320, 8700
+    logits = torch.zeros(rows, vocab, device="cuda", dtype=torch.bfloat16)
+    logits[-1, 12345] = 30.0
+    scores, ids = logprob_topk(logits, 2)
+    assert int(ids[-1, 0]) == 12345
+    assert torch.isfinite(scores).all()
 
 
 @pytest.mark.parametrize(

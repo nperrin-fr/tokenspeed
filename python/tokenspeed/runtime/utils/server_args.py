@@ -785,6 +785,15 @@ class ServerArgs:
                 "tree drafting does not support structured output or mixed batches yet: "
                 f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
             )
+        if topk > 16:
+            raise ValueError(
+                f"tree drafting keeps at most 16 children per node, got topk={topk}"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "tree drafting does not carry the draft tree across prefill/decode "
+                f"disaggregation yet: {self.disaggregation_mode=}"
+            )
         if (steps - 1) * topk > 64:
             raise ValueError(
                 f"tree drafting keeps (steps - 1) * topk = {(steps - 1) * topk} lane slots per "

@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -331,4 +332,8 @@ class SamplingBackend(ABC):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+        *,
+        tree: TreeSpec | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify each request's draft window; ``tree`` is the draft tree
+        (``None`` for a chain) and needs ``supports_tree_verify``."""

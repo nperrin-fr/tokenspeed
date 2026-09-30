@@ -156,12 +156,19 @@ def test_expand_prepares_next_lanes():
         hidden_dst = torch.empty_like(hidden_src)
         before = lane_mask.clone()
         exp = tree.expand(
-            bs, step, torch.randn(bs * topk, vocab, device=DEVICE), (lane_mask, hidden_src, hidden_dst)
+            bs,
+            step,
+            torch.randn(bs * topk, vocab, device=DEVICE),
+            (lane_mask, hidden_src, hidden_dst),
         )
         parent = exp.parent_lane
-        own = torch.ones_like(parent) << (step * topk + torch.arange(topk, device=DEVICE))
+        own = torch.ones_like(parent) << (
+            step * topk + torch.arange(topk, device=DEVICE)
+        )
         assert torch.equal(lane_mask, torch.gather(before, 1, parent) | own)
         want = torch.gather(
-            hidden_src.view(bs, topk, width), 1, parent[:, :, None].expand(-1, -1, width)
+            hidden_src.view(bs, topk, width),
+            1,
+            parent[:, :, None].expand(-1, -1, width),
         ).view(bs * topk, width)
         assert torch.equal(hidden_dst, want)

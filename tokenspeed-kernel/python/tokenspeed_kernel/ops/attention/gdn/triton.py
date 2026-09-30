@@ -411,9 +411,10 @@ def _launch_fused_gdn_decode_update(
 
     o = q.new_empty(B, T, HV, V)
 
-    # Verify steps are serial in T; narrower V tiles buy the parallelism (B200, K=V=128).
+    # Tree verify is serial over its nodes; narrower V tiles buy the parallelism
+    # (B200, K=V=128). Chains keep their tiling, and with it their numerics.
     BK, BV = triton.next_power_of_2(K), min(
-        triton.next_power_of_2(V), 8 if T > 1 else 32
+        triton.next_power_of_2(V), 8 if parent_indices is not None else 32
     )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"

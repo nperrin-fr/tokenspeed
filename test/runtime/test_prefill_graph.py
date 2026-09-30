@@ -151,6 +151,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             prefill_only=False,
@@ -1238,6 +1239,7 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
     def _bare_backend(self):
         b = self.mod.TRTLLMMHAAttnBackend.__new__(self.mod.TRTLLMMHAAttnBackend)
         b.kv_cache_dtype = self.torch.bfloat16
+        b.tree_draft = None
         return b
 
     def test_prewrite_disabled_during_breakable_capture(self):
@@ -1298,6 +1300,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             prefill_only=prefill_only,

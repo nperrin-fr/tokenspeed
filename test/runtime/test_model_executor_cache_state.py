@@ -236,7 +236,7 @@ def test_non_spec_decode_routes_through_verify():
     )
     executor.sampling_backend = SimpleNamespace(
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
-        verify=lambda _lo, _si, cand: calls.append(("verify", tuple(cand.shape)))
+        verify=lambda _lo, _si, cand, tree: calls.append(("verify", tuple(cand.shape)))
         or (
             torch.zeros(cand.shape[0], dtype=torch.int32),
             torch.ones(cand.shape[0], dtype=torch.int32),

@@ -67,6 +67,7 @@ from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -483,7 +484,13 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeSpec | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 

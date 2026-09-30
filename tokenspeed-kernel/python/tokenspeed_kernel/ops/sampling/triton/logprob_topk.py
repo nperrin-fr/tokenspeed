@@ -67,7 +67,9 @@ def _logprob_topk_split_kernel(
     for start in range(lo, hi, BLOCK):
         cols = start + offs
         x = tl.load(
-            logits_ptr + row * stride_row + cols, mask=cols < hi, other=float("-inf")
+            logits_ptr + row.to(tl.int64) * stride_row + cols,
+            mask=cols < hi,
+            other=float("-inf"),
         ).to(tl.float32)
         new_max = tl.maximum(run_max, tl.max(x, axis=0))
         safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)

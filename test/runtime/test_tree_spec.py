@@ -33,7 +33,10 @@ def test_compact_packs_kv_hidden_and_positions(nodes):
     gen = torch.Generator().manual_seed(nodes)
     bs, slots, layers, heads, dim, hidden_size = 3, 4096, 3, 2, 128, 3000
     spec = TreeSpec(
-        TreeSpecConfig(topk=4, num_steps=5, num_nodes=nodes), bs, 8, torch.device("cuda")
+        TreeSpecConfig(topk=4, num_steps=5, num_nodes=nodes),
+        bs,
+        8,
+        torch.device("cuda"),
     )
     buffers = [
         torch.randn(slots, heads, dim, generator=gen).bfloat16().cuda()
@@ -82,7 +85,9 @@ def test_fresh_spec_is_the_chain(nodes):
     before = positions.clone()
     spec.bind_kv([torch.zeros(16, 1, 128, dtype=torch.bfloat16, device="cuda")])
     hidden = torch.randn(3 * nodes, 64, device="cuda").bfloat16()
-    spec.compact(3, torch.zeros(3 * nodes, dtype=torch.int32, device="cuda"), hidden, positions)
+    spec.compact(
+        3, torch.zeros(3 * nodes, dtype=torch.int32, device="cuda"), hidden, positions
+    )
     assert torch.equal(positions, before)
     fresh = (spec.depth_buf.clone(), spec.mask_buf.clone())
     spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"))

@@ -122,6 +122,7 @@ def test_chain_shaped_tree_verifies_like_chain(route):
         LogitsProcessorOutput(next_token_logits=logits.clone()),
         _info(req, offsets),
         candidates,
+        tree=None,
     )
     chain_predict, chain_accept = chain_predict.clone(), chain_accept.clone()
     tree = _tree([-1, 0, 1, 2], req)

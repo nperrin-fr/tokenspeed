@@ -703,6 +703,7 @@ class KdaAttnBackend(MambaAttnBackend):
             "the fused KDA verify kernel follows a chain; no draft trees yet"
         )
 
+    @override
     def _verify(
         self,
         mixed_qkv: torch.Tensor,

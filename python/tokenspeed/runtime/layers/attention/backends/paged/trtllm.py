@@ -103,6 +103,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
     supports_tree_verify = True
+    supports_tree_draft = True
     # Both kernel call sites forward layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
 

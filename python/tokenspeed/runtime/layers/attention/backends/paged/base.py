@@ -141,6 +141,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
 
     # Leaves whose verify forward handles a draft-tree mask (tree_verify.py).
     supports_tree_verify: bool = False
+    # Leaves whose draft forward runs draft-tree lanes (tree_verify.py).
+    supports_tree_draft: bool = False
 
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
         if not self.supports_tree_verify:
@@ -151,7 +153,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.tree_verify = inputs
 
     def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
-        if not self.supports_tree_verify:
+        if not self.supports_tree_draft:
             raise NotImplementedError(
                 f"{type(self).__name__} cannot draft trees; use --drafter-attention-backend trtllm"
             )

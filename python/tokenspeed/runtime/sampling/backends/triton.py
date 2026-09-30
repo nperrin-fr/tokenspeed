@@ -663,7 +663,8 @@ class TritonSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
-        tree: TreeSpec | None = None,
+        *,
+        tree: TreeSpec | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]

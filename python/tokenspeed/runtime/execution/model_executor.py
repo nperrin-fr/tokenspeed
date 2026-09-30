@@ -205,6 +205,8 @@ class ModelExecutorConfig:
     global_rank: int
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
+    # Children per draft node per step; above 1 the draft is a tree (tree_spec.py).
+    spec_topk: int
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     # The prefill role of a disaggregated deployment computes prompts only:
@@ -232,8 +234,6 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
-    # Children per draft node per step; above 1 the draft is a tree (tree_spec.py).
-    spec_topk: int = 1
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -551,6 +551,11 @@ class ModelExecutor:
 
     def _init_tree_spec(self, max_bs: int) -> None:
         """Arm draft-tree speculation: shared tree state, verify leaves, drafter."""
+        if self.runtime_states.has_request_token_history:
+            raise NotImplementedError(
+                "draft trees write verify-window tokens in node order; a target that "
+                "reads request token history needs them along the accepted path"
+            )
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
@@ -1132,14 +1137,9 @@ class ModelExecutor:
         if num_decodes == 0 and num_prefill_outputs == num_extends:
             return self.sampling_backend.sample(logits_output, sampling_info)
         if num_extends == 0:
-            if self.tree_spec is not None:
-                output_tokens, accept_lengths = self.sampling_backend.verify(
-                    logits_output, sampling_info, candidates, tree=self.tree_spec
-                )
-            else:
-                output_tokens, accept_lengths = self.sampling_backend.verify(
-                    logits_output, sampling_info, candidates
-                )
+            output_tokens, accept_lengths = self.sampling_backend.verify(
+                logits_output, sampling_info, candidates, tree=self.tree_spec
+            )
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
@@ -1191,6 +1191,7 @@ class ModelExecutor:
                     sampling_info, decode_requests, mask_width=mask_width, prefill=False
                 ),
                 candidates,
+                tree=None,
             )
             lengths = self._apply_force_single_token_verify(
                 lengths, num_extends, num_decodes, ctx.decode_input_ids

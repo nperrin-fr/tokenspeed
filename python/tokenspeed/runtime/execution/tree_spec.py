@@ -69,7 +69,9 @@ def _compact_tree_kernel(
         ok = nodes < N
         depth = tl.load(depth_ptr + req * N + nodes, mask=ok, other=0)
         pos = tl.load(positions_ptr + req * N + nodes, mask=ok, other=0)
-        tl.store(positions_ptr + req * N + nodes, pos + (nodes - depth).to(tl.int64), mask=ok)
+        tl.store(
+            positions_ptr + req * N + nodes, pos + (nodes - depth).to(tl.int64), mask=ok
+        )
     else:
         # The path is increasing, so row d never overwrites a later row's source.
         for d in range(N):

@@ -226,7 +226,7 @@ def tree_attention(
     return out, lse
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_splits"])
 def _tree_decode_split_kernel(
     q_ptr,  # [bs * N, Hq, D]
     k_ptr,  # [slots, Hkv, D] token rows of the paged cache
@@ -234,8 +234,8 @@ def _tree_decode_split_kernel(
     table_ptr,  # [bs, max_pages] int32
     seq_lens_ptr,  # [bs] int32, including the N window keys
     mask_ptr,  # [bs * N] int64
-    part_out_ptr,  # [bs, Hkv, SPLITS, ROWS_PAD, D] float32
-    part_lse_ptr,  # [bs, Hkv, SPLITS, ROWS_PAD] float32, base 2
+    part_out_ptr,  # [bs, Hkv, splits, ROWS_PAD, D] float32
+    part_lse_ptr,  # [bs, Hkv, splits, ROWS_PAD] float32, base 2
     stride_qt,
     stride_qh,
     stride_kt,
@@ -244,20 +244,24 @@ def _tree_decode_split_kernel(
     stride_vh,
     stride_table,
     sm_scale_log2,
+    num_splits,
     N: tl.constexpr,
     GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE: tl.constexpr,
-    SPLITS: tl.constexpr,
     ROWS_PAD: tl.constexpr,
+    ROWS_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     kv_head = tl.program_id(1)
-    split = tl.program_id(2)
+    # Query rows are tiled so the live tile stays within on-chip memory at any N x group.
+    num_row_blocks: tl.constexpr = ROWS_PAD // ROWS_BLOCK
+    split = tl.program_id(2) // num_row_blocks
+    row_block = tl.program_id(2) % num_row_blocks
 
     # Row r is (node r // GROUP, query head kv_head * GROUP + r % GROUP).
-    rows = tl.arange(0, ROWS_PAD)
+    rows = row_block * ROWS_BLOCK + tl.arange(0, ROWS_BLOCK)
     row_ok = rows < N * GROUP
     node = rows // GROUP
     head = kv_head * GROUP + rows % GROUP
@@ -274,13 +278,13 @@ def _tree_decode_split_kernel(
 
     seq_len = tl.load(seq_lens_ptr + req)
     window = seq_len - N
-    span = tl.cdiv(tl.cdiv(seq_len, SPLITS), BLOCK) * BLOCK
+    span = tl.cdiv(tl.cdiv(seq_len, num_splits), BLOCK) * BLOCK
     start = split * span
     end = tl.minimum(seq_len, start + span)
 
-    run_max = tl.full([ROWS_PAD], float("-inf"), tl.float32)
-    run_sum = tl.zeros([ROWS_PAD], dtype=tl.float32)
-    acc = tl.zeros([ROWS_PAD, HEAD_DIM], dtype=tl.float32)
+    run_max = tl.full([ROWS_BLOCK], float("-inf"), tl.float32)
+    run_sum = tl.zeros([ROWS_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([ROWS_BLOCK, HEAD_DIM], dtype=tl.float32)
     cols = tl.arange(0, BLOCK)
     for tile in range(start, end, BLOCK):
         pos = tile + cols
@@ -314,7 +318,7 @@ def _tree_decode_split_kernel(
         acc = acc * alpha[:, None] + tl.dot(probs.to(v.dtype), v)
         run_max = new_max
 
-    part = (req * tl.num_programs(1) + kv_head) * SPLITS + split
+    part = (req * tl.num_programs(1) + kv_head) * num_splits + split
     safe_sum = tl.where(run_sum > 0.0, run_sum, 1.0)
     tl.store(
         part_out_ptr + (part * ROWS_PAD + rows)[:, None] * HEAD_DIM + dims[None, :],
@@ -324,17 +328,17 @@ def _tree_decode_split_kernel(
     tl.store(part_lse_ptr + part * ROWS_PAD + rows, lse)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_splits"])
 def _tree_decode_reduce_kernel(
     part_out_ptr,
     part_lse_ptr,
     out_ptr,  # [bs * N, Hq, D]
     stride_ot,
     stride_oh,
+    num_splits,
     N: tl.constexpr,
     GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    SPLITS: tl.constexpr,
     ROWS_PAD: tl.constexpr,
     ROWS_BLOCK: tl.constexpr,
     DIM_BLOCK: tl.constexpr,
@@ -345,14 +349,14 @@ def _tree_decode_reduce_kernel(
     rows = (tl.program_id(2) // num_dim_blocks) * ROWS_BLOCK + tl.arange(0, ROWS_BLOCK)
     row_ok = rows < N * GROUP
     dims = (tl.program_id(2) % num_dim_blocks) * DIM_BLOCK + tl.arange(0, DIM_BLOCK)
-    base = (req * tl.num_programs(1) + kv_head) * SPLITS
+    base = (req * tl.num_programs(1) + kv_head) * num_splits
     top = tl.full([ROWS_BLOCK], float("-inf"), tl.float32)
-    for s in tl.static_range(SPLITS):
+    for s in range(0, num_splits):
         top = tl.maximum(top, tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows))
     safe_top = tl.where(top == float("-inf"), 0.0, top)
     total = tl.zeros([ROWS_BLOCK], dtype=tl.float32)
     acc = tl.zeros([ROWS_BLOCK, DIM_BLOCK], dtype=tl.float32)
-    for s in tl.static_range(SPLITS):
+    for s in range(0, num_splits):
         weight = tl.exp2(
             tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows) - safe_top
         )
@@ -432,14 +436,12 @@ def tree_decode_attention(
     part_lse = torch.empty(
         (bs, num_kv_heads, num_splits, rows_pad), dtype=torch.float32, device=q.device
     )
-    common = dict(
-        N=num_nodes,
-        GROUP=group,
-        HEAD_DIM=head_dim,
-        SPLITS=num_splits,
-        ROWS_PAD=rows_pad,
-    )
-    _tree_decode_split_kernel[(bs, num_kv_heads, num_splits)](
+    common = dict(N=num_nodes, GROUP=group, HEAD_DIM=head_dim, ROWS_PAD=rows_pad)
+    # At most 16K fp32 accumulator elements per program: 128 rows at head_dim 128, 64 at 256.
+    rows_block = min(rows_pad, 16384 // head_dim)
+    _tree_decode_split_kernel[
+        (bs, num_kv_heads, num_splits * (rows_pad // rows_block))
+    ](
         q,
         k_cache,
         v_cache,
@@ -456,9 +458,11 @@ def tree_decode_attention(
         v_cache.stride(1),
         page_table.stride(0),
         sm_scale * 1.4426950408889634,
+        num_splits,
         PAGE=page_size,
         BLOCK=64,
-        num_warps=8 if rows_pad * head_dim >= 128 * 128 else 4,
+        ROWS_BLOCK=rows_block,
+        num_warps=8 if rows_block * head_dim >= 128 * 128 else 4,
         **common,
     )
     dim_block = min(head_dim, 64)
@@ -470,6 +474,7 @@ def tree_decode_attention(
         out,
         out.stride(0),
         out.stride(1),
+        num_splits,
         ROWS_BLOCK=16,
         DIM_BLOCK=dim_block,
         **common,
