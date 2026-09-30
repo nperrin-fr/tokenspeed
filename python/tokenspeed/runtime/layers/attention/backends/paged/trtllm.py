@@ -507,11 +507,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         return out.view(-1, layer.tp_q_head_num * dim)
 
     def _tree_verify_splits(self, bs: int, kv_heads: int) -> int:
-        """Enough KV splits to give every SM about two (request, KV head, split) programs."""
+        """About two (request, KV head, split) programs per SM, at most 16 splits."""
         if bs not in self.tree_verify_splits:
             sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             self.tree_verify_splits[bs] = max(
-                1, min(32, -(-2 * sms // (bs * kv_heads)))
+                1, min(16, -(-2 * sms // (bs * kv_heads)))
             )
         return self.tree_verify_splits[bs]
 

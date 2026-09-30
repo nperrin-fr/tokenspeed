@@ -337,19 +337,21 @@ def _tree_decode_reduce_kernel(
     SPLITS: tl.constexpr,
     ROWS_PAD: tl.constexpr,
     ROWS_BLOCK: tl.constexpr,
+    DIM_BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
     kv_head = tl.program_id(1)
-    rows = tl.program_id(2) * ROWS_BLOCK + tl.arange(0, ROWS_BLOCK)
+    num_dim_blocks: tl.constexpr = HEAD_DIM // DIM_BLOCK
+    rows = (tl.program_id(2) // num_dim_blocks) * ROWS_BLOCK + tl.arange(0, ROWS_BLOCK)
     row_ok = rows < N * GROUP
-    dims = tl.arange(0, HEAD_DIM)
+    dims = (tl.program_id(2) % num_dim_blocks) * DIM_BLOCK + tl.arange(0, DIM_BLOCK)
     base = (req * tl.num_programs(1) + kv_head) * SPLITS
     top = tl.full([ROWS_BLOCK], float("-inf"), tl.float32)
     for s in tl.static_range(SPLITS):
         top = tl.maximum(top, tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows))
     safe_top = tl.where(top == float("-inf"), 0.0, top)
     total = tl.zeros([ROWS_BLOCK], dtype=tl.float32)
-    acc = tl.zeros([ROWS_BLOCK, HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([ROWS_BLOCK, DIM_BLOCK], dtype=tl.float32)
     for s in tl.static_range(SPLITS):
         weight = tl.exp2(
             tl.load(part_lse_ptr + (base + s) * ROWS_PAD + rows) - safe_top
@@ -456,10 +458,20 @@ def tree_decode_attention(
         sm_scale * 1.4426950408889634,
         PAGE=page_size,
         BLOCK=64,
-        num_warps=8 if rows_pad >= 128 else 4,
+        num_warps=8 if rows_pad * head_dim >= 128 * 128 else 4,
         **common,
     )
-    _tree_decode_reduce_kernel[(bs, num_kv_heads, rows_pad // 16)](
-        part_out, part_lse, out, out.stride(0), out.stride(1), ROWS_BLOCK=16, **common
+    dim_block = min(head_dim, 64)
+    _tree_decode_reduce_kernel[
+        (bs, num_kv_heads, rows_pad // 16 * (head_dim // dim_block))
+    ](
+        part_out,
+        part_lse,
+        out,
+        out.stride(0),
+        out.stride(1),
+        ROWS_BLOCK=16,
+        DIM_BLOCK=dim_block,
+        **common,
     )
     return out
