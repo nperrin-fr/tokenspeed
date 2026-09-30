@@ -737,9 +737,10 @@ class TritonSamplingBackend(SamplingBackend):
 
         if tree is not None:
             tree.path_buf[:bs].copy_(accept_index)
-            # predict is packed along the path; score it against the path's own rows.
-            logits = logits.index_select(0, tree.path_rows(bs))
         if self.config.enable_output_logprobs:
+            if tree is not None:
+                # predict is packed along the path; score it against the path's own rows.
+                logits = logits.index_select(0, tree.path_rows(bs))
             self._write_logprob_outputs(
                 logits_output,
                 logits,

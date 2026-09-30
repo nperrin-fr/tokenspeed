@@ -583,10 +583,11 @@ class ModelExecutor:
         """Pack each request's accepted path to the front of its verify window:
         target hidden rows, target KV, and the window positions back to ``vc + i``."""
         tree = self.tree_spec
-        tree.compact_rows(bs, logits_output.hidden_states)
-        tree.compact_kv(bs, self.attn_backend.tree_verify_write_locations())
-        tree.chain_positions(
-            bs, self.input_buffers.positions_buf[: bs * tree.num_nodes]
+        tree.compact(
+            bs,
+            self.attn_backend.tree_verify_write_locations(),
+            logits_output.hidden_states,
+            self.input_buffers.positions_buf[: bs * tree.num_nodes],
         )
 
     def _configure_for_pools(self) -> None:

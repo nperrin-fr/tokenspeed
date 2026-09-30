@@ -42,27 +42,52 @@ __all__ = ["TreeSpec", "TreeSpecConfig"]
 
 
 @triton.jit
-def _compact_kv_kernel(
-    buffers_ptr,  # [num_buffers] int64 base addresses of the per-layer K/V buffers
+def _compact_tree_kernel(
+    buffers_ptr,  # [NUM_KV] int64 base addresses of the per-layer K/V buffers
     locs_ptr,  # [bs * N] int32 verify write slots
     path_ptr,  # [bs, N] int32 accepted path, -1 past it
+    hidden_ptr,  # [bs * N, hidden] verify hidden rows
+    stride_hidden,
+    positions_ptr,  # [bs * N] int64 window positions
+    depth_ptr,  # [bs, N] int32 node depth
+    NUM_KV: tl.constexpr,
     ROW: tl.constexpr,
+    HIDDEN: tl.constexpr,
     N: tl.constexpr,
+    N_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    buf = tl.load(buffers_ptr + tl.program_id(0)).to(tl.pointer_type(tl.bfloat16))
+    """Program (i, req): K/V buffer i < NUM_KV, the hidden rows at NUM_KV, the
+    positions at NUM_KV + 1 -- each packs request req's accepted path to the
+    front of its window."""
+    which = tl.program_id(0)
     req = tl.program_id(1)
     offs = tl.arange(0, BLOCK)
-    # The path is increasing, so row d never overwrites a later row's source.
-    for d in range(N):
-        src = tl.load(path_ptr + req * N + d)
-        if (src >= 0) & (src != d):
-            src_loc = tl.load(locs_ptr + req * N + src).to(tl.int64)
-            dst_loc = tl.load(locs_ptr + req * N + d).to(tl.int64)
-            for start in range(0, ROW, BLOCK):
-                cols = start + offs
-                row = tl.load(buf + src_loc * ROW + cols, mask=cols < ROW)
-                tl.store(buf + dst_loc * ROW + cols, row, mask=cols < ROW)
+    if which == NUM_KV + 1:
+        # Row i now holds the path node at depth i: back from vc + depth to vc + i.
+        nodes = tl.arange(0, N_PAD)
+        ok = nodes < N
+        depth = tl.load(depth_ptr + req * N + nodes, mask=ok, other=0)
+        pos = tl.load(positions_ptr + req * N + nodes, mask=ok, other=0)
+        tl.store(positions_ptr + req * N + nodes, pos + (nodes - depth).to(tl.int64), mask=ok)
+    else:
+        # The path is increasing, so row d never overwrites a later row's source.
+        for d in range(N):
+            src = tl.load(path_ptr + req * N + d)
+            if (src >= 0) & (src != d):
+                if which < NUM_KV:
+                    buf = tl.load(buffers_ptr + which).to(tl.pointer_type(tl.bfloat16))
+                    src_row = buf + tl.load(locs_ptr + req * N + src).to(tl.int64) * ROW
+                    dst_row = buf + tl.load(locs_ptr + req * N + d).to(tl.int64) * ROW
+                    width = ROW
+                else:
+                    src_row = hidden_ptr + (req * N + src).to(tl.int64) * stride_hidden
+                    dst_row = hidden_ptr + (req * N + d).to(tl.int64) * stride_hidden
+                    width = HIDDEN
+                for start in range(0, width, BLOCK):
+                    cols = start + offs
+                    row = tl.load(src_row + cols, mask=cols < width)
+                    tl.store(dst_row + cols, row, mask=cols < width)
 
 
 @dataclass(frozen=True)
@@ -84,7 +109,7 @@ class TreeSpec:
         # Next round's tree per request pool slot; the drafter writes it next to future_input_map.
         self.future_parent_map = self.chain_parent.repeat(pool_size, 1)
         self.parent_buf = self.chain_parent.repeat(max_bs, 1)
-        # The chain the parents describe, so graph warmup's chain_positions (no load_step) is a no-op.
+        # The chain the parents describe, so graph warmup's compact (no load_step) is a no-op.
         self.depth_buf = torch.arange(n, dtype=torch.int32, device=device).repeat(
             max_bs, 1
         )
@@ -126,22 +151,12 @@ class TreeSpec:
         view = positions.view(bs, self.num_nodes)
         view.add_(self.depth_buf[:bs] - self._node_offsets.to(view.dtype))
 
-    def chain_positions(self, bs: int, positions: torch.Tensor) -> None:
-        """Back to ``vc + i``: after compaction row ``i`` holds the path node at depth ``i``."""
-        view = positions.view(bs, self.num_nodes)
-        view.add_(self._node_offsets.to(view.dtype) - self.depth_buf[:bs])
-
     def path_rows(self, bs: int) -> torch.Tensor:
         """``[bs * N]`` source row of each packed row: the accepted path first, then identity."""
         n = self.num_nodes
         path = self.path_buf[:bs].long()
         local = torch.where(path >= 0, path, self._node_offsets)
         return (local + torch.arange(bs, device=path.device)[:, None] * n).view(-1)
-
-    def compact_rows(self, bs: int, rows: torch.Tensor) -> None:
-        """Move each request's accepted-path rows to the front of its window, in place."""
-        src = self.path_rows(bs)
-        rows[: bs * self.num_nodes].copy_(rows.index_select(0, src))
 
     def bind_kv(self, kv_buffers: list[torch.Tensor]) -> None:
         """Record the target's K/V buffers compaction moves rows in.
@@ -165,19 +180,37 @@ class TreeSpec:
             device=kv_buffers[0].device,
         )
 
-    def compact_kv(self, bs: int, write_locations: torch.Tensor) -> None:
-        """Copy the accepted path's KV into the window's leading slots, every layer.
+    def compact(
+        self,
+        bs: int,
+        write_locations: torch.Tensor,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Pack each request's accepted path to the front of its verify window,
+        in one launch: target KV (every layer), hidden rows, and the positions
+        back to ``vc + i`` (row ``i`` then holds the path node at depth ``i``).
 
         Args:
             write_locations: ``[bs * N]`` verify write slots of the window.
+            hidden: ``[bs * N, hidden]`` verify hidden rows, compacted in place.
+            positions: ``[bs * N]`` int64 window positions, shifted in place.
         """
         if bs == 0:
             return
-        _compact_kv_kernel[(self.kv_buffer_ptrs.shape[0], bs)](
+        n = self.num_nodes
+        _compact_tree_kernel[(self.kv_buffer_ptrs.shape[0] + 2, bs)](
             self.kv_buffer_ptrs,
             write_locations,
             self.path_buf,
+            hidden,
+            hidden.stride(0),
+            positions,
+            self.depth_buf,
+            NUM_KV=self.kv_buffer_ptrs.shape[0],
             ROW=self.kv_row_elems,
-            N=self.num_nodes,
-            BLOCK=min(triton.next_power_of_2(self.kv_row_elems), 1024),
+            HIDDEN=hidden.shape[1],
+            N=n,
+            N_PAD=max(16, triton.next_power_of_2(n)),
+            BLOCK=1024,
         )
