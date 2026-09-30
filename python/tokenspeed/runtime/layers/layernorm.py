@@ -34,9 +34,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils import (
-    get_colorful_logger,
-)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _platform = current_platform()
@@ -79,9 +76,6 @@ elif _platform.is_nvidia:
     _allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
 else:
     _allreduce_residual_rmsnorm = _torch_allreduce_residual_rmsnorm
-
-
-logger = get_colorful_logger(__name__)
 
 
 def _get_process_group(group: tuple[int, ...]):

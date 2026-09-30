@@ -20,14 +20,11 @@
 
 """NVFP4 quantization config for tokenspeed runtime (ModelOpt-produced checkpoints)."""
 
-import logging
 from typing import Any
 
 import torch
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-
-logger = logging.getLogger(__name__)
 
 
 class Nvfp4Config(QuantizationConfig):

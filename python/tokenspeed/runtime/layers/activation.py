@@ -30,14 +30,9 @@ import torch
 from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.utils import (
-    get_colorful_logger,
-)
 from tokenspeed.runtime.utils.triton import tl, triton
 
 _is_amd = current_platform().is_amd
-
-logger = get_colorful_logger(__name__)
 
 
 class SiluAndMul(torch.nn.Module):

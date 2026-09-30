@@ -44,7 +44,6 @@ to bf16 at load time (see :data:`_FP8_PB_WO_DEQUANT_LEAVES` and
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -60,8 +59,6 @@ from tokenspeed.runtime.layers.quantization.utils import (
     modelopt_block_scale_to_2d,
     should_exclude_quant_module,
 )
-
-logger = logging.getLogger(__name__)
 
 _MOE_CONFIG_ATTRS = {
     "NVFP4": "nvfp4_config",
