@@ -84,8 +84,17 @@ class TreeSpec:
         # Next round's tree per request pool slot; the drafter writes it next to future_input_map.
         self.future_parent_map = self.chain_parent.repeat(pool_size, 1)
         self.parent_buf = self.chain_parent.repeat(max_bs, 1)
-        self.depth_buf = torch.zeros((max_bs, n), dtype=torch.int32, device=device)
-        self.mask_buf = torch.zeros((max_bs * n,), dtype=torch.int64, device=device)
+        # The chain the parents describe, so graph warmup's chain_positions (no load_step) is a no-op.
+        self.depth_buf = torch.arange(n, dtype=torch.int32, device=device).repeat(
+            max_bs, 1
+        )
+        chain_mask = [(1 << (i + 1)) - 1 for i in range(n)]
+        chain_mask = [
+            m - (1 << 64) if m >> 63 else m for m in chain_mask
+        ]  # bit 63 is the sign
+        self.mask_buf = torch.tensor(
+            chain_mask, dtype=torch.int64, device=device
+        ).repeat(max_bs)
         # Verify writes the accepted path here (root first, -1 past it).
         self.path_buf = torch.full((max_bs, n), -1, dtype=torch.int32, device=device)
         self._node_offsets = torch.arange(n, dtype=torch.int64, device=device)

@@ -58,3 +58,22 @@ def test_compact_kv_moves_accepted_path_every_layer(nodes):
 
     for got, want in zip(buffers, expected):
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("nodes", [8, 64])
+def test_fresh_spec_is_the_chain(nodes):
+    """Graph warmup runs chain_positions without a load_step; it must leave positions alone."""
+    spec = TreeSpec(
+        TreeSpecConfig(topk=1, num_steps=nodes - 1, num_nodes=nodes),
+        3,
+        8,
+        torch.device("cuda"),
+    )
+    positions = torch.arange(3 * nodes, dtype=torch.int64, device="cuda") + 100
+    before = positions.clone()
+    spec.chain_positions(3, positions)
+    assert torch.equal(positions, before)
+    fresh = (spec.depth_buf.clone(), spec.mask_buf.clone())
+    spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"))
+    assert torch.equal(spec.depth_buf, fresh[0])
+    assert torch.equal(spec.mask_buf, fresh[1])
