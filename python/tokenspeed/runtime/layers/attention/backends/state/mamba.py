@@ -447,7 +447,7 @@ class MambaAttnBackend(AttentionBackend):
         linear_attn = config.component(LinearAttnConfig)
         self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
         self._gdn_replay: _GDNReplayWorkspace | None = None
-        # Draft-tree verify (bind_tree_verify): per-node parents and the accepted path.
+        # Draft-tree verify (bind_tree_verify): per-node parents.
         self.tree_verify: TreeVerifyInputs | None = None
         self._verify_scratch = None
         self._verify_commit_ctx = None

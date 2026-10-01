@@ -26,6 +26,7 @@ Supports sliding window, attention sinks, and FP8 KV cache.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -66,6 +67,11 @@ if TYPE_CHECKING:
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+
+@functools.cache
+def _multiprocessor_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
@@ -125,9 +131,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # the forward with the pool frozen, and under --disable-autotune no
         # earlier forward will have grown the block by then.
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
-        self.num_sms = torch.cuda.get_device_properties(
-            config.device
-        ).multi_processor_count
         # Draft-tree lanes (bind_tree_draft): per-layer side K/V of the lane
         # slots and each step's (request, lane) slot rows.
         self.tree_side_k: list[torch.Tensor] = []
@@ -162,8 +165,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_decode_metadata = None
         self.spec_cache_seqlens_buf = None
         self._verify_views_by_bs = {}
-        if self.tree_draft is not None and not self.tree_side_k:
-            self._allocate_tree_side_buffers()
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -482,9 +483,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        if self.cache_pool is None:
+            raise RuntimeError("draft-tree lanes bind after the leaf's cache pool")
         super().bind_tree_draft(inputs)
-        if self.cache_pool is not None:
-            self._allocate_tree_side_buffers()
+        self._allocate_tree_side_buffers()
 
     def _allocate_tree_side_buffers(self) -> None:
         """Side K/V for every draft layer's lane slots, sized from the bound pool."""
@@ -544,7 +546,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
     def _tree_verify_splits(self, bs: int, kv_heads: int) -> int:
         """About two (request, KV head, split) programs per SM, at most 16 splits."""
-        return max(1, min(16, ceil_div(2 * self.num_sms, bs * kv_heads)))
+        sms = _multiprocessor_count(torch.device(self.device))
+        return max(1, min(16, ceil_div(2 * sms, bs * kv_heads)))
 
     def _forward_tree_lanes(
         self,

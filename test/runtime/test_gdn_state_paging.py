@@ -1099,7 +1099,7 @@ class VerifyMetadataTest(unittest.TestCase):
             patch.object(mamba_module, "copy_state_rows", recorded_copy),
             patch.object(mamba_module, "state_verify_commit_rows", reference_rows),
         ):
-            self.backend.commit_verified_state(accepted)
+            self.backend.commit_verified_state(accepted, accepted_path=None)
 
         self.assertEqual(len(resolve_calls), 2)
         self.assertEqual(
@@ -1210,7 +1210,9 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 torch.profiler.ProfilerActivity.CUDA,
                             ]
                         ) as profile:
-                            backend.commit_verified_state(accepted[:live_bs])
+                            backend.commit_verified_state(
+                                accepted[:live_bs], accepted_path=None
+                            )
                             torch.cuda.synchronize()
                     events = profile.events()
                     gpu_kernels = [

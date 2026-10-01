@@ -248,8 +248,8 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
     replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     scratch_out = _prepare_verify(scratch_backend, scratch_pool, inputs)
     accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
-    replay_backend.commit_verified_state(accepted)
-    scratch_backend.commit_verified_state(accepted)
+    replay_backend.commit_verified_state(accepted, accepted_path=None)
+    scratch_backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(replay_out, scratch_out, atol=0.0, rtol=0.0)
@@ -323,7 +323,7 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     recurrent[torch.tensor([5, 6], device=DEVICE)].fill_(float("nan"))
     graph.replay()
     backend.commit_verified_state(
-        torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
+        torch.tensor([1, 3], dtype=torch.int32, device=DEVICE), accepted_path=None
     )
     torch.cuda.synchronize()
 
@@ -387,8 +387,8 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
 
     monkeypatch.setattr(backend_ops, "gdn_replay_commit", counted_commit)
     accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
-    replay_backend.commit_verified_state(accepted)
-    scratch_backend.commit_verified_state(accepted)
+    replay_backend.commit_verified_state(accepted, accepted_path=None)
+    scratch_backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
 
     assert launch_calls == 1
