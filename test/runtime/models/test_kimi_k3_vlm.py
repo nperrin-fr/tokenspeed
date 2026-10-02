@@ -254,4 +254,3 @@ def test_kimi_k3_encoder_graph_targets_top_level_image_encoder(monkeypatch):
     for wrapper in (singular, wrappers["image_encoder"]):
         assert wrapper.adapter.tower is model.vision.vision_tower.encoder
         assert wrapper.capture_tp_size == 1
-        assert wrapper.capture_tp_group == (5,)

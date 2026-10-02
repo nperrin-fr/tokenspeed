@@ -101,7 +101,6 @@ def test_runner_restores_order_and_preserves_eager_fallback():
         dtype=torch.float32,
         modality_name="image",
         capture_tp_size=1,
-        capture_tp_group=None,
     )
     runner = EncoderForwardStepRunner(
         adapter=adapter,

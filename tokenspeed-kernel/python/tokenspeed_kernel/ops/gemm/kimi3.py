@@ -1450,10 +1450,8 @@ _ROUTER_CUDA_MAX_TOKENS = 4
 
 def _ll_bf16_usable(hidden_states: torch.Tensor, weight: torch.Tensor, m: int) -> bool:
     """Whether the vendored CuTe dot-product router GEMM can serve this call."""
-    try:
-        from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
-    except ImportError:
-        return False
+    from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
+
     return ll_bf16_router_supported(hidden_states, weight, m)
 
 

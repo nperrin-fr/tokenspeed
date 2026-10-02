@@ -999,7 +999,6 @@ class MoonViTVisionPath(nn.Module):
                 modality_name="image",
                 out_squeeze_dim=0,
                 capture_tp_size=mapping.vision.tp_size,
-                capture_tp_group=mapping.vision.tp_group,
             ),
             budget_range=(256, 16384),
         )

@@ -66,7 +66,6 @@ class TrtllmAllReduceBackend(CommBackend):
         group: Group,
         max_token_num: int,
         hidden_dim: int,
-        use_fp32_lamport: bool = False,
     ) -> bool:
         """Arm the group's shared fusion workspace.  Returns True on success."""
         if group in self._resources:
@@ -98,7 +97,6 @@ class TrtllmAllReduceBackend(CommBackend):
                 group=device_group,
                 max_token_num=max_token_num,
                 hidden_dim=hidden_dim,
-                use_fp32_lamport=use_fp32_lamport,
             ):
                 return False
 
@@ -116,17 +114,6 @@ class TrtllmAllReduceBackend(CommBackend):
 
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
-
-    def oneshot_hidden_dim(self, group: Group) -> int:
-        """Hidden lane width the group's workspace is armed for (0 if unarmed)."""
-        res = self._resources.get(group)
-        if res is None:
-            return 0
-        from tokenspeed_kernel.ops.communication.trtllm import (
-            armed_workspace_hidden_dim,
-        )
-
-        return armed_workspace_hidden_dim(res["device_group"])
 
     def ensure_group_lane(self, group: Group, hidden_dim: int) -> bool:
         """Widen *group*'s one-shot lane to at least *hidden_dim*.

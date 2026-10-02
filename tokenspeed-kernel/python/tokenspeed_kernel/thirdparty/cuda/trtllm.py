@@ -259,19 +259,6 @@ def _mnnvl_oneshot_token_cap(
     return threshold_bytes // (hidden_dim * world_size * elem_size)
 
 
-def _mnnvl_should_use_oneshot(
-    token_num: int,
-    hidden_dim: int,
-    elem_size: int,
-    world_size: int,
-    threshold_bytes: int = MNNVL_ONESHOT_BYTES,
-) -> bool:
-    """Select one-shot when aggregate one-shot traffic is within its limit."""
-    return token_num <= _mnnvl_oneshot_token_cap(
-        hidden_dim, elem_size, world_size, threshold_bytes
-    )
-
-
 # Two-shot serves calls through 2048 tokens; mirrors kMnnvlTwoShotMaxToken in the
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048

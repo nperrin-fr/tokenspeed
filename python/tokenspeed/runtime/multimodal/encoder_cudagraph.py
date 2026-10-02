@@ -27,7 +27,6 @@ fallback. Model/modality-specific input layout is supplied by an adapter object.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
@@ -84,9 +83,6 @@ class EncoderCudaGraphAdapter(Protocol):
 
     @property
     def capture_tp_size(self) -> int: ...
-
-    @property
-    def capture_tp_group(self) -> Any | None: ...
 
     def batch_from_items(self, items: list[Any]) -> EncoderCudaGraphBatch: ...
 
@@ -186,7 +182,6 @@ class VisionEncoderCudaGraphAdapter:
     modality_name: str = "vision"
     out_squeeze_dim: int | None = None
     capture_tp_size: int = 1
-    capture_tp_group: Any | None = None
 
     @cached_property
     def _param(self) -> torch.nn.Parameter:
@@ -325,7 +320,6 @@ class EncoderForwardStepRunner:
         )
 
         self.capture_tp_size = adapter.capture_tp_size
-        self.capture_tp_group = adapter.capture_tp_group
 
         self.budget_graphs: dict[int, BudgetGraphMetadata] = {}
 
@@ -409,16 +403,10 @@ class EncoderForwardStepRunner:
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer = torch.empty_like(output)
 
-        # Encoder TP > 1 used to capture under the custom-AR context. That
-        # backend never armed (its resources were gated on a flag nothing
-        # set), so this was already a nullcontext; the remaining AR paths
-        # (trtllm one-shot, NCCL) need no capture-time context.
-        ar_ctx: Any = contextlib.nullcontext()
-
         # No pool= argument: each budget graph gets its own private pool. A
         # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
+        with torch.inference_mode(), torch.cuda.graph(graph):
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer.copy_(output)
 

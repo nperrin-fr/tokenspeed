@@ -182,14 +182,14 @@ def test_dispatch_boundary_oneshot_vs_twoshot():
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         MNNVL_ONESHOT_BYTES,
         AllReduceFusionPattern,
-        _mnnvl_should_use_oneshot,
+        _mnnvl_oneshot_token_cap,
     )
 
     ctx = _skip_unless_mnnvl()
     boundary = MNNVL_ONESHOT_BYTES // (H * ctx["world"] * 2)
     assert boundary > 0
     for token_num in (boundary, boundary + 1):
-        use_oneshot = _mnnvl_should_use_oneshot(token_num, H, 2, ctx["world"])
+        use_oneshot = token_num <= _mnnvl_oneshot_token_cap(H, 2, ctx["world"])
         assert use_oneshot == (token_num == boundary)
         x = _inputs(token_num, ctx["dev"], ctx["rank"], seed=3)
         out = torch.empty_like(x)

@@ -1396,7 +1396,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_feature_shape=(1, self.visual.hidden_size),
             modality_name="vision",
             capture_tp_size=mapping.vision.tp_size,
-            capture_tp_group=mapping.vision.tp_group,
         )
         return EncoderForwardStepRunner(
             adapter=adapter,
