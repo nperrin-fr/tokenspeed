@@ -232,11 +232,10 @@ def test_forced_strategies_agree_at_same_token_count():
     torch.testing.assert_close(outputs[0], outputs[1], atol=3e-2, rtol=3e-2)
 
 
-def test_workspace_dispatch_cap_is_frozen(monkeypatch):
-    """A later environment change cannot enlarge an existing one-shot lane."""
+def test_workspace_dispatch_cap_is_frozen():
+    """Dispatch never widens the one-shot lane the workspace was armed with."""
     ctx = _skip_unless_mnnvl()
     workspace = ctx["mnnvl"]
-    monkeypatch.setenv("TOKENSPEED_MNNVL_ONESHOT_BYTES", str(1 << 40))
     cap = workspace.oneshot_token_cap
     assert workspace.resolve_use_oneshot(cap, None, H)
     assert not workspace.resolve_use_oneshot(cap + 1, None, H)

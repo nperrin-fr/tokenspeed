@@ -130,13 +130,12 @@ def test_pool_allocates_on_its_own_device():
     assert view.device.type == "cpu"
 
 
-def test_initial_size_comes_from_env():
-    from tokenspeed.runtime.utils.env import envs
-
-    with envs.TOKENSPEED_WORKSPACE_INITIAL_MB.override(1):
-        pool = WorkspacePool("cpu")
-    (view,) = pool.allocate(((1 << 20,), torch.uint8))  # fits, no growth
+def test_initial_size_holds_a_fitting_request():
+    pool = WorkspacePool("cpu", 1 << 20)
+    block = pool._block
+    (view,) = pool.allocate(((1 << 20,), torch.uint8))
     assert view.numel() == 1 << 20
+    assert pool._block is block
 
 
 if __name__ == "__main__":

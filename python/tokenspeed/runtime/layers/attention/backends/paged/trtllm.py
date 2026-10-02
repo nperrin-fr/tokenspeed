@@ -48,11 +48,13 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+# Scratch the TRT-LLM MHA kernels draw from the shared workspace pool.
+_WORKSPACE_NBYTES = 512 << 20
 
 
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
@@ -105,9 +107,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.kv_cache_dtype = config.kv_cache_dtype
 
         self._workspace_pool = workspace_pool(config.device)
-        self._workspace_nbytes = envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.get() * (
-            1 << 20
-        )
+        self._workspace_nbytes = _WORKSPACE_NBYTES
         # Warm the shared block to this backend's peak now: graph capture runs
         # the forward with the pool frozen, and under --disable-autotune no
         # earlier forward will have grown the block by then.

@@ -75,7 +75,6 @@ def _bare_mla_backend(
     backend.qk_rope_head_dim = _ROPE
     backend.kv_cache_dim = _KV_LORA + _ROPE
     backend.data_type = torch.bfloat16
-    backend.cutedsl_workspace = None
     backend.forward_decode_metadata = None
     backend.page_table_buf = None
     backend.seq_lens_buf = None

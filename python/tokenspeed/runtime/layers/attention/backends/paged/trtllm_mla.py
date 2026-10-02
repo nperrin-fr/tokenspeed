@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.triton import triton
 
 if TYPE_CHECKING:
@@ -58,6 +57,8 @@ if TYPE_CHECKING:
 
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
+# Size of the zero-initialized fused-kernel workspace below.
+_TRTLLM_WORKSPACE_NBYTES = 256 << 20
 
 
 def calc_padded_blocks(max_seq_len: int, kernel_page_size: int) -> int:
@@ -82,8 +83,7 @@ def calc_padded_blocks(max_seq_len: int, kernel_page_size: int) -> int:
 # Shared workspace buffer for fused kernels, zero-initialized. NOT eligible
 # for the WorkspacePool: zero-init is required for the kernel's internal
 # semaphore mechanism, i.e. the content carries state between launches, and
-# the pool's shared block hands the same bytes to every consumer. Size in MB
-# via TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.
+# the pool's shared block hands the same bytes to every consumer.
 _trtllm_workspace_buffer = None
 
 
@@ -92,7 +92,7 @@ def get_trtllm_workspace_buffer(device):
     global _trtllm_workspace_buffer
     if _trtllm_workspace_buffer is None:
         _trtllm_workspace_buffer = torch.zeros(
-            envs.TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.get() * (1 << 20),
+            _TRTLLM_WORKSPACE_NBYTES,
             dtype=torch.uint8,
             device=device,
         )

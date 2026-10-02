@@ -243,7 +243,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.dcp_rank = config.dcp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
-        self.cutedsl_workspace = self._cutedsl_workspace(
+        self._cutedsl_workspace(
             max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)
         )
 
@@ -713,12 +713,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             )
             CuteDSLMLABackend._logged_decode = True
 
-        self.cutedsl_workspace = self._cutedsl_workspace(query.shape[1])
+        workspace = self._cutedsl_workspace(query.shape[1])
 
         raw_out = tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=self.cutedsl_workspace,
+            workspace_buffer=workspace,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=page_table,

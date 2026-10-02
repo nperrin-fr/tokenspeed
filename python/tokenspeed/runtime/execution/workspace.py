@@ -56,11 +56,12 @@ import os
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
 _ALIGN = 256
+# The block's size before any request grows it.
+_INITIAL_NBYTES = 256 << 20
 
 
 def _round_up(n: int, align: int = _ALIGN) -> int:
@@ -83,11 +84,7 @@ def _caller() -> str:
 class WorkspacePool:
     """One device's shared scratch block; the contract is in the module docstring."""
 
-    def __init__(
-        self, device: torch.device | str, initial_nbytes: int | None = None
-    ) -> None:
-        if initial_nbytes is None:
-            initial_nbytes = envs.TOKENSPEED_WORKSPACE_INITIAL_MB.get() * (1 << 20)
+    def __init__(self, device: torch.device | str, initial_nbytes: int) -> None:
         self.device = torch.device(device)
         self._block = torch.empty(initial_nbytes, dtype=torch.uint8, device=self.device)
         self._frozen = False
@@ -159,7 +156,7 @@ def workspace_pool(device: torch.device | str) -> WorkspacePool:
     key = torch.device(device)
     pool = _pools.get(key)
     if pool is None:
-        pool = WorkspacePool(key)
+        pool = WorkspacePool(key, _INITIAL_NBYTES)
         _pools[key] = pool
     return pool
 

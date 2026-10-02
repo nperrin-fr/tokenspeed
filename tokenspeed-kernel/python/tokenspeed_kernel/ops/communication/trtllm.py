@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import logging
-import os
 from ctypes import c_void_p
 
 import torch
@@ -212,14 +211,7 @@ if current_platform().is_nvidia:
         return _group_spans_nodes(group)
 
     def _skip_ipc_workspace(group) -> bool:
-        """Whether to skip arming the CUDA-IPC workspace for *group*.
-
-        Auto-detected so a cross-node run is safe by default;
-        TOKENSPEED_TRTLLM_AR_SKIP_IPC=0/1 forces the decision.
-        """
-        override = os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC")
-        if override is not None:
-            return override == "1"
+        """Whether to skip arming the CUDA-IPC workspace for *group*: IPC is node-local."""
         return _group_spans_nodes(group)
 
     class TrtllmFusionWorkspaceManager:

@@ -28,7 +28,6 @@ Usage:
 
 import functools
 import logging
-import os
 from ctypes import c_void_p, cast
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -244,9 +243,7 @@ def _destroy_ipc_workspace(
 # Match flashinfer's one-shot traffic threshold. Traffic includes the payload
 # sent by every rank, so the token boundary varies with hidden width, dtype,
 # and TP size.
-MNNVL_ONESHOT_BYTES = int(
-    os.environ.get("TOKENSPEED_MNNVL_ONESHOT_BYTES", 64 * 1024 * 8 * 2)
-)
+MNNVL_ONESHOT_BYTES = 64 * 1024 * 8 * 2
 
 
 def _mnnvl_oneshot_token_cap(
@@ -271,9 +268,7 @@ MNNVL_TWOSHOT_MAX_TOKEN = 2048
 # 86.1 vs 75.4). Expressed in input-tensor bytes so it holds across hidden sizes
 # and dtypes. Only reachable single-node -- cross-node there is no IPC
 # workspace, and there mnnvl beats NCCL across the whole supported range.
-MNNVL_PREFER_IPC_BYTES = int(
-    os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
-)
+MNNVL_PREFER_IPC_BYTES = 12 * 1024 * 1024
 
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
     {
@@ -344,8 +339,6 @@ class MnnvlAllReduceFusionWorkspace:
         self.peer_ptrs = peer_ptrs
         self.local_ptr = local_ptr
         self.buffer_flags = buffer_flags
-        # Frozen when the allocation is built: dispatch must never re-read an
-        # environment override that could select a layout this buffer cannot hold.
         self.oneshot_token_cap = oneshot_token_cap
         self._refs = refs  # keep the symm_mem tensor + handle alive
 
@@ -356,8 +349,7 @@ class MnnvlAllReduceFusionWorkspace:
 
         Arming is grow-only, so the stored cap is the traffic rule at the widest
         width any caller on this group reserved, not at the width in hand: scale
-        it, bounded by the rows the buffer was armed for. Scaling rather than
-        recomputing keeps dispatch off the environment override. ``hidden_dim``
+        it, bounded by the rows the buffer was armed for. ``hidden_dim``
         is required because every resolution is authoritative -- the last one to
         run decides -- so a caller that omitted it would quietly restore the
         armed-width answer.
