@@ -369,7 +369,6 @@ def test_triton_output_acquisition_propagates_staging_failure(monkeypatch):
 def test_nccl_collection_uses_single_tensor_path():
     backend = NcclBackend()
     backend._resources[(0,)] = {
-        "pynccl_comm": None,
         "device_group": None,
         "world_size": 1,
     }

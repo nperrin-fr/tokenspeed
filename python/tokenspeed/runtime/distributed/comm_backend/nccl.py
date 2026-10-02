@@ -20,9 +20,8 @@
 
 """NCCL communication backend.
 
-Looks up pre-created process groups from pg_manager. Optionally uses
-PyNccl communicators for better performance. Supports torch.compile
-via custom ops.
+Looks up pre-created process groups from pg_manager. Supports
+torch.compile via custom ops.
 """
 
 import torch
@@ -32,19 +31,14 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
 
 class NcclBackend(CommBackend):
-    """Backend using NCCL via PyNccl or torch.distributed.
+    """Backend using NCCL via torch.distributed.
 
-    Caches per-group resources (process group handle, PyNccl comm)
-    keyed by group tuple. Process groups are looked up from pg_manager
-    on first use.
+    Caches per-group resources (process group handle, world size) keyed by
+    group tuple. Process groups are looked up from pg_manager on first use.
     """
 
     def __init__(self):
-        self._resources = {}  # group_tuple → {pynccl_comm, device_group, world_size}
-        self._use_pynccl = False
-
-    def configure(self, use_pynccl: bool = False) -> None:
-        self._use_pynccl = use_pynccl
+        self._resources = {}  # group_tuple → {device_group, world_size}
 
     def _get_or_create_resources(self, group: Group):
         if group in self._resources:
@@ -55,27 +49,9 @@ class NcclBackend(CommBackend):
         )
 
         device_group = pg_manager.get_process_group("nccl", group)
-        world_size = len(group)
-
-        pynccl_comm = None
-        if self._use_pynccl and world_size > 1:
-            try:
-                from tokenspeed.runtime.distributed.device_communicators.pynccl import (
-                    PyNcclCommunicator,
-                )
-
-                gloo_group = pg_manager.get_process_group("gloo", group)
-                pynccl_comm = PyNcclCommunicator(
-                    group=gloo_group,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-                )
-            except Exception:
-                pynccl_comm = None
-
         self._resources[group] = {
-            "pynccl_comm": pynccl_comm,
             "device_group": device_group,
-            "world_size": world_size,
+            "world_size": len(group),
         }
         return self._resources[group]
 
@@ -94,11 +70,7 @@ class NcclBackend(CommBackend):
             return tensor
         if op is None:
             op = torch.distributed.ReduceOp.SUM
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.all_reduce(tensor, op=op)
-        else:
-            torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
+        torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
         return tensor
 
     def all_reduce_two(
@@ -114,17 +86,15 @@ class NcclBackend(CommBackend):
         kernel launch, so callers get single-launch latency WITHOUT first
         copying the operands into one contiguous buffer -- the copy-free
         alternative to a cat + single all-reduce. Falls back to two ordinary
-        collectives when the coalescing manager is unavailable (pynccl-driven
-        groups, torch without ``_coalescing_manager``).
+        collectives when torch lacks ``_coalescing_manager``.
         """
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
             return first, second
         if op is None:
             op = torch.distributed.ReduceOp.SUM
-        pynccl = res["pynccl_comm"]
         coalescing = getattr(torch.distributed, "_coalescing_manager", None)
-        if coalescing is None or (pynccl is not None and not pynccl.disabled):
+        if coalescing is None:
             return (
                 self.all_reduce(first, group, op=op),
                 self.all_reduce(second, group, op=op),
@@ -164,13 +134,7 @@ class NcclBackend(CommBackend):
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         res = self._get_or_create_resources(group)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.all_gather(output, input)
-        else:
-            torch.distributed.all_gather_single(
-                output, input, group=res["device_group"]
-            )
+        torch.distributed.all_gather_single(output, input, group=res["device_group"])
 
     def all_to_all_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
@@ -180,7 +144,6 @@ class NcclBackend(CommBackend):
         if ws == 1:
             output.copy_(input)
             return
-        # PyNccl has no all_to_all wrapper
         torch.distributed.all_to_all_single(output, input, group=res["device_group"])
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
@@ -194,22 +157,14 @@ class NcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.reduce_scatter(output_tensor, tensor)
-        else:
-            torch.distributed.reduce_scatter_single(
-                output_tensor, tensor, group=res["device_group"]
-            )
+        torch.distributed.reduce_scatter_single(
+            output_tensor, tensor, group=res["device_group"]
+        )
         return output_tensor
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         res = self._get_or_create_resources(group)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.send(tensor, dst)
-        else:
-            torch.distributed.send(tensor, group[dst], group=res["device_group"])
+        torch.distributed.send(tensor, group[dst], group=res["device_group"])
 
     def recv(
         self,
@@ -221,11 +176,7 @@ class NcclBackend(CommBackend):
     ) -> torch.Tensor:
         res = self._get_or_create_resources(group)
         tensor = torch.empty(size, dtype=dtype, device=device)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.recv(tensor, src)
-        else:
-            torch.distributed.recv(tensor, group[src], group=res["device_group"])
+        torch.distributed.recv(tensor, group[src], group=res["device_group"])
         return tensor
 
     def token_all_gather(

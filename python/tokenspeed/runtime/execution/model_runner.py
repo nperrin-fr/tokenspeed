@@ -256,8 +256,8 @@ class ModelRunner:
         ``init_process_group(init_method="tcp://addr:port", rank=0, world_size)``
         and pushes weights via ``dist.broadcast(..., src=0)``. We must rendezvous
         through the *same* torch TCP-store + NCCL-unique-id handshake — a
-        ``StatelessProcessGroup``/``PyNcclCommunicator`` keys its store
-        differently and never forms a joint communicator with a torch group, so
+        store-based stateless group keys its store differently and never forms
+        a joint communicator with a torch group, so
         the broadcast would deadlock. Build a standalone, non-default group (via
         the same private helper torch's own ``init_process_group`` uses) so it
         never collides with the engine's own world.

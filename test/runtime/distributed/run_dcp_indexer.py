@@ -61,7 +61,7 @@ def main() -> None:
         max_num_seqs=4,
         speculative_algorithm=None,
     )
-    initialize_comm_backend(use_pynccl=False)
+    initialize_comm_backend()
     torch.manual_seed(912)
     page_size, topk, pages = 64, 512, 17
     keys = torch.randn(pages * page_size, 128, device="cuda", dtype=torch.bfloat16)

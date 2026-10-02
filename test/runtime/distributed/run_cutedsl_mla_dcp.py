@@ -484,7 +484,7 @@ def main():
         max_num_seqs=3,
         speculative_algorithm=None,
     )
-    initialize_comm_backend(use_pynccl=False)
+    initialize_comm_backend()
     for dtype in (torch.bfloat16, torch.float8_e4m3fn):
         for context in args.contexts:
             for queries, draft, block in (

@@ -74,9 +74,6 @@ class AutoBackend(CommBackend):
     def trtllm_ar(self) -> TrtllmAllReduceBackend:
         return self._trtllm_ar
 
-    def configure(self, use_pynccl: bool = False) -> None:
-        self._nccl.configure(use_pynccl=use_pynccl)
-
     @staticmethod
     def _force_deterministic_rsag() -> bool:
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
