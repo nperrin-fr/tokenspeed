@@ -239,7 +239,7 @@ class MoELayer(torch.nn.Module):
         if self._quant_kind == "mxfp4":
             if self.quant_config.is_w4a8_fp8:
                 internal_activation_dtype = "fp8"
-            elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
+            elif self.quant_config.use_dynamic_mxfp4_activations:
                 internal_activation_dtype = "mxfp4"
         # --moe-mxfp4-fp8-activation: FP8 activations for every MXFP4 routed
         # expert layer in the model. "fp8" matches only the FlashInfer cutlass
@@ -452,18 +452,6 @@ class MoELayer(torch.nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
-
-    def forward_zero_experts(self, topk_output):
-        zero_expert_limit = self.num_experts
-        if self.ep_num_redundant_experts is not None:
-            zero_expert_limit = zero_expert_limit - self.ep_num_redundant_experts
-
-        normal_expert_mask = topk_output.topk_ids >= zero_expert_limit
-        topk_output.topk_ids[normal_expert_mask] = -1
-        if self.zero_expert_type == "copy":
-            topk_output.topk_weights[normal_expert_mask] = 1.0
-        if self.zero_expert_type == "drop":
-            topk_output.topk_weights[normal_expert_mask] = 0.0
 
     def forward(
         self,

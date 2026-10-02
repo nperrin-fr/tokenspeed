@@ -22,9 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
-import logging
-
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
@@ -35,8 +32,6 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
 )
 from torch.nn.parameter import Parameter
-
-logger = logging.getLogger(__name__)
 
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,

@@ -71,6 +71,3 @@ class W8A8Fp8Config(QuantizationConfig):
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
         )
         return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []

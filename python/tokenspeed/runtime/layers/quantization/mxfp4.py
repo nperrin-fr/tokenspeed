@@ -296,12 +296,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
-    def is_static_cfg(self):
-        return self.is_checkpoint_mxfp4_serialized
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
 
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 # E2M1 code -> value; the sign is the code's high bit.

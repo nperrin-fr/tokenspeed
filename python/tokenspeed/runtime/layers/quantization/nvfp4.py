@@ -20,14 +20,11 @@
 
 """NVFP4 quantization config for tokenspeed runtime (ModelOpt-produced checkpoints)."""
 
-import logging
 from typing import Any
 
 import torch
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-
-logger = logging.getLogger(__name__)
 
 
 class Nvfp4Config(QuantizationConfig):
@@ -110,9 +107,6 @@ class Nvfp4Config(QuantizationConfig):
         if user_quant == "nvfp4" and hf_quant_cfg.get("quant_method") == "modelopt":
             return "nvfp4"
         return None
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []
 
 
 class Nvfp4W4A16Config(Nvfp4Config):

@@ -44,7 +44,6 @@ to bf16 at load time (see :data:`_FP8_PB_WO_DEQUANT_LEAVES` and
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -60,8 +59,6 @@ from tokenspeed.runtime.layers.quantization.utils import (
     modelopt_block_scale_to_2d,
     should_exclude_quant_module,
 )
-
-logger = logging.getLogger(__name__)
 
 _MOE_CONFIG_ATTRS = {
     "NVFP4": "nvfp4_config",
@@ -396,9 +393,6 @@ class ModelOptMixedConfig(QuantizationConfig):
 
     def moe_weight_dtype(self, prefix: str = "") -> str:
         return self.get_moe_quant_config(prefix).moe_weight_dtype(prefix)
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []
 
 
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)

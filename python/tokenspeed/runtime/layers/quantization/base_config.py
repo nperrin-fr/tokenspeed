@@ -151,14 +151,6 @@ class QuantizationConfig(ABC):
         except ValueError:
             return default
 
-    @abstractmethod
-    def get_scaled_act_names(self) -> list[str]:
-        """Returns the activation function names that should be post-scaled.
-
-        For now, this is only used by AWQ.
-        """
-        raise NotImplementedError
-
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""

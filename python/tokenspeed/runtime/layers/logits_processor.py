@@ -59,11 +59,8 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
+from tokenspeed.runtime.utils import is_pin_memory_available
 from tokenspeed.runtime.utils.triton import tl, triton
-
-logger = get_colorful_logger(__name__)
-
 
 _UNQUANTIZED_LM_HEAD_METHODS = frozenset(
     {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod"}

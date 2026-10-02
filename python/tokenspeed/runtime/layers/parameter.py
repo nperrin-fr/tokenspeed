@@ -30,8 +30,6 @@ from fractions import Fraction
 import torch
 from torch.nn import Parameter
 
-from tokenspeed.runtime.utils import get_colorful_logger
-
 __all__ = [
     "BaseWeightParameter",
     "PackedWeightParameter",
@@ -42,8 +40,6 @@ __all__ = [
     "PackedColumnParameter",
     "RowParallelWeightParameter",
 ]
-
-logger = get_colorful_logger(__name__)
 
 
 def _check_shape_match(actual: torch.Size, expected: torch.Size) -> None:
