@@ -20,8 +20,8 @@
 
 """The boot path's capture step: where it is called and what it covers.
 
-The checks read source text instead of importing the runtime: what moved is
-boot sequencing, and a sequencing test should not need the model to load.
+The boot-path checks read source text: sequencing ``build_device_side`` should
+not need the model to load. The step itself runs against a stub executor.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ import ast
 import os
 import pathlib
 import sys
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -155,39 +157,36 @@ def test_nothing_the_constructor_reaches_tunes_freezes_or_captures():
     assert not offenders, offenders
 
 
-def test_the_step_names_every_operation_the_constructor_gave_up():
-    """The move must be complete, not partial: tuning left, the rest stayed.
+def test_the_step_freezes_then_captures_decode_then_prefill(monkeypatch):
+    """Freeze, capture decode, capture prefill, then fill the drafter's window."""
+    from tokenspeed.runtime.execution import model_executor
 
-    Tuning left ``capture_graphs`` when the probe made it run twice -- a
-    captured graph keeps the tactic it was captured with, and the tuner's
-    token bound is a once-per-process call -- so the boot path now names it
-    directly, alongside the step that freezes and captures.
-    """
-    step = _function(_tree("model_executor.py"), "capture_graphs")
-    names = {call.func.attr for call in _attribute_calls(step)}
-    builder = _function(_tree("device.py"), "build_device_side")
-    boot_names = {call.func.attr for call in _attribute_calls(builder)}
+    calls = mock.Mock()
+    monkeypatch.setattr(model_executor, "workspace_pool", lambda _: calls.workspace)
+    executor = SimpleNamespace(
+        device="cuda:0",
+        forward_step=SimpleNamespace(disable=False, capture=calls.decode, stream="s"),
+        prefill_graph=SimpleNamespace(disable=False, capture=calls.prefill),
+        captures_drafter_prefill_graph=True,
+        drafter=SimpleNamespace(capture_prefill_graph=calls.drafter),
+    )
+    observer = SimpleNamespace(measure=lambda name: name)
 
-    # Only tuning moved; freeze and capture stay where the constructor left them.
-    assert {"freeze", "capture"} <= names, names
-    assert "autotune" in boot_names, boot_names
-    assert "autotune" not in names, names
+    model_executor.ModelExecutor.capture_graphs(
+        executor, entries=None, observer=observer
+    )
 
-
-def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
-    """Freeze, capture decode, capture prefill; the boot tunes before and seeds after.
-
-    Tuning and capture draw from the generator, so the boot path seeds once
-    they are done, exactly where the constructor used to.
-    """
-    step = _function(_tree("model_executor.py"), "capture_graphs")
-    sequence = [
-        call.func.attr
-        for call in _attribute_calls(step)
-        if call.func.attr in _STEP_OPERATIONS
+    assert [call[0] for call in calls.mock_calls] == [
+        "workspace.freeze",
+        "decode",
+        "prefill",
+        "drafter",
     ]
-    assert sequence == ["freeze", "capture", "capture"]
+    calls.drafter.assert_called_once_with("s", "prefill:drafter")
 
+
+def test_the_boot_tunes_before_the_step_and_seeds_after():
+    """Tuning and capture draw from the generator; the boot seeds after both."""
     builder = _function(_tree("device.py"), "build_device_side")
     tune = [
         call.lineno

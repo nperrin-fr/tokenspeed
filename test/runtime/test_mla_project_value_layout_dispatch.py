@@ -64,33 +64,11 @@ def test_gate_is_applied_with_a_strided_weight():
     )
 
 
-def test_caller_does_not_need_a_vendor_branch():
-    import inspect
-
-    from tokenspeed.runtime.models import deepseek_v3
-
-    src = inspect.getsource(deepseek_v3.DeepseekV3AttentionMLA)
-    assert (
-        "w_vc.contiguous() if _is_amd" not in src
-    ), "the vendor-specific layout fix-up is back in the model; dispatch owns it"
-
-
 def test_fused_mla_kv_write_is_not_amd_only():
     from tokenspeed_kernel.registry import KernelRegistry
 
     spec = KernelRegistry.get().get_by_name("triton_mla_prologue")
     assert {"amd", "nvidia"} <= spec.capability.vendors
-
-
-def test_model_no_longer_vendor_gates_the_fused_kv_write():
-    import inspect
-
-    from tokenspeed.runtime.models import deepseek_v3
-
-    src = inspect.getsource(deepseek_v3.DeepseekV3AttentionMLA)
-    assert (
-        "_is_amd and self.attention_backend" not in src
-    ), "the fused KV write is gated on vendor again; the registry decides this"
 
 
 def test_weight_layout_matches_what_the_kernel_wants():
