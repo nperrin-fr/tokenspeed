@@ -219,7 +219,9 @@ The prepared MN-major contract, selected at load time on every Blackwell
 datacenter part, transposes the weight scales once and then consumes the
 TRT-LLM quantizer's native `[K/128, M]` activation scales directly, which is
 what the canonical path would otherwise have to transpose on every call. Both
-produce bitwise identical output.
+produce bitwise identical output: FlashInfer's SM10x K-major kernel misreads
+activation scales for 17 <= `M` <= 32, so the canonical contract runs those row
+counts through MN-major.
 
 MN-major requires `M` to be a multiple of four, so a prepared layer falls back
 to the canonical contract once padding would cost more than the transpose it

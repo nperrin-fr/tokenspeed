@@ -31,6 +31,7 @@ if not is_nvidia():
 from flashinfer import fp4_quantize  # noqa: E402
 from tokenspeed_kernel.platform import current_platform, pdl_enabled  # noqa: E402
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (  # noqa: E402
+    MAX_ROWS,
     LamportCopyNvfp4QuantKernel,
     compile_kernel,
     launch,
@@ -210,3 +211,13 @@ def test_gather_allocated_outputs_and_graph_replay(pdl, m):
             graph.replay()
         torch.cuda.synchronize()
         check(outputs)
+
+
+@pytest.mark.parametrize("max_m", [MAX_ROWS, MAX_ROWS + 1])
+def test_nvfp4_is_offered_only_up_to_the_consumer_rows(max_m):
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+
+    mailbox = SimpleNamespace(shard_dim=448, max_m=max_m)
+    assert KimiK3LatentDownOp.nvfp4_available(mailbox) is (max_m <= MAX_ROWS)

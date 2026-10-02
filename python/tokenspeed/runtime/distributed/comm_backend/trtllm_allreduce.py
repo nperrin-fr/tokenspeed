@@ -67,50 +67,49 @@ class TrtllmAllReduceBackend(CommBackend):
         max_token_num: int,
         hidden_dim: int,
     ) -> bool:
-        """Arm the group's shared fusion workspace.  Returns True on success."""
+        """Arm the group's shared fusion workspace.  Returns True on success.
+
+        Collective: arming failures propagate rather than leave ranks disagreeing.
+        """
         if group in self._resources:
             return True
 
         if not self._load_comm():
             return False
 
-        try:
-            from tokenspeed.runtime.distributed.process_group_manager import (
-                process_group_manager as pg_manager,
-            )
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
 
-            device_group = pg_manager.get_process_group("nccl", group)
+        device_group = pg_manager.get_process_group("nccl", group)
 
-            from tokenspeed_kernel.ops.communication.trtllm import (
-                MNNVL_TWOSHOT_MAX_TOKEN,
-                ensure_workspace_initialized,
-                group_spans_nodes,
-            )
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_TWOSHOT_MAX_TOKEN,
+            ensure_workspace_initialized,
+            group_spans_nodes,
+        )
 
-            if group_spans_nodes(device_group):
-                # Cross-node arms mnnvl only; size it for the two-shot range.
-                max_token_num = max(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
+        if group_spans_nodes(device_group):
+            # Cross-node arms mnnvl only; size it for the two-shot range.
+            max_token_num = max(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
 
-            # Nothing armed reports False; the group keeps routing through NCCL.
-            if not ensure_workspace_initialized(
-                rank=rank,
-                group=device_group,
-                max_token_num=max_token_num,
-                hidden_dim=hidden_dim,
-            ):
-                return False
-
-            self._resources[group] = {
-                "rank": rank,
-                "max_token_num": max_token_num,
-                "hidden_dim": hidden_dim,
-                "device_group": device_group,
-            }
-
-            return True
-
-        except Exception:
+        # Nothing armed reports False; the group keeps routing through NCCL.
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=device_group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+        ):
             return False
+
+        self._resources[group] = {
+            "rank": rank,
+            "max_token_num": max_token_num,
+            "hidden_dim": hidden_dim,
+            "device_group": device_group,
+        }
+
+        return True
 
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
@@ -132,16 +131,12 @@ class TrtllmAllReduceBackend(CommBackend):
             ensure_workspace_initialized,
         )
 
-        try:
-            ok = ensure_workspace_initialized(
-                rank=res["rank"],
-                group=res["device_group"],
-                max_token_num=res["max_token_num"],
-                hidden_dim=hidden_dim,
-            )
-        except Exception:
-            self._resources.pop(group, None)
-            return False
+        ok = ensure_workspace_initialized(
+            rank=res["rank"],
+            group=res["device_group"],
+            max_token_num=res["max_token_num"],
+            hidden_dim=hidden_dim,
+        )
         if not ok:
             # A graph-freeze refusal keeps the old lane; a failed grow unarms it.
             if armed_workspace_hidden_dim(res["device_group"]) == 0:

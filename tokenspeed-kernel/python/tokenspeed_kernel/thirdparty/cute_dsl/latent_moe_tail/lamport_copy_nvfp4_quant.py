@@ -39,6 +39,9 @@ from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
     to_cute_dynamic_m,
 )
 
+# Widest live-row count the consumer is tested for; wider mailboxes must decline it.
+MAX_ROWS = 1280
+
 
 def _quantize_asm():
     lines = [
@@ -261,14 +264,14 @@ def launch(source, data, scales, global_scale, *, hidden, m, use_pdl):
         scales: Contiguous CUDA uint8 [M, hidden/16] linear E4M3 scale bytes.
         global_scale: CUDA FP32 scalar encoding multiplier of this receiver.
         hidden: Positive latent width divisible by 64, keeping groups complete.
-        m: Live rows, in 1..1280. Only these mailbox rows are consumed/reset.
+        m: Live rows, in 1..MAX_ROWS. Only these mailbox rows are consumed/reset.
         use_pdl: Capture-time PDL policy shared with the original producer.
 
     Returns:
         None. Writes payload/scales and rearms consumed mailbox fragments.
         Buffers and the two-slot symmetric-mailbox rotation remain caller-owned.
     """
-    if hidden <= 0 or hidden % 64 or not 1 <= m <= 1280:
+    if hidden <= 0 or hidden % 64 or not 1 <= m <= MAX_ROWS:
         raise ValueError("unsupported Lamport NVFP4 geometry")
     if (
         not source.is_cuda
@@ -328,7 +331,7 @@ class LamportCopyNvfp4QuantKernel:
             symmetric_mailbox: Contiguous CUDA BF16 storage covering M rows of
                 hidden_dim values, using the 0x80008000 sentinel contract.
             scale: This receiver's positive scalar FP32 encoding multiplier.
-            m: Live rows, between 1 and 1280; only these rows are consumed.
+            m: Live rows, between 1 and MAX_ROWS; only these rows are consumed.
 
         Returns:
             Newly allocated uint8 packed values [M, H/2] and linear E4M3

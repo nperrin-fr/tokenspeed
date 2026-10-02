@@ -391,6 +391,40 @@ def test_trtllm_collection_uses_fallback_single_tensor_path():
     assert fallback.all_reduce.call_count == len(tensors)
 
 
+def test_trtllm_arming_failures_propagate(monkeypatch):
+    """Arming is collective: a rank that swallowed a failure would split the group."""
+    import tokenspeed_kernel.ops.communication.trtllm as kernel_trtllm
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+
+    backend = TrtllmAllReduceBackend(Mock())
+    monkeypatch.setattr(backend, "_load_comm", lambda: True)
+    monkeypatch.setattr(
+        process_group_manager, "get_process_group", lambda kind, group: "device"
+    )
+    monkeypatch.setattr(kernel_trtllm, "group_spans_nodes", lambda group: False)
+    monkeypatch.setattr(
+        kernel_trtllm,
+        "ensure_workspace_initialized",
+        Mock(side_effect=RuntimeError("rendezvous failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="rendezvous failed"):
+        backend.configure_group(rank=0, group=(0, 1), max_token_num=8, hidden_dim=16)
+    assert not backend.has_trtllm_ar((0, 1))
+
+    backend._resources[(0, 1)] = {
+        "rank": 0,
+        "max_token_num": 8,
+        "hidden_dim": 16,
+        "device_group": "device",
+    }
+    with pytest.raises(RuntimeError, match="rendezvous failed"):
+        backend.ensure_group_lane((0, 1), 32)
+
+
 def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend, monkeypatch
 ):

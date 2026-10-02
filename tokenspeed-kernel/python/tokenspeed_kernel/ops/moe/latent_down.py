@@ -282,11 +282,17 @@ class KimiK3LatentDownOp:
     def nvfp4_available(self) -> bool:
         """Whether this mailbox and platform support fused NVFP4 quantization."""
         platform = current_platform()
-        return (
+        if not (
             self.shard_dim % 64 == 0
             and platform.is_nvidia
             and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+        ):
+            return False
+        from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy_nvfp4_quant import (
+            MAX_ROWS,
         )
+
+        return self.max_m <= MAX_ROWS
 
     def prepare_nvfp4(self) -> None:
         """Construct the NVFP4 mailbox consumer once, before graph capture."""
@@ -650,8 +656,8 @@ class KimiK3LatentDownOp:
                 slices it, because a projection that narrowed its storage has
                 no full width left to slice from.
             output_scale: NVFP4 encoding multiplier for the fused gather, or
-                None to gather BF16. NVFP4 requires its kernel prepared before
-                capture, a width divisible by 64, and at most 1280 live rows.
+                None to gather BF16. NVFP4 requires ``nvfp4_available()`` and its
+                kernel prepared before capture.
 
         Returns:
             The full BF16 latent, or (packed NVFP4 values, linear E4M3 scales).

@@ -105,6 +105,25 @@ def test_kmajor_canonical_matches_mn_path(device: str, m: int) -> None:
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("m", [16, 17, 24, 32, 33])
+def test_kmajor_misread_band_matches_mn_path(device: str, m: int) -> None:
+    """The raw SM10x K-major kernel misreads scales here for 17 <= M <= 32."""
+    from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_blockscale
+
+    n, k = 2048, 7168
+    quantized, weight, activation_scales, weight_scales = _make_case(m, n, k, device)
+    expected = _mn_reference(quantized, weight, activation_scales, weight_scales)
+    result = flashinfer_mm_fp8_blockscale(
+        quantized,
+        weight,
+        activation_scales,
+        weight_scales,
+        torch.bfloat16,
+        block_size=[128, 128],
+    )
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
 def test_kmajor_out_direct_and_strided_fallback(device: str) -> None:
     from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_blockscale
 

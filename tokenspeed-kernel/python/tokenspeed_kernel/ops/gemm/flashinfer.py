@@ -81,6 +81,8 @@ _NVFP4_FORMAT_SIGNATURES = frozenset(
 
 # Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
 _PREPACKED_PAD_TOKEN_LIMIT = 256
+# FlashInfer's SM10x K-major kernel misreads activation scales for these M.
+_KMAJOR_MISREAD_M = range(17, 33)
 
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
@@ -205,6 +207,18 @@ def _validate_flashinfer_fp8_blockscale_prepacked(
         )
 
 
+def _pack_mn_major(
+    A: torch.Tensor, A_scales: torch.Tensor, B_scales: torch.Tensor, m: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad ``A`` to a multiple of four rows and transpose both canonical scales."""
+    padded_m = -(-m // 4) * 4
+    padded = A.new_zeros((padded_m, A.shape[1]))
+    padded[:m] = A[:m]
+    a_scales = A_scales.new_ones((A_scales.shape[1], padded_m))
+    a_scales[:, :m] = A_scales[:m].t()
+    return padded, a_scales, prepare_flashinfer_fp8_blockscale_weight_scales(B_scales)
+
+
 if gemm_fp8_nt_groupwise is not error_fn:
 
     @register_kernel(
@@ -250,6 +264,9 @@ if gemm_fp8_nt_groupwise is not error_fn:
         ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
         orig_m = A.shape[0] if original_m is None else int(original_m)
+        if not prepacked_scales and orig_m in _KMAJOR_MISREAD_M:
+            A, A_scales, B_scales = _pack_mn_major(A, A_scales, B_scales, orig_m)
+            prepacked_scales = True
         if prepacked_scales:
             _validate_flashinfer_fp8_blockscale_prepacked(
                 A,
@@ -273,10 +290,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 return out
             return output
 
-        # K-major mode reads the quant kernel's native (m, k//128) activation
-        # scales and the checkpoint's native (n//128, k//128) weight scales,
-        # so no padding, transposes, or scale copies are needed per call.
-        # FlashInfer defect: SM10x mis-reads these scales for 17 <= M <= 32.
+        # K-major reads the native scale layouts: no padding or transposes per call.
         if A_scales.shape[0] != orig_m:
             A_scales = A_scales[:orig_m]
         # The kernel reads raw row-major storage; normalize strided views
