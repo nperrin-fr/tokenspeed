@@ -107,41 +107,6 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
-def maybe_warm_cupti_for_graph_capture() -> None:
-    """Preload CUPTI before any CUDA graph is captured. Opt-in.
-
-    The warm-up guards a hazard reported on older stacks: a profiler that
-    first attaches AFTER capture invalidates the captured graphs -- every
-    later replay dies with cudaErrorLaunchFailure -- which would forbid
-    runtime ``/start_profile`` on graph-mode servers. One empty profiler
-    session loads CUPTI ahead of every capture.
-
-    It is off by default because it defeats its own purpose: the empty session
-    leaves activity collection dead for the life of the process, so every
-    later ``/start_profile`` returns a trace with ``cpu_op`` entries and zero
-    ``"cat": "kernel"`` events, on every rank, in eager and graph mode alike.
-    That was documented for ROCm's roctracer and is CUPTI's behaviour too --
-    on CUDA 13.0 / torch 2.13, 2xGB300 TP8, a profiled decode yields 0 kernel
-    events with the warm-up and 933k across 340 graph replays without it. The
-    hazard did not reproduce there either: all 340 replays ran after the
-    attach with no launch failure.
-
-    ``TOKENSPEED_CUPTI_GRAPH_WARMUP=1`` restores it on a stack that still
-    needs it, at the cost of GPU profiling. AMD ignores that request: on
-    roctracer the warm-up has the same cost and no upside.
-    """
-    from tokenspeed_kernel.platform import current_platform
-
-    if not envs.TOKENSPEED_CUPTI_GRAPH_WARMUP.get():
-        return
-    if not torch.cuda.is_available() or current_platform().is_amd:
-        return
-
-    from torch.profiler._utils import _init_for_cuda_graphs
-
-    _init_for_cuda_graphs()
-
-
 class EventLoop:
     def __init__(
         self,
@@ -1319,8 +1284,6 @@ def run_event_loop(
         with startup_phase(
             "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
         ):
-            maybe_warm_cupti_for_graph_capture()
-
             event_loop = EventLoop(
                 server_args,
                 port_args,
