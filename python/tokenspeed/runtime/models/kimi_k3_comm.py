@@ -320,15 +320,9 @@ class K3AttnComm:
 
         The tokenspeed collective is the exception: it serves the narrow window
         ahead of those branches and returns None for the mixed hidden even when
-        ``combine`` is set, so the caller runs the combine as its own kernel.
-        Measured net faster despite the extra launch at the width that
-        actually reaches it -- one token per step, where every layer but the
-        block-write ones arrives with a residual. Wider steps mostly take the
-        fused AttnRes graph instead, and the block-write layers that still
-        arrive pass no prefix: instrumented at eight tokens on a DSpark
-        deployment, this window was armed and served nothing. A layer that
-        declines the fused graph for some other reason does reach it with a
-        prefix, so that is a property of the configuration, not of the width.
+        ``combine`` is set, so the caller runs the combine as its own kernel --
+        net faster, despite the extra launch, at the one-token width that
+        reaches it.
 
         Like the vendor branch below it, that window does not consult
         ``force_deterministic_rsag``: the collective reduces in ascending rank

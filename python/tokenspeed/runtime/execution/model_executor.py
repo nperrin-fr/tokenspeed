@@ -113,6 +113,7 @@ logger = get_colorful_logger(__name__)
 
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _sampling_info_for_requests(
@@ -140,9 +141,6 @@ def _draft_idle_global_num_tokens_for_step(
     if step_idx == 0 or global_bs is None:
         return global_num_tokens
     return global_bs
-
-
-PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
@@ -276,7 +274,7 @@ class ModelExecutorConfig:
 
     # ====== PREFILL CUDA GRAPH (breakable) =========
     disable_prefill_graph: bool = False
-    # Opt-in: > 0 enables the prefill graph and caps the largest token bucket.
+    # > 0 enables the prefill graph and caps its largest bucket; serving resolves it on.
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None

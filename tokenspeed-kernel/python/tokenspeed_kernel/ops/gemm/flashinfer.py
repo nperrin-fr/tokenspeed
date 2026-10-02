@@ -79,6 +79,9 @@ _NVFP4_FORMAT_SIGNATURES = frozenset(
     for b_scale_dtype in _NVFP4_SCALE_DTYPES
 )
 
+# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
+_PREPACKED_PAD_TOKEN_LIMIT = 256
+
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
 gemm_fp8_nt_groupwise = error_fn
@@ -126,10 +129,6 @@ def has_flashinfer_fp8_blockscale() -> bool:
     """Return whether the native FlashInfer FP8 block-scale GEMM is usable."""
     # Every Blackwell datacenter part runs this kernel; GB300 reports 10.3.
     return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
-
-
-# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
-_PREPACKED_PAD_TOKEN_LIMIT = 256
 
 
 def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:

@@ -164,7 +164,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             self.threads, self.cluster_ctas = _select_routed_schedule(
                 tp_size, latent_dim, hidden_dim, max_m
             )
-        # Compile-time diagnostic specialization: a one-role grid runs only the routed path, leaving the production fused path unchanged.
+        # Roles per grid: the routed path, the shared reduce-scatter roles, or both.
         if include_routed and include_reduce_scatter:
             self.roles = 1 + shared_roles
         elif include_routed:
@@ -174,7 +174,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         self.warps = (self.threads + 31) // 32
         self.last_warp_lanes = self.threads - (self.warps - 1) * 32
         self.last_warp_mask = (1 << self.last_warp_lanes) - 1
-        # Keep one cluster per token in the routed-only diagnostic: reusing a cluster across token waves lets the Lamport generation metadata change between waves.
+        # Routed-only uses one cluster per token so no wave reuses Lamport metadata.
         self.token_ctas = (
             min(max_m, max_token_ctas) if include_reduce_scatter else max_m
         )

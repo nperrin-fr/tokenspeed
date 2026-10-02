@@ -20,9 +20,10 @@
 
 """Auto backend: per-call strategy selection.
 
-Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
-backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL.
+Wraps NCCL and optional low-latency GPU backends. CUDA IPC backends serve
+node-local groups only. Symmetric-memory multicast (the TRT-LLM mnnvl all-reduce
+and the token all-gather/reduce-scatter) also serves groups spanning hosts that
+share an NVLink fabric. Everything else falls back to NCCL.
 """
 
 import torch
@@ -250,22 +251,11 @@ class AutoBackend(CommBackend):
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
 
-        # AR backend dispatch -- first match wins. This is Tier 1 (which
-        # backend); the trtllm backend then runs Tier 2 (mnnvl vs IPC, by
-        # payload bytes) inside _ar_fusion_workspace.
-        #   1. force_deterministic_rsag ............ NCCL
-        #   2. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   3. group spans nodes ................... NCCL
-        #   4. triton_ar can run ................... triton_ar
-        #   5. otherwise ........................... NCCL
+        # First match wins; the trtllm backend then picks mnnvl or IPC by payload.
         if self._force_deterministic_rsag():
             return self._nccl.all_reduce(tensor, group, op=op)
         spans_nodes = self._group_spans_nodes(group)
-        # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
-        # armed for a group when that succeeded, so has_trtllm_ar() is itself
-        # the "usable here" test. Checking it before the cross-node NCCL
-        # fallback is what lets a cross-node group use mnnvl at all -- otherwise
-        # the workspace is armed and never called.
+        # Ahead of the cross-node fallback: an armed mnnvl workspace spans nodes.
         if self._trtllm_ar.has_trtllm_ar(group):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if spans_nodes:

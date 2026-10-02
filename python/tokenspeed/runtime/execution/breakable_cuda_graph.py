@@ -96,7 +96,7 @@ def active_forward(ctx: Any) -> Generator[None]:
     thread the live context through ``replay()`` (which would conflate graph
     mechanics with forward semantics), the runner wraps capture and each replay
     in this, and breaks rebind their captured context arg to the ambient one by
-    identity (see :func:`break_here`) -- so break bodies read live ``ctx``
+    identity (see :func:`_record_break`) -- so break bodies read live ``ctx``
     fields exactly like the eager path. Re-entrant (saves/restores the
     previous value).
     """
@@ -155,7 +155,7 @@ class BreakableCapture:
 
         cap = BreakableCapture(pool=shared_pool)
         with cap:
-            model_forward(...)        # attention calls hit break_here()
+            model_forward(...)        # @break_point methods run eagerly
         # later, after copying live inputs into the static buffers:
         cap.replay()
 
@@ -166,14 +166,9 @@ class BreakableCapture:
             and the rest reuse it.
         stream: An optional dedicated capture stream. CUDA forbids stream capture
             on the default stream; if ``None``, a single class-level side stream is
-            (lazily) created and SHARED by all captures. Sharing one capture stream
-            is load-bearing for memory: the caching allocator's pool blocks are
-            stream-keyed, so captures on different streams can never reuse each
-            other's freed blocks -- a fresh stream per capture makes graph-pool
-            memory grow with the SUM of bucket sizes instead of the max (measured:
-            2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
-            mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
-            its documented "pass the same stream for effective memory sharing".
+            (lazily) created and SHARED by all captures: the allocator keys pool
+            blocks by stream, so only captures on one stream reuse each other's
+            freed blocks (as with ``torch.cuda.graph``'s ``default_capture_stream``).
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
     """
@@ -212,10 +207,7 @@ class BreakableCapture:
     def __enter__(self) -> BreakableCapture:
         if BreakableCapture.current() is not None:
             raise RuntimeError("Nested BreakableCapture is not supported.")
-        # A GC run during capture invalidates it: destructors of collected
-        # CUDA graphs call reset, which is illegal while a stream is capturing.
-        # Clear pending garbage, then keep automatic GC off for the whole
-        # capture window (restored in __exit__).
+        # Collected graphs reset in their destructors, which is illegal mid-capture.
         gc.collect()
         self._gc_was_enabled = gc.isenabled()
         gc.disable()
@@ -321,8 +313,8 @@ def _record_break(
 
     Args/kwargs are bound once at capture time, with two live exceptions: (1) tensor
     args alias persistent storage (the static input buffers / pool-pinned segment
-    intermediates), so they carry live values at replay -- ``weak_ref_tensor`` is
-    the (currently identity) hook to avoid pinning their pool slots; (2) the
+    intermediates), so they carry live values at replay -- ``weak_ref_tensor``
+    aliases them without pinning their pool slots; (2) the
     per-forward ``ForwardContext`` is rebound by identity to the live ambient
     context each replay (see :func:`active_forward`), so ``fn`` may read live
     ``ctx`` fields exactly like the eager path. **Other (loose) non-tensor scalars

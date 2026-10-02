@@ -260,14 +260,7 @@ def _mnnvl_oneshot_token_cap(
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
-# Above this payload the IPC lamport workspace beats the mnnvl one on a single
-# node: multicast/scatter wins while cost tracks the number of stores, but past
-# ~10 MiB bandwidth dominates and IPC's direct peer writes come out ahead.
-# Measured at world 4, hidden 7168, bf16, with the scatter phase A: mnnvl leads
-# through 768 tokens (10.5 MiB, 60.0 vs 63.4 us) and trails from 1024 (14 MiB,
-# 86.1 vs 75.4). Expressed in input-tensor bytes so it holds across hidden sizes
-# and dtypes. Only reachable single-node -- cross-node there is no IPC
-# workspace, and there mnnvl beats NCCL across the whole supported range.
+# Single-node input bytes above which IPC's direct peer writes beat mnnvl multicast.
 MNNVL_PREFER_IPC_BYTES = 12 * 1024 * 1024
 
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
@@ -275,18 +268,12 @@ _MNNVL_SUPPORTED_PATTERNS = frozenset(
         AllReduceFusionPattern.kAllReduce,
         AllReduceFusionPattern.kARResidualRMSNorm,
         AllReduceFusionPattern.kARResidualAttnResCombine,
-        # kAllReduceLatentNorm: the mnnvl kernel handles it, but the wide
-        # [latent|hidden] lane makes it a hair slower than IPC lamport on a
-        # single node (8.60us vs 6.64 on 8x B300), so _ar_fusion_workspace
-        # prefers IPC for it when an IPC workspace exists. Cross-node there is
-        # no IPC and the alternative is NCCL, which mnnvl beats ~3.3x --
-        # excluding it there crashed K3's latent-MoE tail with no fallback.
+        # Single-node prefers IPC for this lane; cross-node only mnnvl serves it.
         AllReduceFusionPattern.kAllReduceLatentNorm,
     }
 )
 
-# 16 covers 4-node TP16 (Kimi-K3); the NVLink domain spans the rack, so the
-# limit was template instantiation, not fabric reach.
+# 16 covers 4-node TP16 (Kimi-K3): the NVLink domain spans the rack.
 _MNNVL_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 
 
@@ -522,10 +509,7 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
 # AllReduce fusion
 # ---------------------------------------------------------------------------
 
-# One-shot payload ceiling in MiB per world size, for the IPC lamport path.
-# 16 extrapolates the 4->8 halving (64 -> 42 -> ~21): without an entry
-# `.get(world, 0)` returns 0, which silently forced every TP16 call onto the
-# two-shot path regardless of size.
+# IPC lamport one-shot ceiling in MiB per world size; 16 extends the 4->8 halving.
 _ar_oneshot_heuristics: dict = {2: 512, 4: 64, 8: 42, 16: 21}
 
 

@@ -310,11 +310,13 @@ groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
 fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
 (inside the trtllm backend for armed groups; the Triton all-reduce tier
-serves AMD only, where no trtllm workspace exists). Single-node token
-all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
-across nodes. Logits all-gather and distributed argmax use the same
-cross-node fallback. This is required for layouts such as attention DP
-with dense TP or MoE EP spanning nodes.
+serves AMD only, where no trtllm workspace exists). Token
+all-gather/reduce-scatter runs on the Triton RSAG backend wherever
+symmetric-memory multicast can map the group -- every single-node group, and
+groups spanning hosts that share an NVLink fabric -- and on NCCL otherwise.
+Logits all-gather and distributed argmax follow the same rule. This is
+required for layouts such as attention DP with dense TP or MoE EP spanning
+nodes.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled

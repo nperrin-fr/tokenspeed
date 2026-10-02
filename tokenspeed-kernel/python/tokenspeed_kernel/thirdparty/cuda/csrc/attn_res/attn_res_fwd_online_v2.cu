@@ -17,8 +17,8 @@
 //   - Q=res_weight*rms_weight remains in registers across persistent tokens.
 //   - V rows are converted once and cached as FP32 in TMEM between passes.
 //
-// Integration contract: Kimi K3 H=7168, 1<=num_blocks<=8, and token-major
-// block residual storage.
+// Integration contract: Kimi K3 H=7168, 1<=num_blocks<=8, and block-major
+// [K, T, B, H] block residual storage.
 
 #include "attn_res.cuh"
 

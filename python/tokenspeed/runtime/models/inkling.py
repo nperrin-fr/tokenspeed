@@ -1382,10 +1382,7 @@ class InklingAudioTower(nn.Module):
         bin_offsets = (
             torch.arange(self.n_mel_bins, device=device) * self.mel_vocab_size
         ).unsqueeze(0)
-        # Fused lookup+sum: the unfused form materializes an intermediate of
-        # ``(num_tokens * n_mel_bins, decoder_dmodel)``, i.e. ``n_mel_bins``
-        # (80) times the output, which dominates peak memory on long clips --
-        # ~0.95 MB per audio token at decoder_dmodel=6144.
+        # Fused lookup+sum avoids an n_mel_bins-times-larger intermediate.
         hidden_states = F.embedding_bag(
             bin_offsets + dmel, self.encoder.weight, mode="sum"
         )

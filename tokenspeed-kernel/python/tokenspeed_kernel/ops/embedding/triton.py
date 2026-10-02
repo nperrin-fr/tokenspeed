@@ -224,20 +224,13 @@ def _mla_rope_set_kv_buffer_kernel(
         pair_lo = half_offsets * 2
         pair_hi = half_offsets * 2 + 1
 
-    # Wait only after the address-independent index math, so the producer's
-    # tail overlaps work that touches no global memory.
+    # Wait after the address-free index math so it overlaps the producer's tail.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    # One program covers BLOCK_N tokens. The token grid dimension is what sets
-    # the CTA count, and PDL costs a fixed amount per CTA, so widening this is
-    # what stops the wait from outgrowing the overlap it buys.
+    # BLOCK_N tokens per program bounds the CTA count, and PDL costs per CTA.
     for tok in tl.static_range(BLOCK_N):
-        # The query destination spans nope+rope per head, so token_idx times
-        # its row stride passes 2**31 at token counts a public caller can
-        # reach, and the wrap is an out-of-bounds write. Widen only when the
-        # shape can actually reach it -- the wider arithmetic costs up to 9%
-        # at large token counts.
+        # The query row offset can pass 2**31; widen only when the shape reaches it.
         if INDEX_INT64:
             token_idx = (block_idx * BLOCK_N + tok).to(tl.int64)
         else:
@@ -341,10 +334,9 @@ def _mla_rope_set_kv_buffer_kernel(
 def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
     """Tokens per program for the fused MLA write.
 
-    PDL's cost is a fixed amount per CTA (measured ~0.57us per 1000 CTAs on
-    B200) while the overlap it buys is roughly constant, so the grid has to
-    stay near the point where the two meet. Capped at 6: past that the wider
-    per-program footprint costs more than the CTA reduction returns.
+    PDL costs a fixed amount per CTA while the overlap it buys is roughly
+    constant, so the grid stays near ~1100 CTAs. Capped at 6 tokens, past which
+    the wider per-program footprint costs more than the fewer CTAs save.
     """
     ctas_per_token = num_q_heads + 1
     return max(1, min(6, -(-num_tokens * ctas_per_token // 1100)))

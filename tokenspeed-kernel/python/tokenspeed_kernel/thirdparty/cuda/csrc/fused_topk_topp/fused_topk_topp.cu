@@ -466,21 +466,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         }
     } else {
         // ── Mode 3.2: top-P only (radix top-p threshold) ────────────────────
-        // Vectorized V-scan with float4: each thread reads 16B per iteration,
-        // 4x fewer transactions than scalar. A float4 access must be naturally
-        // aligned, and a 16B-aligned row base is NOT guaranteed:
-        //   1. `probs`/`out_probs` may be views whose data_ptr is only 4B-aligned
-        //      (any slice or offset gather off a larger buffer), and
-        //   2. vocab_size % 4 != 0 pushes every row b >= 1 off a 16B boundary
-        //      even when the base allocation is 256B-aligned.
-        // Either one used to fault with "misaligned address".
-        //
-        // Whether any row can be unaligned is a property of the launch (base
-        // pointers + vocab_size), so the host picks the instantiation and
-        // ROWS_ALIGNED is a compile-time constant here. Keeping it compile-time
-        // matters: a runtime branch leaves the unaligned code in the aligned
-        // path's register footprint and costs ~2.5% occupancy even on rows that
-        // never execute it.
+        // float4 scan; the host sets ROWS_ALIGNED from the base pointers and vocab_size.
         const float threshold =
             air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
@@ -526,12 +512,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 }
             }
         } else {
-            // Some row may be unaligned. Rather than drop the whole row to a
-            // scalar loop (measured ~2x slower on this kernel -- the two V x 4B
-            // read passes dominate it, and with one block per row the slowest row
-            // gates the launch), peel it: a scalar prologue of 0-3 floats walks
-            // `in_row` up to a 16B boundary, the bulk stays vectorized, and a
-            // scalar tail finishes. Unaligned rows keep full read bandwidth.
+            // Peel a scalar head to a 16B boundary of in_row; the bulk stays float4.
             const uintptr_t in_addr = reinterpret_cast<uintptr_t>(in_row);
             const uintptr_t out_addr = reinterpret_cast<uintptr_t>(out_row);
 

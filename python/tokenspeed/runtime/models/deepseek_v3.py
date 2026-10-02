@@ -51,25 +51,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
-from tokenspeed.runtime.layers.moe import (
-    ExpertCheckpointSchema,
-    build_moe_checkpoint_loader,
-)
-from tokenspeed.runtime.layers.utils import (
-    CP_METADATA,
-    ENABLE_CP,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    get_layer_id,
-)
-
-_platform = current_platform()
-_is_blackwell = _platform.is_blackwell
-_is_hopper_plus = _platform.is_hopper_plus
-_device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
-_FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
-
-
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -95,6 +76,10 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.moe import (
+    ExpertCheckpointSchema,
+    build_moe_checkpoint_loader,
+)
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
@@ -106,6 +91,13 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.utils import (
+    CP_METADATA,
+    ENABLE_CP,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    get_layer_id,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -127,6 +119,12 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = get_colorful_logger(__name__)
+
+_platform = current_platform()
+_is_blackwell = _platform.is_blackwell
+_is_hopper_plus = _platform.is_hopper_plus
+_device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+_FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
 
 _OPTIONAL_MISSING_WEIGHT_SUFFIXES = (
     ".k_scale",

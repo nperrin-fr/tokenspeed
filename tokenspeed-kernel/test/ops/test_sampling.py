@@ -299,8 +299,8 @@ def test_fused_topk_topp_unaligned_rows(
     Mode 3.2 (top-p only, reached via the top-k sentinel) scans the row with
     float4 vector loads. A float4 access must be naturally aligned, so an
     unaligned row base used to abort the process with CUDA "misaligned address".
-    The kernel now gates the vector path on the actual row alignment and falls
-    back to the scalar loop, which must stay numerically identical.
+    The kernel now keeps the vector loads for the aligned bulk and peels a scalar
+    head and tail, which must stay numerically identical.
     """
 
     if not torch.cuda.is_available():

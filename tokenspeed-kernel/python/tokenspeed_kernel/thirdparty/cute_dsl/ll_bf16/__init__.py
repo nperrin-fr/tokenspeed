@@ -5,20 +5,10 @@
 
 """Low-latency BF16 router GEMM: ``a @ b.T`` in FP32 for decode-sized M.
 
-Two vendored CuTe kernels serve K3's router shape (``[M, 7168] x [896, 7168]``).
-Measured on GB300, cold L2, us/call, against the cublas path they displace::
-
-    M          1     2     4     8    16    24    32    64   128   512
-    dot-prod  3.39  3.83  4.99  8.21 12.27     -     -     -     -     -
-    split-K      -     -     -  4.93  4.94  7.55  7.44 14.98 25.75 90.1
-    cublas    9.51  9.69  9.82  9.89  9.94  9.26  9.56  9.62 10.98  14.7
-
-Hence ``MAX_M_DOTPROD = 4`` (split-K wins from 8; the dot product only carries
-past 4 when split-K is absent) and ``MAX_M = 32`` (both lose to cublas above it,
-a bound vLLM does not apply). ``(split_k, num_stages)`` is tuned here too:
-vLLM's tables cover ``(K, N)`` from ``(4096, 256)`` to ``(7168, 384)`` and never
-``(7168, 896)``, so they run K3 on a ``(6, 4)`` default that loses at every M
-measured -- 5.75 / 8.74 / 9.19 us at M = 16 / 24 / 32 against the picks below.
+Two vendored CuTe kernels serve K3's router shape (``[M, 7168] x [896, 7168]``):
+a dot product up to ``MAX_M_DOTPROD`` rows and split-K up to ``MAX_M``, above
+which cublas is faster. The split-K ``(split_k, num_stages)`` picks are tuned for
+this ``(K, N)``.
 """
 
 from __future__ import annotations
@@ -34,8 +24,8 @@ MAX_M = 32
 _BLOCK_SIZE_BY_M: dict[int, int] = {1: 256, 2: 256, 4: 256, 8: 128}
 _DEFAULT_BLOCK_SIZE = 128
 _SPLITK_CONFIG_BY_M: tuple[tuple[int, tuple[int, int]], ...] = (
-    (16, (4, 4)),  # 4.94 us at M = 16, against 6.04 for (4, 2)
-    (MAX_M, (4, 2)),  # 7.55 / 7.44 at M = 24 / 32, against 8.28 / 8.31
+    (16, (4, 4)),
+    (MAX_M, (4, 2)),
 )
 _SPLITK_TILE_N = 16
 _SPLITK_TILE_K = 256

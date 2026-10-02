@@ -41,9 +41,9 @@ Usage::
     ...
     tape.run({Reg.BS: bs, Reg.REAL_BS: real_bs})   # every replay
 
-All tensors must be int32, contiguous in their last dimension, and outlive
-the tape (their addresses are baked into the descriptors). Only int32
-metadata is supported -- that is what graph input buffers are made of.
+All tensors must be int32 (``filltail`` also takes int64), contiguous in their
+last dimension, and outlive the tape (their addresses are baked into the
+descriptors).
 """
 
 from __future__ import annotations

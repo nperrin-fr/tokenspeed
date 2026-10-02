@@ -261,9 +261,9 @@ class InputBuffers:
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
 
-        The six fills below are independent and touch persistent buffers, so a
+        The five fills below are independent and touch persistent buffers, so a
         tape records them once and replays them as a single kernel instead of
-        six launches on every step's critical path. Non-CUDA callers keep the
+        five launches on every step's critical path. Non-CUDA callers keep the
         torch spelling.
         """
         if torch.device(self.device).type != "cuda":

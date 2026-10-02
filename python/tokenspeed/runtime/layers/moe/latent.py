@@ -143,11 +143,7 @@ class Kimi3MoEExecutionPlan:
 
         use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
         use_native = not use_mega_moe and native_latent_moe_available()
-        # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
-        # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
-        # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
-        # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
-        # it can also be forced with ``--moe-backend marlin``.
+        # Marlin W4A16 runs on any NVIDIA SM90+, so AUTO picks it before TRT-LLM-Gen.
         use_marlin = (
             not use_mega_moe
             and not use_native
@@ -198,30 +194,11 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     With ``column_group`` the projection splits the same output columns over
     the group and one all-gather concatenates the blocks. It is taken only
-    where a mailbox exists, which is to say only where the fabric can map
-    symmetric memory, and it narrows storage the same way ``shard_group``
-    does. That coupling is deliberate, and measured rather than inferred: the
-    replica wins at every width where the fabric cannot carry the gather. The
-    numbers are on ``_gather_shards``, which is where the two routes are
-    described together; they are not repeated here because an earlier eager
-    set that was repriced away lived in this paragraph, two decimal places
-    from a value in the other arm.
-
-    Where the fabric is there, the split pays from the mailbox ceiling
-    upward: measured on GB300 TP8 under graph replay with cold weights, the
-    shard wins from 1280 by about 5 percent out to 36 at 8192, and the
-    fused NVLink gather writes the final layout for 135us where the buffer
-    path needs 239us. It wins eager as well -- 64.3/53.8 at 2048, 101.8/78.7
-    at 4096, 208.9/138.6 at 8192 -- so the width does not depend on whether
-    the chunk was captured, and a deployment whose chunks exceed the capture
-    ceiling needs nothing done here.
-
-    ``get_is_cuda_graph_phase`` cannot decide those two regimes apart, which
-    is worth knowing because it reads as though it could. Its only setters
-    are the decode wrapper's capture and its comm prewarm, and the executor
-    runs prefill capture as a later statement, after that capture has
-    already restored the flag -- so it is False throughout prefill capture.
-    Nothing here keys on it, and nothing should.
+    where a mailbox exists -- where the fabric can map symmetric memory -- and
+    it narrows storage the same way ``shard_group`` does: without the fabric
+    the replica wins at every width, and with it the split wins from the
+    mailbox ceiling upward, captured or eager. Nothing here keys on
+    ``get_is_cuda_graph_phase``, which is False throughout prefill capture.
     """
 
     def __init__(
@@ -318,31 +295,16 @@ class Kimi3LatentProjection(ReplicatedLinear):
         ``column_group`` asks the backend for that layout instead, and only
         where storage narrowed: a full-width projection already holds every
         column and has nothing to concatenate. That request reaches
-        ``all_gather_inner`` -- the fused NVLink gather writes the final layout
-        in one pass, 135us at 8152 tokens where a buffer-and-permute needs 239.
-
-        It reaches that kernel only on NVIDIA, with a 2-D bf16 tensor gathered
-        on the last dim; anything else, and any group the fabric cannot map,
-        falls back to the NCCL backend's allocate-gather-transpose, and that
-        fallback loses to the replica at every width. Measured under graph
-        replay on 8 ranks over two hosts, with the route witnessed rather than
-        assumed -- nccl 33 calls and rsag 0 with the probe declined, the
-        reverse with it live:
-
-            m       no fabric (nccl)      with fabric (rsag)
-            1280    37.2 rep / 76.8 col   37.7 rep / 35.6 col
-            4096   111.4     / 121.5     111.5     /  72.6
-            8192   226.0     / 254.0     224.5     / 142.8
-
-        Which is why a projection that cannot narrow does not take this route
-        at all. An earlier eager measurement here put the no-fabric gap at
-        4.5x rather than 2.1x; it timed host submission inside the interval,
-        and the two arms submit different amounts of Python.
+        ``all_gather_inner``, whose fused NVLink gather writes the final layout
+        in one pass. It reaches that kernel only on NVIDIA, with a 2-D bf16
+        tensor gathered on the last dim; anything else, and any group the
+        fabric cannot map, falls back to the NCCL backend's
+        allocate-gather-transpose, which loses to the replica at every width --
+        so a projection that cannot narrow never takes this route.
 
         Returns:
             The full-width projection. **It may alias the backend's workspace**,
-            which the next gather reuses -- measured same-address across
-            consecutive calls. Read it on the issuing stream before gathering
+            which the next gather reuses. Read it on the issuing stream before gathering
             again. The contract is stated for both routes even though only the
             column one can alias, because a caller that had to know which route
             it got would be the branch this method exists to remove.
@@ -459,12 +421,8 @@ class Kimi3LatentProjection(ReplicatedLinear):
             The accumulated projection at full width; instances that narrowed
             their storage project their block and gather it.
 
-        The branch keys on ``narrowed`` rather than on ``shard_group``, which
-        used to be the same question. It stopped being so when the column path
-        gained its own way to narrow: the proxy quietly lost its meaning, and
-        the full-width branch would have projected a block while calling it the
-        whole width. Anyone adding a third narrowing path should re-run that
-        enumeration over every ``shard_group is None`` left in this class.
+        The branch keys on ``narrowed``, not ``shard_group``: the column path
+        narrows storage too, and a full-width branch must never project a block.
         """
         if not self.narrowed:
             return tokenspeed_kernel.kimi3_latent_projection_add3(

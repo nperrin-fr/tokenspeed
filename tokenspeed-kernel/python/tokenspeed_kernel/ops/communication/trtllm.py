@@ -99,10 +99,7 @@ if current_platform().is_nvidia:
         fabric-handle memory really works. Purely local: safe to call before any
         collective.
         """
-        # Single source of truth: the kernel's own list. A duplicated literal
-        # here silently gated out world 16 even after the kernel gained it --
-        # the correctness suite passed (it calls the creator directly) while
-        # end-to-end serving found no workspace at all.
+        # The kernel's own world-size list; a copied literal once gated out world 16.
         if world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return False
         try:
@@ -116,11 +113,7 @@ if current_platform().is_nvidia:
                 DeviceType.CUDA, torch.cuda.current_device()
             ):
                 return False
-            # One rank per GPU, so a wider group necessarily spans hosts, and
-            # its symmetric buffer needs multi-node NVLink rather than plain
-            # NVLS multicast. Multicast support is still advertised on hosts
-            # without the IMEX stack, where symm_mem.rendezvous() then hangs
-            # instead of failing, so the allocation has to be probed.
+            # Without IMEX a multi-host rendezvous hangs instead of failing: probe it.
             if (
                 world_size > torch.cuda.device_count()
                 and not fabric_allocation_supported(torch.cuda.current_device())
@@ -269,11 +262,7 @@ if current_platform().is_nvidia:
             group: dist.ProcessGroup,
             use_fp32_lamport: bool,
         ) -> None:
-            # CUDA-IPC handles cannot span nodes -- attempting creation on a
-            # cross-node group fails AND leaves a sticky CUDA context error
-            # ('invalid resource handle' on the next allocation). Gate it off
-            # for cross-node runs; the MNNVL fabric workspace below is the
-            # multi-node path.
+            # IPC handles cannot span nodes, and trying leaves a sticky CUDA error.
             # Recorded first: a failed arm must still destroy on the right group.
             self.group = group
             _skip_ipc = _skip_ipc_workspace(group)
@@ -291,18 +280,12 @@ if current_platform().is_nvidia:
                         use_fp32_lamport=use_fp32_lamport,
                     )
                 )
-            # Additionally arm the MNNVL one-shot AR workspace (NVLS multicast
-            # + Lamport rotation). Capability auto-detected; the IPC workspace
-            # above stays as the always-available fallback and continues to
-            # serve allgather/reducescatter and unsupported AR shapes.
+            # Also arm mnnvl one-shot; IPC stays the fallback and serves AG/RS.
             self.mnnvl_workspace = _try_create_mnnvl_workspace(
                 rank, world_size, max_token_num, hidden_dim, group
             )
 
-            # With IPC skipped, mnnvl is the only workspace; if it failed to
-            # arm there is nothing to fuse with -- stay uninitialized so
-            # prepare_allreduce_fusion() returns False and the model layer
-            # keeps the plain NCCL path.
+            # IPC skipped and mnnvl unarmed: stay uninitialized so callers keep NCCL.
             if self.workspace_tensor is None and self.mnnvl_workspace is None:
                 logger.warning(
                     "trtllm AR: no workspace available (ipc skipped, mnnvl "
@@ -331,11 +314,7 @@ if current_platform().is_nvidia:
             # and skipping the destroy then would orphan them.
             if self.initialized or self.ipc_handles is not None:
                 try:
-                    # Cross-node groups arm mnnvl only; there is no IPC
-                    # workspace to destroy, but the state reset below must
-                    # still run or a re-init leaks the symm_mem allocation and
-                    # a failed re-arm leaves initialized=True with no
-                    # workspace behind it.
+                    # No IPC to destroy cross-node, but the reset below must still run.
                     if self.ipc_handles is not None:
                         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
                             self.ipc_handles, group=self.group
@@ -510,16 +489,10 @@ if current_platform().is_nvidia:
         the whole range (it beats NCCL everywhere there).
         """
         mnnvl = manager.mnnvl_workspace
-        # Byte-based split between the two fused workspaces: multicast (mnnvl)
-        # for small payloads, IPC lamport once bandwidth dominates. Only bites
-        # single-node -- cross-node workspace_tensor is None and mnnvl is the
-        # only option. See MNNVL_PREFER_IPC_BYTES for the measurement.
         from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
 
         payload_bytes = token_num * hidden_dim * dtype.itemsize
-        # Prefer IPC when it exists (single node) for large payloads, and for
-        # latent-norm whose wide lane the mnnvl geometry handles slightly worse.
-        # Cross-node workspace_tensor is None, so mnnvl serves both.
+        # Single-node, IPC wins for large payloads and the wide latent-norm lane.
         prefer_ipc = payload_bytes >= MNNVL_PREFER_IPC_BYTES or (
             pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm
         )
@@ -1131,10 +1104,7 @@ if current_platform().is_nvidia:
         else:
             quant_out = None
             scale_out = None
-        # allgather/reducescatter have no mnnvl implementation -- they run on
-        # the IPC lamport workspace only. Since IPC is skipped on cross-node
-        # groups, `initialized` can be True (mnnvl armed) while this workspace
-        # is None; without this check a null pointer reaches the FFI.
+        # AG/RS run on IPC only, which is None cross-node even with mnnvl armed.
         manager = _manager_for_group(group)
         if manager.workspace_tensor is None:
             raise RuntimeError(
@@ -1265,10 +1235,7 @@ if current_platform().is_nvidia:
             else AllGatherFusionPattern.kAllGatherfusedRMS
         )
 
-        # allgather/reducescatter have no mnnvl implementation -- they run on
-        # the IPC lamport workspace only. Since IPC is skipped on cross-node
-        # groups, `initialized` can be True (mnnvl armed) while this workspace
-        # is None; without this check a null pointer reaches the FFI.
+        # AG/RS run on IPC only, which is None cross-node even with mnnvl armed.
         manager = _manager_for_group(group)
         if manager.workspace_tensor is None:
             raise RuntimeError(

@@ -442,18 +442,9 @@ class PrefillGraph:
             # The graph's embedding seam takes input_ids alone; an embedding
             # that reads request-token history stays eager.
             or model_runner.model_config.requires_request_token_history
-            # DP replay decisions must come from replicated state, and a
-            # forward's multimodal-ness is rank-local: one rank running its mm
-            # prefill eager while text-only peers replay desyncs the EP
-            # collectives. Until the DP metadata gather carries a multimodal
-            # flag, keep the graph off for multimodal models under DP.
+            # Multimodal-ness is rank-local; mixed eager/replay DP ranks desync EP.
             or (config.data_parallel_size > 1 and model_runner.is_multimodal)
-            # The narrowed row count is rank-local (which prompts complete on
-            # this rank), so the decoder bucket -- and the collective shapes
-            # its graph bakes -- would differ across ranks; the stages also
-            # size their collectives from their own rows, which the DP
-            # gather does not carry. Until narrowed counts are exchanged,
-            # the split graph stays off under attention DP.
+            # Narrowed row counts are rank-local; DP ranks would bake other shapes.
             or (config.data_parallel_size > 1 and self._narrowing is not None)
         )
         if (
@@ -515,24 +506,15 @@ class PrefillGraph:
         measured around each capture; ``None`` captures every bucket.
 
         ``decode_wrapper`` supplies the shared capture stream (used here only,
-        not stored). Buckets share
-        one PRIVATE mempool (first capture
-        allocates it) to reuse scratch; graph objects and metadata still cost
-        memory per variant. Never use the decode graphs' pool: eager ops cache
-        raw pointers to
-        buffers they lazily allocated inside a decode capture (flashinfer's
-        trtllm-gen MoE runner), and a prefill capture reusing those freed
-        blocks means every replay rewrites them, corrupting the next eager
-        call (IMA; A/B-proven on qwen3.5 MTP).
+        not stored). Buckets share one private mempool, never the decode
+        graphs': eager ops cache raw pointers to buffers they allocated inside a
+        decode capture (flashinfer's trtllm-gen MoE runner), and a prefill
+        capture reusing those blocks would rewrite them on every replay.
 
-        Runs under inference mode like serving forwards (in-place updates on
-        inference-mode model state buffers are only legal there). There is no
-        handler here: every failure kills the boot, OOM included (the graph
-        pool did not fit next to weights + KV cache -- free headroom, lower
-        ``--prefill-graph-max-tokens``, or set it to 0). A model family that
-        cannot capture has to say so up front in ``ModelExecutor``'s
-        ``disable_prefill_graph`` condition, because degrading here silently
-        served eager prefill to a whole model family while CI stayed green.
+        Runs under inference mode like serving forwards. Every failure, OOM
+        included, kills the boot (lower ``--prefill-graph-max-tokens`` or set it
+        to 0); a backend that cannot capture declares it through
+        ``cuda_graph_support`` (see docs/design/unified_path.md).
         """
         if self.disable:
             return
@@ -1012,15 +994,10 @@ class PrefillGraph:
         spec, not of the kernel that reads it, which is why no per-backend
         knob is needed.
 
-        Deliberately NOT ``compute_max_logical_pages_for_capture``: that
-        helper answers the decode question, where a row describes live cache
-        history, so a sliding group is bounded by its window. Capture derives
-        a write column per position of the extend it fabricates
-        (``extend_out_cache_locs``, ``(prefix + new - 1) // grain``)
-        with no window bound, so a window-sized row underflows.
-        Trying the helper here made Inkling capture die with "extend write
-        locations out of table bounds" -- its ``sliding_attention_0`` row was
-        6 columns against the 63 the bucket needed.
+        Deliberately NOT ``compute_max_logical_pages_for_capture``: it bounds a
+        sliding group by its window, but capture derives a write column per
+        position of the extend it fabricates (``extend_out_cache_locs``) with no
+        window bound, so a window-sized row underflows.
 
         Blocks are distinct per row because a state group takes one working
         block per request; two rows sharing one clobber each other. Note the
@@ -1031,28 +1008,14 @@ class PrefillGraph:
         An empty dict (a pool publishing no groups: unit fixtures, warmup
         before binding) skips the cache-metadata kwargs downstream.
         """
-        # ALL groups, state included: hybrid wrappers forward the dict to the
-        # mamba child, which requires its state group; KV children keep only
-        # the families they declared (_consumed_group_tables).
+        # State groups too: hybrid wrappers forward the dict to the mamba child.
         out = {}
         extent = max(1, int(self.config.physical_context_len))
-        # Built on the host: make_dummy_batch's only use of these is
-        # ``.cpu().numpy()`` for the contract packer, so a device tensor here
-        # would be allocated and copied straight back off per group per bucket.
+        # On the host: make_dummy_batch only reads these through ``.cpu().numpy()``.
         first_block = torch.arange(1, bs + 1, dtype=torch.int32)
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
             cols = -(-extent // int(spec.block_granularity))
-            # Never the reserved block 0: attention runs eager inside the
-            # break, so capture really does write KV, and block 0 must stay
-            # zero for the padding and table holes that resolve into it.
-            # The upper bound is the group's own block count, enforced by the
-            # contract packer: block_tables_from_forward_op rejects anything
-            # past group_page_counts[gid] - 1, and capture failure is fatal, so
-            # a violation is a loud dead boot rather than a bad table. It is
-            # never reached in practice, but not because bs is bounded by the
-            # pool -- the bucket ladder does not clamp against max_bs, and an
-            # oversized bs dies earlier on the max_bs-sized request buffers
-            # make_dummy_batch writes before it gets here.
+            # Skip reserved block 0: capture writes KV, and padding resolves to block 0.
             out[str(spec.group_id)] = first_block[:, None].expand(bs, cols).contiguous()
         return out
 

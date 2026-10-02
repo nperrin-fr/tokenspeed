@@ -118,9 +118,7 @@ class WorkspacePool:
                 f"workspace block: {block.numel() / (1 << 20):.2f} MB -> "
                 f"{total / (1 << 20):.2f} MB ({_caller()!s})",
             )
-            # Point _block at an empty tensor first so the old block is
-            # actually released, letting the caching allocator serve the new
-            # request from those bytes.
+            # Drop the old block before allocating so its bytes can serve the new one.
             self._block = torch.empty(0, dtype=torch.uint8, device=self.device)
             del block
             self._block = torch.empty(total, dtype=torch.uint8, device=self.device)

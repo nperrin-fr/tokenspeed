@@ -1658,8 +1658,9 @@ class KimiLinearMoE(nn.Module):
       so ``routed_expert_down_proj`` (7168->3584) feeds the experts and
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
-      by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE. The selected MoE kernel
+      by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. On NVIDIA,
+      AUTO uses the Marlin W4A16 MoE where it is built, else flashinfer's
+      TRTLLM-Gen SiTU MoE. The selected MoE kernel
       advertises whether it consumes precomputed TopK or routes from logits.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
@@ -1731,8 +1732,7 @@ class KimiLinearMoE(nn.Module):
         )
         situ_beta, situ_linear_beta = _situ_betas(config)
 
-        # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
-        # registered at import time; AUTO cannot override MoELayer per model.
+        # Without a native, Marlin or MegaMoE plan, only TRT-LLM-Gen SiTU can serve.
         plan = self.execution_plan
         if not plan.use_mega_moe and not plan.use_native and not plan.use_marlin:
             if not plan.use_trtllm:
@@ -2778,9 +2778,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self.k3_comm = K3AttnComm(mapping=mapping, hidden_size=config.hidden_size)
 
         self.attn_fork = StreamFork(alt_stream)
-        # (proj_w_getter, norm, valid_blocks) for the NEXT layer's attn-side
-        # mix; set by the backbone after all layers exist. The partial launches
-        # from this (MoE) layer's aux branch, hidden under the routed experts.
+        # (next_layer, valid_blocks); our aux branch runs the next attn-side partial.
         self._next_attn_mix = None
         # Whether the next layer's mlp-side partial rides our sweep too.
         self._hoist_next_mlp = False
@@ -2793,8 +2791,6 @@ class KimiLinearDecoderLayer(nn.Module):
         # True when the PREVIOUS layer precomputes our mlp-side block partial.
         self._mlp_split = False
         self._dflash_attnres_capture_fallback = False
-        # True when the NEXT layer folds our routed+shared residual accumulate
-        # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
@@ -2877,7 +2873,6 @@ class KimiLinearDecoderLayer(nn.Module):
     def _fused_attnres_graph_available(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
-        # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
         if self._dflash_attnres_capture_fallback:
             return False
 

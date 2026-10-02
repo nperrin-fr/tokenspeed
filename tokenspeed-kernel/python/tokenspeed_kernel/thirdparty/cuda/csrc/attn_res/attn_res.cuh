@@ -8,7 +8,8 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Packed Blackwell forward Attention-Residual kernel from the NVIDIA DevTech
- * Kimi-K3 / KDA optimization work. Vendored unmodified -- do not edit here.
+ * Kimi-K3 / KDA optimization work. Vendored, then adapted locally to the
+ * online-v2 kernel and the PDL launch flag.
  */
 #pragma once
 

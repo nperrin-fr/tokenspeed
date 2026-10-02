@@ -65,6 +65,10 @@ _LAMPORT_THREADS = 512
 # Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
 _DOWN_SENTINEL = 0x80008000
 _BF16_BYTES = 2
+# Reasons already reported; the decline repeats per MoE block and says nothing new.
+_DECLINED: set[str] = set()
+# See _rendezvous_failure_is_a_fault for why this is not latent_tail's gate.
+_MULTICAST_VALIDATED_ARCH = 10
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +89,6 @@ class _Gather(Protocol):
     """Assembles the full latent from a mailbox the peers have published into."""
 
     def __call__(self, mailbox: torch.Tensor, m: int) -> tuple[torch.Tensor, ...]: ...
-
-
-# Reasons already reported; the decline repeats per MoE block and says nothing new.
-_DECLINED: set[str] = set()
-# See _rendezvous_failure_is_a_fault for why this is not latent_tail's gate.
-_MULTICAST_VALIDATED_ARCH = 10
 
 
 def _rendezvous_failure_is_a_fault() -> bool:
@@ -119,10 +117,8 @@ def _fabric_fault_message(reason: str) -> str:
 
     Raised only here, after every probe said the fabric could map the group:
     that is the one signal that cannot also mean hardware which never carried
-    the feature, so it is the one place a boot may fail. The alternative is not
-    a working server but one that quietly gives back 3.85 GiB of weight per GPU
-    and 20-40 percent of the projection, found months later from a throughput
-    number if at all.
+    the feature, so it is the one place a boot may fail rather than silently
+    serving without the narrowed weights and the faster projection.
     """
     return (
         f"Kimi-K3 down mailbox: the fabric said it could map this group and "
@@ -235,10 +231,8 @@ class _MulticastVaGemm:
             The mailbox, as the fused producer returns it.
 
         The store overwrites rather than accumulates, so a word transitions once
-        a round. That is untested and not cheaply testable: the mailbox is armed
-        with negative zero in both BF16 lanes, adding which is the identity
-        bitwise, so an accumulating publish would be byte-identical to this one.
-        A witness would have to catch a peer reading mid-accumulation.
+        a round; no test can tell the two apart, since the mailbox is armed with
+        negative zero and adding it is bitwise the identity.
         """
         published = self._block[: hidden_states.shape[0]]
         torch.mm(hidden_states, weight_block.t(), out=published)
@@ -256,11 +250,7 @@ def _wide_producer(
 ) -> _Producer:
     """Choose the producer for widths past the fused kernel's ceiling.
 
-    One producer today, and this is the only place a second one is chosen, so a
-    swap is this function plus whatever the new producer is constructed with.
-    The candidate is ``AdaptiveUpProjectionKernel`` in
-    ``fused_add_multicast_gemm.py``, not adopted because it owns the mailbox it
-    publishes into and the slot would have to borrow that one instead.
+    The only place a producer is chosen, so a swap touches this function alone.
     """
     return _MulticastVaGemm(
         multicast_ptr=multicast_ptr,
