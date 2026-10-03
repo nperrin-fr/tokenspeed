@@ -1277,7 +1277,9 @@ class VerifyCommitGPUTest(unittest.TestCase):
                         )
                         torch.testing.assert_close(
                             kwargs["read_indices"],
-                            torch.stack([read_pages[g] for g in layer_groups.values()]),
+                            torch.stack(
+                                [read_pages[g][:live_bs] for g in layer_groups.values()]
+                            ),
                         )
                     else:
                         replay.assert_not_called()
