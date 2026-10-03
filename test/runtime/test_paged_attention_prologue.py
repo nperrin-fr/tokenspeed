@@ -88,8 +88,9 @@ _PROLOGUE_STEPS = {
 }
 
 
-def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
-    """Run ``PagedAttention.prologue`` and return what it handed the kernel entry."""
+def _prologue(monkeypatch, *, qk_norm, mode, rows, slots, query_dtype=None):
+    """Run ``PagedAttention.prologue`` and return what it handed the kernel entry;
+    the backend keeps the query's dtype unless ``query_dtype`` is given."""
     handed = {}
     monkeypatch.setattr(
         paged_attention,
@@ -106,6 +107,7 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
             padded_write_locations=lambda layer, m, rows: handed.update(rows=rows)
             or slots,
             cache_placement=lambda layer: None,
+            prologue_query_dtype=lambda layer, dtype: query_dtype or dtype,
         ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: HeadKVCache(cache, cache, None, s)
@@ -261,6 +263,67 @@ def test_the_prologue_asks_for_a_slot_per_row_it_carries(monkeypatch):
         slots=torch.tensor([5, 6, 7, 0]),
     )
     assert handed["rows"] == 4 and handed["cache"].slots.numel() == 4
+
+
+@pytest.mark.parametrize("query_dtype", [None, torch.float8_e4m3fn])
+def test_the_prologue_writes_the_query_in_the_dtype_attention_reads(
+    monkeypatch, query_dtype
+):
+    """A backend that would cast the query first names the dtype instead, so
+    the prologue's own copy of the query is the cast."""
+    handed = _prologue(
+        monkeypatch,
+        qk_norm=None,
+        mode=ForwardMode.DECODE,
+        rows=2,
+        slots=torch.tensor([5, 6]),
+        query_dtype=query_dtype,
+    )
+    assert handed["query_dtype"] == (query_dtype or torch.bfloat16)
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_an_fp8_query_only_meets_prewrite_extends(kv_dtype):
+    """A postwrite prefill attends the native K/V rows directly, so an FP8 cache,
+    whose query the prologue writes in FP8, must never plan one."""
+    from tokenspeed_kernel.ops.attention.mha import mha_plan
+
+    assert mha_plan(kv_dtype, 128)["extend_mode"] == "prewrite"
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,mxfp8,expected",
+    [
+        (torch.bfloat16, False, torch.bfloat16),
+        (torch.float8_e4m3fn, False, torch.float8_e4m3fn),
+        (torch.float8_e5m2, False, torch.float8_e5m2),
+        (torch.float8_e4m3fn, True, torch.bfloat16),
+    ],
+)
+def test_fp8_mha_backends_take_the_query_in_their_cache_dtype(
+    kv_dtype, mxfp8, expected
+):
+    """Per-tensor FP8 caches read an unscaled FP8 query; MXFP8 quantizes its own."""
+    from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+        MHAAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+        TRTLLMMHAAttnBackend,
+    )
+
+    mha = SimpleNamespace(
+        kv_cache_dtype=kv_dtype, is_fp8=kv_dtype.itemsize == 1 and not mxfp8
+    )
+    assert MHAAttnBackend.prologue_query_dtype(mha, None, torch.bfloat16) == expected
+    if not mxfp8:
+        trtllm = SimpleNamespace(kv_cache_dtype=kv_dtype)
+        trtllm_expected = (
+            torch.float8_e4m3fn if kv_dtype == torch.float8_e4m3fn else torch.bfloat16
+        )
+        assert (
+            TRTLLMMHAAttnBackend.prologue_query_dtype(trtllm, None, torch.bfloat16)
+            == trtllm_expected
+        )
 
 
 @pytest.mark.parametrize("positions", [[0, 5, 4095], [0, 5, 4097]])

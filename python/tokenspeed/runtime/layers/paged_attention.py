@@ -233,6 +233,7 @@ class PagedAttention(nn.Module):
             norm=norm,
             rotary=rotary,
             cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.prologue_query_dtype(self, q.dtype),
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,

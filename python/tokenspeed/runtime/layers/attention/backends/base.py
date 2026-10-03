@@ -452,6 +452,13 @@ class AttentionBackend(CachePoolBinding, ABC):
             raise ValueError(f"{locations.numel()} write slots for {rows} rows")
         return locations
 
+    def prologue_query_dtype(
+        self, layer: PagedAttention, dtype: torch.dtype
+    ) -> torch.dtype:
+        """Dtype the attention prologue writes ``layer``'s ``dtype`` query in:
+        the dtype core attention reads it in, so the prologue's copy is the cast."""
+        return dtype
+
     # ------------------------------------------------------------------
     # PD / speculative side state
     # ------------------------------------------------------------------

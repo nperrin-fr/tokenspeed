@@ -138,6 +138,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def prologue_query_dtype(self, layer, dtype):
+        return self._backend_for_layer(layer.layer_id).prologue_query_dtype(
+            layer, dtype
+        )
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""

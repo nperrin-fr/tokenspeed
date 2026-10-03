@@ -150,6 +150,7 @@ def test_the_gemma_offset_is_formed_in_fp32(solution):
         norm=norm,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 64, seed=54)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -205,6 +206,7 @@ def test_a_zero_offset_keeps_negative_zero_weights(solution):
         norm=HeadNorm(weight, weight, 0.0, 1e-6),
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 8, seed=61)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -258,6 +260,7 @@ def test_the_norm_epsilon_is_applied(solution, scale, eps):
         norm=norm,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 16, seed=132)),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -325,10 +328,59 @@ def test_an_override_must_serve_the_request(override):
                 None,
             ),
             cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 256, seed=141)),
+            query_dtype=q.dtype,
             return_kv=False,
             solution=None,
             override=override,
         )
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("steps", ["nope", "norm_rope"])
+def test_an_fp8_query_leaves_the_cache_and_rounds_like_its_solution(solution, steps):
+    """The FP8 query that attention would cast to: a NoPE query is exactly the
+    cast it replaces; with steps, Triton rounds the fp64 result once and the
+    composite casts its own output. The cache rows do not change."""
+    hq, hkv, dim, tokens = 8, 2, 128, 65
+    inputs = qkv(tokens, hq, hkv, dim, seed=61)
+    norm, rotary = None, None
+    if steps == "norm_rope":
+        norm = head_norm(dim, 0.0, seed=62)
+        positions = torch.arange(tokens, device="cuda") * 37
+        rotary = Rotary(cos_sin_cache(dim), positions, RopeStyle.NEOX, None)
+    runs = [
+        run_gqa(
+            solution,
+            inputs,
+            hq,
+            hkv,
+            dim,
+            norm=norm,
+            rotary=rotary,
+            fmt=KVCacheFormat.FP8,
+            return_kv=False,
+            slots=torch.arange(tokens, device="cuda"),
+            total=tokens,
+            query_dtype=query_dtype,
+        )
+        for query_dtype in (BF16, FP8)
+    ]
+    (q_native, *caches_native), (q_fp8, *caches_fp8) = runs
+    assert q_fp8.dtype == FP8
+    for a, b in zip(caches_native, caches_fp8):
+        assert bytes_equal(a, b)
+    if steps == "nope" or solution == "composite":
+        assert bytes_equal(q_fp8, q_native.to(FP8))
+    else:
+        q = split(inputs, hq, hkv, dim)[0]
+        assert_rounded_once(
+            q_fp8, *reference_heads(q, norm.q_weight, norm, rotary, dim)
+        )
+
+
+def test_a_query_dtype_other_than_its_own_or_fp8_is_refused():
+    with pytest.raises(ValueError, match="as itself or FP8"):
+        gqa_prologue(**_gqa_request(query_dtype=lambda request: torch.float16))
 
 
 @pytest.mark.parametrize(
@@ -420,6 +472,7 @@ def test_gqa_composite_writes_mxfp8():
             scales=MXFP8Scales(ks, vs, page_tokens),
             slots=loc,
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -520,6 +573,7 @@ def test_gqa_writes_only_the_slotted_rows(solution, cache_dtype):
             scales=None,
             slots=loc,
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=solution,
         override=None,
@@ -597,6 +651,7 @@ def test_triton_reads_query_heads_past_int32_offsets():
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, torch.arange(1, device="cuda")),
+        query_dtype=q.dtype,
         return_kv=False,
         solution="triton",
         override=None,
@@ -731,6 +786,7 @@ def test_fp16_rows_round_once_into_a_bf16_cache(solution, tokens):
         norm=None,
         rotary=rotary,
         cache=HeadKVCache(k_cache, v_cache, None, loc),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=solution,
         override=None,
@@ -809,6 +865,7 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
             norm=None,
             rotary=None,
             cache=HeadKVCache(k_cache, v_cache, None, loc),
+            query_dtype=q.dtype,
             return_kv=False,
             solution=None,
             override=None,
@@ -836,6 +893,7 @@ def test_composite_reads_kv_rows_past_int32_offsets():
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, loc),
+        query_dtype=q.dtype,
         return_kv=False,
         solution="composite",
         override=None,
@@ -908,6 +966,7 @@ def test_the_composite_writes_a_prefill_past_65535_tokens(fmt):
                 cache=HeadKVCache(
                     k_cache, v_cache, scales, torch.arange(a, b, device="cuda")
                 ),
+                query_dtype=q.dtype,
                 return_kv=False,
                 solution="composite",
                 override=None,
@@ -944,6 +1003,7 @@ def test_non_interleaved_strided_queries_are_accepted(layout):
             cache=HeadKVCache(
                 *gqa_cache(4, hkv, dim, BF16), None, slots(tokens, 4, seed=157)
             ),
+            query_dtype=x.dtype,
             return_kv=False,
             solution=None,
             override=None,
@@ -1559,6 +1619,7 @@ def test_prologues_accept_zero_tokens(mrope):
             scales=None,
             slots=empty,
         ),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=None,
         override=None,
@@ -1599,6 +1660,7 @@ def _gqa_request(**change) -> dict:
             scales=None,
             slots=slots(tokens, 8, seed=38),
         ),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -1827,6 +1889,7 @@ def _mxfp8_request(
         norm=None,
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, scales, slots(tokens, rows, seed=4)),
+        query_dtype=q.dtype,
         return_kv=False,
         solution=None,
         override=None,
@@ -2176,6 +2239,7 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
             cache=HeadKVCache(
                 k_cache, v_cache, None, torch.arange(count, device="cuda")
             ),
+            query_dtype=q.dtype,
             return_kv=True,
             solution="triton",
             override=None,

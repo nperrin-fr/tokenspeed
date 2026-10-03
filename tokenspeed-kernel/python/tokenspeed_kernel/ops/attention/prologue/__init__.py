@@ -115,6 +115,7 @@ def gqa_prologue(
     norm: HeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
+    query_dtype: torch.dtype,
     return_kv: bool,
     solution: str | None,
     override: str | None,
@@ -132,6 +133,8 @@ def gqa_prologue(
         norm: Per-head RMSNorm, or ``None``.
         rotary: Rotary embedding, or ``None`` for NoPE.
         cache: KV cache destination.
+        query_dtype: Dtype of the returned query: ``q.dtype``, or an FP8
+            dtype for attention that reads an unscaled FP8 query.
         return_kv: Also return the rotated key and the value rows, for
             attention kernels that read them instead of the cache.
         solution: Optional registered solution to select.
@@ -141,6 +144,11 @@ def gqa_prologue(
         The query and optional key/value rows for core attention.
     """
     check_gqa_request(q, k, v, norm, rotary, cache)
+    if query_dtype not in (q.dtype, torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(
+            f"the GQA prologue writes a {q.dtype} query as itself or FP8, "
+            f"not {query_dtype}"
+        )
     num_tokens = q.shape[0]
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
     num_q_heads = q.shape[1:].numel() // head_dim
@@ -177,6 +185,7 @@ def gqa_prologue(
             norm=norm,
             rotary=rotary,
             cache=cache,
+            query_dtype=query_dtype,
             return_kv=return_kv,
             enable_pdl=pdl_enabled(),
         )
@@ -218,6 +227,7 @@ def qk_norm_rope(
             scales=None,
             slots=k.new_empty(0, dtype=torch.int64),
         ),
+        query_dtype=q.dtype,
         return_kv=True,
         solution=None,
         override=None,

@@ -252,6 +252,12 @@ class MHAAttnBackend(PagedAttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    def prologue_query_dtype(
+        self, layer: PagedAttention, dtype: torch.dtype
+    ) -> torch.dtype:
+        # FP8 caches plan prewrite extends, so no postwrite prefill meets this query.
+        return self.kv_cache_dtype if self.is_fp8 else dtype
+
     def forward_decode(
         self,
         q: torch.Tensor,

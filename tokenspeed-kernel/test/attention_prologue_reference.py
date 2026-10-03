@@ -128,8 +128,10 @@ def run_gqa(
     slots: torch.Tensor,
     total: int,
     strided_q: bool = False,
+    query_dtype: torch.dtype | None = None,
 ) -> list[torch.Tensor]:
-    """Query, key cache, value cache, then the returned key and value."""
+    """Query, key cache, value cache, then the returned key and value; the query
+    keeps the input dtype unless ``query_dtype`` is given."""
     q, k, v = split(qkv.clone(), hq, hkv, head_dim)
     if strided_q:
         q = torch.stack(
@@ -146,6 +148,7 @@ def run_gqa(
         norm=norm,
         rotary=rotary,
         cache=HeadKVCache(k_cache=k_cache, v_cache=v_cache, scales=None, slots=slots),
+        query_dtype=q.dtype if query_dtype is None else query_dtype,
         return_kv=return_kv,
         solution=solution,
         override=None,

@@ -779,6 +779,9 @@ class CacheGroupRouter(AttentionBackend):
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
 
+    def prologue_query_dtype(self, layer, dtype):
+        return self._leaf_for(layer).prologue_query_dtype(layer, dtype)
+
     @break_point
     def forward(
         self,

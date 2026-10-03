@@ -337,6 +337,13 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         return k_cache, v_cache
 
+    def prologue_query_dtype(
+        self, layer: PagedAttention, dtype: torch.dtype
+    ) -> torch.dtype:
+        return (
+            torch.float8_e4m3fn if self.kv_cache_dtype == torch.float8_e4m3fn else dtype
+        )
+
     def _prepare_q(self, q: torch.Tensor, layer: PagedAttention) -> torch.Tensor:
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             q = fp8_cast_contiguous(q)
