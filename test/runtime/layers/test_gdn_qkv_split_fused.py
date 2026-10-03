@@ -97,7 +97,7 @@ def test_split_l2norm_correctness(nq, nv, hq, hv, T, dtype):
 
 @pytest.mark.parametrize("nq,nv,hq,hv,T", CONFIGS[:2])
 def test_strided_input(nq, nv, hq, hv, T):
-    """Strided input must produce same result as contiguous (b3 fallback)."""
+    """Row-strided input is read in place and matches the contiguous split."""
     nk = nq
     hk = hq
     dtype = torch.bfloat16
@@ -115,6 +115,41 @@ def test_strided_input(nq, nv, hq, hv, T):
     assert torch.max(torch.abs(q.float() - q_ref.float())) < 1e-5
     assert torch.max(torch.abs(k.float() - k_ref.float())) < 1e-5
     assert torch.max(torch.abs(v.float() - v_ref.float())) < 1e-5
+
+
+def test_projection_slice_launches_only_the_split():
+    """A verify window sliced out of the in-projection needs no contiguous copy."""
+    nq = nk = 8
+    nv, hq, hv, T = 16, 128, 64, 16
+    qkv_dim = nq * hq + nk * hq + nv * hv
+    projected = torch.randn(T, qkv_dim + 3000, dtype=torch.bfloat16, device="cuda")
+    window = projected[:, 1000 : 1000 + qkv_dim]
+    expected = _ref_split(window.contiguous(), nq, nk, nv, hq, hq, hv)
+    fused_qkv_split_gdn_prefill(window, nq, nk, nv, hq, hq, hv)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        actual = fused_qkv_split_gdn_prefill(window, nq, nk, nv, hq, hq, hv)
+        torch.cuda.synchronize()
+    kernels = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert kernels == ["_fused_qkv_split_kernel"]
+    for got, ref in zip(actual, expected, strict=True):
+        assert torch.equal(got, ref)
+
+    # A transposed layout still takes the contiguous copy and splits correctly.
+    transposed = torch.randn(qkv_dim, T, dtype=torch.bfloat16, device="cuda").t()
+    expected = _ref_split(transposed.contiguous(), nq, nk, nv, hq, hq, hv)
+    for got, ref in zip(
+        fused_qkv_split_gdn_prefill(transposed, nq, nk, nv, hq, hq, hv),
+        expected,
+        strict=True,
+    ):
+        assert torch.equal(got, ref)
 
 
 @pytest.mark.parametrize("fuse_l2norm", [False, True])
