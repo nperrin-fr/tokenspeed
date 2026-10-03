@@ -54,7 +54,7 @@ def attn_res_fwd_packed(
     block_residual: torch.Tensor,
     res_weight: torch.Tensor,
     rms_weight: torch.Tensor,
-    rms_eps: float = 1e-6,
+    rms_eps: float,
     out_norm_weight: torch.Tensor | None = None,
     delta: torch.Tensor | None = None,
     num_blocks: int | None = None,

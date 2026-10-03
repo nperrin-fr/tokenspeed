@@ -196,13 +196,16 @@ class DistributedInitializer:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )
+            from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
+                MAX_ONESHOT_BYTES,
+            )
 
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
                 # One-shot window; configure_group widens cross-node groups.
                 max_oneshot_tokens = max(
-                    1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
+                    1, MAX_ONESHOT_BYTES // max(config.hidden_size * 2, 1)
                 )
                 for group in {
                     config.mapping.attn.tp_group,
