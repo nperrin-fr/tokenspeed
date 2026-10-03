@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
+    trtllm_gen_counter_buffer,
     trtllm_ragged_attention_deepseek,
 )
 
@@ -420,6 +421,9 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
+            multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
+                query.device, query.shape[0] * query.shape[1], query.shape[2]
+            ),
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)

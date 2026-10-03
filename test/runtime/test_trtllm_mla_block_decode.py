@@ -103,6 +103,19 @@ def test_fill_block_decode_seq_lens_publishes_clamped_lengths() -> None:
     assert backend.seq_lens_buf.tolist() == [4, 64]
 
 
+_COUNTERS = torch.zeros(8, dtype=torch.uint8)
+
+
+def _counters(sized: list[int]):
+    """The shared counters; records the query rows times heads each call sizes them for."""
+
+    def counters(device: torch.device, batch_size: int, num_heads: int) -> torch.Tensor:
+        sized.append(batch_size * num_heads)
+        return _COUNTERS
+
+    return counters
+
+
 def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> None:
     backend = _backend(draft_block_decode=True)
     backend.forward_decode_metadata = TRTLLMMLADecodeMetadata(
@@ -119,6 +132,7 @@ def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> Non
         get_key_buffer=lambda _layer_id: torch.zeros(4, 4, dtype=torch.bfloat16)
     )
     captured = {}
+    sized: list[int] = []
 
     def fake_decode(**kwargs):
         captured.update(kwargs)
@@ -126,7 +140,7 @@ def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> Non
 
     with mock.patch.object(
         trtllm_mla, "trtllm_batch_decode_with_kv_cache_mla", fake_decode
-    ):
+    ), mock.patch.object(trtllm_mla, "trtllm_gen_counter_buffer", _counters(sized)):
         output = backend.forward_decode(
             q=q,
             k=None,
@@ -150,6 +164,8 @@ def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> Non
     ]
     assert captured["seq_lens"].tolist() == [11] * 4 + [23] * 4
     assert captured["max_seq_len"] == 64
+    assert captured["multi_ctas_kv_counter_buffer"] is _COUNTERS
+    assert sized == [8]
 
 
 def test_non_block_draft_keeps_causal_catch_up_offsets() -> None:
@@ -166,6 +182,7 @@ def test_non_block_draft_keeps_causal_catch_up_offsets() -> None:
         get_key_buffer=lambda _layer_id: torch.zeros(4, 4, dtype=torch.bfloat16)
     )
     captured = {}
+    sized: list[int] = []
 
     def fake_decode(**kwargs):
         captured.update(kwargs)
@@ -173,7 +190,7 @@ def test_non_block_draft_keeps_causal_catch_up_offsets() -> None:
 
     with mock.patch.object(
         trtllm_mla, "trtllm_batch_decode_with_kv_cache_mla", fake_decode
-    ):
+    ), mock.patch.object(trtllm_mla, "trtllm_gen_counter_buffer", _counters(sized)):
         backend.forward_decode(
             q=q,
             k=None,

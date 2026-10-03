@@ -61,9 +61,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
     from flashinfer.decode import (
         trtllm_batch_decode_with_kv_cache_mla as _trtllm_batch_decode_with_kv_cache_mla,
     )
-
-if platform.is_blackwell or platform.is_hopper:
-    from flashinfer.mla import get_trtllm_gen_multi_ctas_kv_counter_bytes
+    from tokenspeed_kernel.thirdparty.flashinfer.attention import (
+        trtllm_gen_counter_buffer,
+    )
 
 
 def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
@@ -95,8 +95,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
 
 
 _dsa_sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
-_dsa_sparse_counter_buffers: dict[torch.device, torch.Tensor] = {}
-_retired_dsa_sparse_counter_buffers: list[torch.Tensor] = []
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
 
 
@@ -183,30 +181,6 @@ def _topk_lens_or_count(
     if topk_lens is not None:
         return topk_lens.to(device=topk_slots.device, dtype=torch.int32).contiguous()
     return (topk_slots >= 0).sum(dim=-1, dtype=torch.int32).contiguous()
-
-
-def _get_dsa_sparse_counter_buffer(
-    device: torch.device | str,
-    num_tokens: int,
-    num_heads: int,
-) -> torch.Tensor:
-    device = torch.device(device)
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-        int(num_tokens), int(num_heads), int(sm_count)
-    )
-    counter = _dsa_sparse_counter_buffers.get(device)
-    if counter is None or counter.numel() < required_bytes:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "FlashInfer DSA counter workspace must be initialized before "
-                "CUDA Graph capture."
-            )
-        if counter is not None:
-            _retired_dsa_sparse_counter_buffers.append(counter)
-        counter = torch.zeros(required_bytes, dtype=torch.uint8, device=device)
-        _dsa_sparse_counter_buffers[device] = counter
-    return counter
 
 
 def _prepare_nope_sparse_slots(
@@ -302,7 +276,7 @@ def _flashinfer_trtllm_dsa_impl(
         bmm1_scale=float(k_scale) * float(softmax_scale),
         bmm2_scale=1.0,
         backend="trtllm-gen",
-        multi_ctas_kv_counter_buffer=_get_dsa_sparse_counter_buffer(
+        multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
             q.device, num_tokens, q_kernel.shape[2]
         ),
         sparse_mla_top_k_lens=sparse_topk_lens,

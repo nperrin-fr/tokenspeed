@@ -33,6 +33,7 @@ import torch
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
+    trtllm_gen_counter_buffer,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -395,6 +396,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             sinks=attention_sink,
             out_dtype=self.dtype,
             q_len_per_req=metadata.max_seq_len_q,
+            multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
+                q.device, q.shape[0] // metadata.max_seq_len_q, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -433,6 +437,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
+            multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
+                q.device, metadata.cu_seqlens_q.shape[0] - 1, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

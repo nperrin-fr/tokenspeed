@@ -45,6 +45,7 @@ trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
 trtllm_ragged_attention_deepseek = error_fn
+trtllm_gen_counter_buffer = error_fn
 
 
 def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
@@ -89,6 +90,9 @@ if platform.is_nvidia:
     )
     from flashinfer.prefill import (
         trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
+    )
+    from tokenspeed_kernel.thirdparty.flashinfer.attention import (
+        trtllm_gen_counter_buffer,
     )
 
     trtllm_batch_context_with_kv_cache = _with_pdl_default(
@@ -195,6 +199,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
+            multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
+                q.device, cache_seqlens.shape[0], q.shape[1]
+            ),
             enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
@@ -268,6 +275,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
+            multi_ctas_kv_counter_buffer=trtllm_gen_counter_buffer(
+                q.device, cache_seqlens.shape[0], q.shape[1]
+            ),
             enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
@@ -285,5 +295,6 @@ __all__ = [
     "trtllm_batch_context_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
+    "trtllm_gen_counter_buffer",
     "trtllm_ragged_attention_deepseek",
 ]
