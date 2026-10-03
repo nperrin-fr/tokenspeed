@@ -90,6 +90,9 @@ from tokenspeed.runtime.utils.tensor import upload_packed
 
 logger = logging.getLogger(__name__)
 
+# The replay tape holds one row pointer (PTR0..PTR7) and width (USER0..USER7) per group.
+_TAPE_MAX_STATE_GROUPS = 8
+
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.metadata import PrepTape
 
@@ -453,7 +456,6 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_scratch = None
         self._verify_commit_ctx = None
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
-        self._replay_state_tapes: dict[int, PrepTape] = {}
 
     @property
     def kv_pool(self) -> CachePool | None:
@@ -475,6 +477,8 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._qsl_dirty: list[bool] = []
         self._qsl_last_mode: list[tuple[ForwardMode, bool] | None] = []
+        # Tapes bake in the index buffers' addresses, so they die with them.
+        self._replay_state_tapes: dict[int, PrepTape] = {}
 
     def set_kv_pool(self, kv_pool: CachePool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -1460,7 +1464,7 @@ class MambaAttnBackend(AttentionBackend):
             not cache_debug_enabled()
             and seq_lens.is_cuda
             and seq_lens.dtype == torch.int32
-            and len(gids) <= 4
+            and len(gids) <= _TAPE_MAX_STATE_GROUPS
             and all(gid in block_tables for gid in gids)
         )
         if use_tape:
@@ -1477,7 +1481,7 @@ class MambaAttnBackend(AttentionBackend):
                         sin,
                         sout,
                         rows_ptr=Reg(Reg.PTR0 + i),
-                        seq_lens_ptr=Reg.PTR4,
+                        seq_lens_ptr=Reg.PTR8,
                         bs=Reg.REAL_BS,
                         max_slots=Reg(Reg.USER0 + i),
                         page_size=self._checkpoint_granularity,
@@ -1490,7 +1494,7 @@ class MambaAttnBackend(AttentionBackend):
                     )
                 tape.finalize()
                 tapes[bs] = tape
-            regs = {Reg.REAL_BS: real_bs, Reg.PTR4: seq_lens}
+            regs = {Reg.REAL_BS: real_bs, Reg.PTR8: seq_lens}
             for i, gid in enumerate(gids):
                 rows = block_tables[gid]
                 regs[Reg(Reg.PTR0 + i)] = rows
