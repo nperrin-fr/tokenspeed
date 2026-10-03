@@ -324,7 +324,7 @@ class ServerArgs:
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     disable_kda_prefill_graph: bool = False
-    # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
+    # Breakable prefill graph bucket cap: None = auto min(4096, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
@@ -2136,7 +2136,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
             help="Largest token bucket captured by the breakable prefill CUDA "
-            "graph. Default (unset) = min(2048, chunked-prefill size); "
+            "graph. Default (unset) = min(4096, chunked-prefill size); "
             "0 disables.",
         )
         prefill_token_sizes = parser.add_mutually_exclusive_group()
