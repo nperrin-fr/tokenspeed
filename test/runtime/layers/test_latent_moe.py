@@ -800,12 +800,10 @@ def test_kimi3_latent_projection_without_a_group_has_no_shard_size() -> None:
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 1280, 1281])
-@pytest.mark.parametrize("narrowed", [False, True])
 @pytest.mark.parametrize("nvfp4_available", [False, True])
 def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tokens: int,
-    narrowed: bool,
     nvfp4_available: bool,
 ) -> None:
     world, rank, out, k = 4, 1, 16, 8
@@ -851,7 +849,7 @@ def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
         k,
         out,
         params_dtype=torch.float32,
-        column_group=tuple(range(world)) if narrowed else None,
+        column_group=tuple(range(world)),
         shard_rank=rank,
         shard_size=world,
         multicast_down=mailbox,
@@ -874,7 +872,7 @@ def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
             torch.testing.assert_close(payload, expected)
     else:
         mailbox.assert_not_called()
-        assert len(gathers) == int(narrowed)
+        assert len(gathers) == 1
         torch.testing.assert_close(payload, expected)
 
 
@@ -935,34 +933,27 @@ def _multicast_projection(monkeypatch, world, rank, out, k, calls, max_m=8):
         k,
         out,
         params_dtype=torch.float32,
+        column_group=tuple(range(world)),
         shard_rank=rank,
         shard_size=world,
         multicast_down=_FakeMulticastDown(rank, out // world, out, calls, max_m),
     )
 
 
-def test_the_multicast_path_needs_no_group_of_its_own(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The op carries its own group, so the projection needs none wired in."""
-    out, k = 16, 64
-    monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
-        lambda x, w, solution=None: pytest.fail("the multicast op must be dispatched"),
-        raising=False,
-    )
-    calls: list = []
-    proj = latent_module.Kimi3LatentProjection(
-        k,
-        out,
-        params_dtype=torch.float32,
-        shard_rank=0,
-        shard_size=4,
-        multicast_down=_FakeMulticastDown(0, out // 4, out, calls),
-    )
-    proj(torch.zeros(1, k))
-    assert calls == [(1, (out // 4, k))]
+def test_the_column_split_and_its_mailbox_come_together() -> None:
+    """Either alone is a configuration that never narrows or never gathers."""
+    with pytest.raises(ValueError, match="come together"):
+        latent_module.Kimi3LatentProjection(
+            64,
+            16,
+            shard_rank=0,
+            shard_size=4,
+            multicast_down=_FakeMulticastDown(0, 4, 16, []),
+        )
+    with pytest.raises(ValueError, match="come together"):
+        latent_module.Kimi3LatentProjection(
+            64, 16, column_group=(0, 1, 2, 3), shard_rank=0, shard_size=4
+        )
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 9, 512])
@@ -988,37 +979,13 @@ def test_kimi3_latent_projection_claimed_batches_take_the_multicast_path(
     torch.testing.assert_close(torch.cat(blocks, dim=1), hidden @ weight.T)
 
 
-def test_kimi3_latent_projection_hands_wide_batches_back_to_the_replicated_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Past the width the op claims there is nothing left but the full weight."""
-    world, out, k = 4, 16, 64
-    calls: list = []
-    replicated: list = []
-    torch.manual_seed(1234)
-    weight = torch.randn(out, k)
-    proj = _multicast_projection(monkeypatch, world, 0, out, k, calls, 8)
-    proj.weight_loader(proj.weight, weight)
-    # After the fixture, whose own stub would otherwise shadow this one.
-    monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
-        lambda x, w, solution=None: replicated.append(x.shape[0]) or x @ w.T,
-        raising=False,
-    )
-    hidden = torch.randn(9, k)
-    output, _ = proj(hidden)
-    assert calls == []
-    assert replicated == [9]
-    torch.testing.assert_close(output, hidden @ weight.T)
-
-
 def test_kimi3_latent_projection_rejects_a_multicast_op_that_disagrees() -> None:
     """The op's rank and block must match the projection it is attached to."""
     with pytest.raises(ValueError, match="does not match the projection"):
         latent_module.Kimi3LatentProjection(
             64,
             16,
+            column_group=(0, 1),
             shard_rank=0,
             shard_size=2,
             multicast_down=_FakeMulticastDown(1, 8, 16, []),
@@ -1027,27 +994,15 @@ def test_kimi3_latent_projection_rejects_a_multicast_op_that_disagrees() -> None
         latent_module.Kimi3LatentProjection(
             64,
             16,
+            column_group=(0, 1),
             shard_rank=0,
             shard_size=2,
             multicast_down=_FakeMulticastDown(0, 4, 16, []),
         )
-    with pytest.raises(ValueError, match="cannot also multicast"):
-        latent_module.Kimi3LatentProjection(
-            64,
-            16,
-            shard_group=(0, 1),
-            shard_rank=0,
-            shard_size=2,
-            multicast_down=_FakeMulticastDown(0, 8, 16, []),
-        )
 
 
-def _column_projection(monkeypatch, world, rank, out, k, calls=None, max_m=0):
-    """A CPU projection that column-splits over replicated storage.
-
-    ``max_m`` above zero also attaches a multicast op, so the three-way
-    dispatch can be exercised on one object.
-    """
+def _column_projection(monkeypatch, world, rank, out, k, calls, max_m):
+    """A CPU projection with a column split and its multicast op."""
     monkeypatch.setattr(
         latent_module.tokenspeed_kernel,
         "kimi3_latent_projection",
@@ -1067,30 +1022,8 @@ def _column_projection(monkeypatch, world, rank, out, k, calls=None, max_m=0):
         column_group=tuple(range(world)),
         shard_rank=rank,
         shard_size=world,
-        multicast_down=(
-            _FakeMulticastDown(rank, out // world, out, calls, max_m) if max_m else None
-        ),
+        multicast_down=_FakeMulticastDown(rank, out // world, out, calls, max_m),
     )
-
-
-def test_column_group_keeps_the_weight_full_width(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Without a mailbox the replica is reachable, so every row is kept.
-
-    This is the configuration that cannot narrow: the shard loses badly to the
-    replica at decode widths, so the replica has to stay available, and it
-    needs the full width to run. Narrowing is pinned in the mailboxed case.
-    """
-    world, out, k = 4, 16, 8
-    full = torch.arange(out * k, dtype=torch.float32).view(out, k)
-    rows = out // world
-    for rank in range(world):
-        proj = _column_projection(monkeypatch, world, rank, out, k)
-        proj.weight_loader(proj.weight, full)
-        assert proj.weight.shape == (out, k)
-        torch.testing.assert_close(proj.weight.data, full)
-        assert proj.shard_slice == (rank * rows, rows)
 
 
 def _gather_recorder(monkeypatch, world, gathers):
@@ -1132,38 +1065,6 @@ def test_a_narrowed_column_projection_never_reaches_the_replica(
     # Every width past the mailbox took the shard; none took the replica.
     assert [c[0] for c in calls] == [8]
     assert gathers == [9, crossover - 1, crossover, 0]
-
-
-def test_without_a_mailbox_no_width_gathers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The column split is taken only where the mailbox is, at every width.
-
-    Without the fabric the gather falls back to a buffer-and-permute over
-    NCCL, which under graph replay costs 254us at a full prefill chunk
-    against the replicated projection's 226us -- so the split is a loss
-    everywhere on such a machine, not only below some crossover. The old
-    dispatch gathered above 1280 because that width was measured on hardware
-    that has the fabric.
-    """
-    world, out, k = 4, 16, 8
-    torch.manual_seed(0)
-    full = torch.randn(out, k)
-    monkeypatch.setattr(
-        latent_module,
-        "all_gather",
-        lambda *a, **kw: pytest.fail("no gather without a mailbox"),
-    )
-    proj = _column_projection(monkeypatch, world, 2, out, k)
-    proj.weight_loader(proj.weight, full)
-    assert not proj.narrowed and proj.weight.shape == (out, k)
-
-    ceiling = latent_module.DOWN_MAILBOX_MAX_TOKENS
-    for tokens in (9, ceiling - 1, ceiling, ceiling + 1):
-        x = torch.randn(tokens, k)
-        got, _ = proj(x)
-        assert got.shape == (tokens, out)
-        torch.testing.assert_close(got, x @ full.T)
 
 
 def test_column_group_and_shard_group_are_exclusive() -> None:

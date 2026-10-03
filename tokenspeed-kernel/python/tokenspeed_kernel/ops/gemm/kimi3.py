@@ -37,7 +37,7 @@ from types import MappingProxyType
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
-from tokenspeed_kernel.ops.gemm.triton_gemv import use_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.platform import Platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
@@ -493,8 +493,6 @@ def kimi3_latent_projection(
             out=out,
         )
     if routed and use_decode_gemv(hidden_states, weight):
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         return decode_gemv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
@@ -606,8 +604,6 @@ def kimi3_mla_qkv_gate_projection(
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=packed)
 
     if solution == "fused":
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         packed = decode_gemv(hidden_states, weight)
         qkv, gate = packed.split((qkv_width, output_width - qkv_width), dim=-1)
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=packed)
@@ -1067,8 +1063,6 @@ def kimi3_shared_situ_projection(
         return out
 
     if routed and use_decode_gemv(hidden_states, gate_up_weight):
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         gate_up = decode_gemv(hidden_states, gate_up_weight)
     else:
         gate_up = (
@@ -1195,8 +1189,6 @@ def kimi3_shared_down_projection(
         else:
             solution = "torch"
     if routed and use_decode_gemv(hidden_states, weight):
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         return decode_gemv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
@@ -1395,8 +1387,6 @@ def kimi3_qkvfab_projection(
             out=out,
         )
     if solution == "decode_gemv":
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         result = decode_gemv(hidden_states, weight)
         if out is None:
             return result

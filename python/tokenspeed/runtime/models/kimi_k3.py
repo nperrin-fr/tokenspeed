@@ -672,6 +672,45 @@ def _sliced_scratch(like: torch.Tensor, slot: int, n_tokens: int):
     return m[:n_tokens], s_[:n_tokens], acc[:n_tokens]
 
 
+def _next_attnres_partial_args(
+    next_mix: tuple[KimiLinearDecoderLayer, int],
+    hoist_mlp: bool,
+    block_residual: torch.Tensor,
+    like: torch.Tensor,
+) -> tuple:
+    """Arguments of the next layer's block partials that this layer's sweep runs.
+
+    The attn-side partial alone, or with ``hoist_mlp`` both partials in
+    ``attnres_partial_dual`` order.
+    """
+    next_layer, valid_blocks = next_mix
+    num_tokens = like.shape[0]
+    attn_scratch = _sliced_scratch(like, 1, num_tokens)
+    if not hoist_mlp:
+        return (
+            block_residual[:valid_blocks],
+            next_layer._attn_wp,
+            next_layer.self_attention_res_norm.variance_epsilon,
+            attn_scratch,
+        )
+    return (
+        block_residual[:valid_blocks],
+        next_layer._mlp_wp,
+        next_layer._attn_wp,
+        next_layer.mlp_res_norm.variance_epsilon,
+        _sliced_scratch(like, next_layer._mlp_slot, num_tokens),
+        attn_scratch,
+    )
+
+
+def _run_next_attnres_partials(hoist_mlp: bool, args: tuple) -> None:
+    """Launch the partials ``_next_attnres_partial_args`` described."""
+    if hoist_mlp:
+        attnres_partial_dual(*args)
+    else:
+        attnres_partial(*args)
+
+
 def _apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -848,6 +887,15 @@ def _assemble_fp8_fused_qkv_a(
     return fused_w, fused_s
 
 
+def _is_moe_layer(config, layer_id: int) -> bool:
+    """Whether target layer ``layer_id`` runs a MoE block rather than a dense MLP."""
+    return (
+        config.num_experts is not None
+        and layer_id >= config.first_k_dense_replace
+        and layer_id % config.moe_layer_freq == 0
+    )
+
+
 def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
     """MoE blocks this pipeline stage runs, which is what the rotation sees.
 
@@ -855,16 +903,8 @@ def _k3_local_moe_blocks(config, mapping: Mapping) -> int:
     every step, so it states its own count rather than deriving one from the
     target checkpoint's layers.
     """
-    if mapping.pp_size > 1:
-        start, end = pp_layer_window(config.num_hidden_layers, mapping)
-    else:
-        start, end = 0, config.num_hidden_layers
-    freq = config.moe_layer_freq
-    return sum(
-        1
-        for layer in range(start, end)
-        if layer >= config.first_k_dense_replace and layer % freq == 0
-    )
+    start, end = pp_layer_window(config.num_hidden_layers, mapping)
+    return sum(_is_moe_layer(config, layer) for layer in range(start, end))
 
 
 def _shard_k3_latent_projection(mapping: Mapping, hidden_size: int) -> bool:
@@ -1860,16 +1900,14 @@ class KimiLinearMoE(nn.Module):
             else None
         )
         # Past the mailbox's ceiling the same columns split over the group again.
-        column_down = (
-            self._shard_latent_projections
-            and self.routed_hidden % mapping.moe.tp_ep_size == 0
-        )
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
             multicast_down=multicast_down,
-            column_group=(mapping.moe.tp_ep_group if column_down else None),
+            column_group=(
+                mapping.moe.tp_ep_group if multicast_down is not None else None
+            ),
             shard_rank=mapping.moe.tp_ep_rank,
             shard_size=mapping.moe.tp_ep_size,
         )
@@ -2026,8 +2064,11 @@ class KimiLinearMoE(nn.Module):
         same width, so one ``[experts + latent + 2 * shared, hidden]`` weight
         lets a single GEMM replace three. Each module keeps a contiguous row
         view of that tensor, so the rebinding adds no steady-state memory and
-        leaves the separate composition working unchanged.
+        leaves the separate composition working unchanged. A narrowed routed
+        projection stays unpacked: it holds one rank's columns, not the latent.
         """
+        if self.routed_expert_down_proj.narrowed:
+            return
         modules = (
             self.gate,
             self.routed_expert_down_proj,
@@ -2055,16 +2096,11 @@ class KimiLinearMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
-        Returns ``None`` before the projection weights are concatenated, and
-        whenever the routed projection narrowed its storage: this path reads that
-        weight directly, so it would hand the experts one rank's columns instead
-        of the gathered latent. The caller then takes the projection's own
-        forward, which gathers.
+        Returns ``None`` unless the projection weights were packed, which a
+        narrowed routed projection never is; the caller then takes the
+        projections' own forwards, which gather.
         """
-        if (
-            self.packed_input_projection_weight is None
-            or self.routed_expert_down_proj.narrowed
-        ):
+        if self.packed_input_projection_weight is None:
             return None
         router_logits, routed_input, shared_input = latent_moe_input_projections(
             hidden_states,
@@ -2714,11 +2750,7 @@ class KimiLinearDecoderLayer(nn.Module):
             )
 
         # --- FFN: dense MLP (first_k_dense_replace) or MoE block ---
-        self.is_moe_layer = (
-            config.num_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
-        )
+        self.is_moe_layer = _is_moe_layer(config, layer_id)
         situ_beta, situ_linear_beta = _situ_betas(config)
         if self.is_moe_layer:
             # Named for the checkpoint index; not aliased as self.mlp (double
@@ -2759,6 +2791,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self.is_block_write_layer = layer_id % block == 0
         self.block_write_idx = layer_id // block
         self.prev_valid_blocks = ceil_div(layer_id, block)
+        self.mlp_valid_blocks = self.prev_valid_blocks + int(self.is_block_write_layer)
         self.self_attention_res_norm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -2918,7 +2951,6 @@ class KimiLinearDecoderLayer(nn.Module):
         if not pre_attn:
             return False
 
-        mlp_valid_blocks = self.prev_valid_blocks + int(self.is_block_write_layer)
         return attn_res_fwd_available(
             hidden_states,
             block_residual,
@@ -2928,7 +2960,7 @@ class KimiLinearDecoderLayer(nn.Module):
             out_norm_weight=self.post_attention_layernorm.weight,
             out_norm_eps=self.post_attention_layernorm.variance_epsilon,
             delta=None if self.is_block_write_layer else hidden_states,
-            num_valid_blocks=mlp_valid_blocks,
+            num_valid_blocks=self.mlp_valid_blocks,
         )
 
     def _forward_fused_attnres_graph(
@@ -2980,8 +3012,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 eps=self.mlp_res_norm.variance_epsilon,
                 out_norm_weight=self.post_attention_layernorm.weight,
                 out_norm_eps=self.post_attention_layernorm.variance_epsilon,
-                num_valid_blocks=self.prev_valid_blocks
-                + int(self.is_block_write_layer),
+                num_valid_blocks=self.mlp_valid_blocks,
             )
         prefix_is_sharded = mixed is not None
         if mixed is not None:
@@ -2997,7 +3028,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 block_residual,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
-                self.prev_valid_blocks + int(self.is_block_write_layer),
+                self.mlp_valid_blocks,
                 out_norm=self.post_attention_layernorm,
                 delta=delta,
             )
@@ -3036,26 +3067,15 @@ class KimiLinearDecoderLayer(nn.Module):
         ):
             return
 
-        next_layer, valid_blocks = self._next_attn_mix
+        next_layer, _ = self._next_attn_mix
         if next_layer._fused_attnres_graph_available(hidden_states, block_residual):
             return
-        attn_scratch = _sliced_scratch(hidden_states, 1, num_tokens)
-        if self._hoist_next_mlp:
-            attnres_partial_dual(
-                block_residual[:valid_blocks],
-                next_layer._mlp_wp,
-                next_layer._attn_wp,
-                next_layer.mlp_res_norm.variance_epsilon,
-                _sliced_scratch(hidden_states, next_layer._mlp_slot, num_tokens),
-                attn_scratch,
-            )
-        else:
-            attnres_partial(
-                block_residual[:valid_blocks],
-                next_layer._attn_wp,
-                next_layer.self_attention_res_norm.variance_epsilon,
-                attn_scratch,
-            )
+        _run_next_attnres_partials(
+            self._hoist_next_mlp,
+            _next_attnres_partial_args(
+                self._next_attn_mix, self._hoist_next_mlp, block_residual, hidden_states
+            ),
+        )
 
     @torch.no_grad()
     def forward(
@@ -3077,20 +3097,22 @@ class KimiLinearDecoderLayer(nn.Module):
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
-        mlp_valid_blocks = self.prev_valid_blocks + (
-            1 if self.is_block_write_layer else 0
-        )
         num_tokens = h.shape[0]
         split_mix = (
             0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
             and h.is_cuda
-            and mlp_valid_blocks > 0
+            and self.mlp_valid_blocks > 0
         )
         scratch = _sliced_scratch(h, self._mlp_slot, num_tokens) if split_mix else None
         # Block-write layers only: theirs cannot ride the previous sweep.
         own_mlp = split_mix and not self._mlp_split
-        next_mix = self._next_attn_mix if split_mix else None
-        sc1 = _sliced_scratch(h, 1, num_tokens) if next_mix is not None else None
+        next_args = (
+            _next_attnres_partial_args(
+                self._next_attn_mix, self._hoist_next_mlp, block_residual, h
+            )
+            if split_mix and self._next_attn_mix is not None
+            else None
+        )
         # The mlp-side combine (blocks partial + post-AR prefix) rides the
         # attention AR epilogue on the fused path.
         ar_combine = (
@@ -3104,22 +3126,14 @@ class KimiLinearDecoderLayer(nn.Module):
             if split_mix
             else None
         )
-        attnres_partial_args = None
-        if next_mix is not None and self._hoist_next_mlp:
-            next_layer, _ = next_mix
-            # This layer's attention projection writes both block partials
-            # hoisted for the next layer, which consumes their scratch slots.
-            # Kernel availability below is the token-count capability gate.
-            candidate_args = (
-                block_residual[:mlp_valid_blocks],
-                next_layer._mlp_wp,
-                next_layer._attn_wp,
-                self.mlp_res_norm.variance_epsilon,
-                _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
-                sc1,
-            )
-            if self.self_attn.can_fuse_attnres_partials(h, candidate_args):
-                attnres_partial_args = candidate_args
+        # The attention projection can write both hoisted partials for the next layer.
+        attnres_partial_args = (
+            next_args
+            if next_args is not None
+            and self._hoist_next_mlp
+            and self.self_attn.can_fuse_attnres_partials(h, next_args)
+            else None
+        )
         reduce_consumes_scratch = (
             own_mlp
             and ar_combine is not None
@@ -3147,28 +3161,11 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         ) as fork:
             with fork.branch():
-                if next_mix is not None:
-                    next_layer, _ = next_mix
-                    if self._hoist_next_mlp:
-                        if attnres_partial_args is None:
-                            attnres_partial_dual(
-                                block_residual[:mlp_valid_blocks],
-                                next_layer._mlp_wp,
-                                next_layer._attn_wp,
-                                self.mlp_res_norm.variance_epsilon,
-                                _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
-                                sc1,
-                            )
-                    else:
-                        attnres_partial(
-                            block_residual[:mlp_valid_blocks],
-                            next_layer._attn_wp,
-                            self.mlp_res_norm.variance_epsilon,
-                            sc1,
-                        )
+                if next_args is not None and attnres_partial_args is None:
+                    _run_next_attnres_partials(self._hoist_next_mlp, next_args)
                 if own_mlp:
                     attnres_partial(
-                        block_residual[:mlp_valid_blocks],
+                        block_residual[: self.mlp_valid_blocks],
                         self._mlp_wp,
                         self.mlp_res_norm.variance_epsilon,
                         scratch,
@@ -3207,7 +3204,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 block_residual,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
-                mlp_valid_blocks,
+                self.mlp_valid_blocks,
                 out_norm=self.post_attention_layernorm,
             )
         if self.is_moe_layer:

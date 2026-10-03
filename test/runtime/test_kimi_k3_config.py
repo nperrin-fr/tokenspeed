@@ -175,7 +175,13 @@ _NVIDIA_ONLY = unittest.skipIf(
 
 class KimiK3RegistrationTests(unittest.TestCase):
     def _build_moe_block(
-        self, plan, *, moe_layer_freq=1, layer_index=1, routed_hidden=64
+        self,
+        plan,
+        *,
+        moe_layer_freq=1,
+        layer_index=1,
+        routed_hidden=64,
+        multicast_op="mc-op",
     ):
         """Construct one MoE block on a chosen plan; report what it wired."""
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
@@ -259,7 +265,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             mock.patch.object(
                 kimi_k3.KimiK3LatentDownOp,
                 "initialize",
-                staticmethod(lambda **kw: multicast_calls.append(kw) or "mc-op"),
+                staticmethod(lambda **kw: multicast_calls.append(kw) or multicast_op),
             ),
             mock.patch(
                 "tokenspeed.runtime.distributed.process_group_manager"
@@ -290,8 +296,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
 
     @_NVIDIA_ONLY
-    def test_the_packed_input_projection_declines_a_narrowed_weight(self):
-        """It reads the routed weight directly, so a narrowed one would bypass the gather.
+    def test_a_narrowed_routed_projection_is_never_packed(self):
+        """The packed path reads the routed weight directly, bypassing the gather.
 
         Shipped once without this: the packed path handed the experts one rank's
         448 columns where the expert weight takes 3584, and narrow and wide
@@ -309,13 +315,21 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
         )
         moe = built.layer
-        moe.packed_input_projection_weight = torch.zeros(1)
+        for module in (
+            moe.gate,
+            moe.routed_expert_down_proj,
+            moe.shared_experts.gate_up_proj,
+        ):
+            module.weight = torch.nn.Parameter(torch.zeros(2, 8), requires_grad=False)
         moe.routed_expert_down_proj.narrowed = True
+        moe.pack_input_projection_weights()
+        self.assertIsNone(moe.packed_input_projection_weight)
         self.assertIsNone(moe._latent_input_projections(torch.zeros(2, 8)))
         moe.routed_expert_down_proj.narrowed = False
+        moe.pack_input_projection_weights()
         self.assertIsNotNone(
             moe.packed_input_projection_weight,
-            "the packed weight must still be set, or the guard proves nothing",
+            "the same block must pack when wide, or the guard proves nothing",
         )
 
     @_NVIDIA_ONLY
@@ -357,13 +371,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # since the manager's device backend defaults to "nccl" in a test.
         get_pg.assert_called_with(mapping.moe.tp_ep_group)
 
-    def test_the_column_group_needs_a_divisible_latent(self):
-        """The group would otherwise raise at construction and kill the boot.
-
-        The multicast op declines an indivisible latent by returning None, but
-        the column split has no such vote: it is wired straight from the
-        mapping, so the width has to be checked where it is wired.
-        """
+    def test_the_column_group_follows_the_mailbox(self):
+        """The op declines an indivisible latent; the column split follows its vote."""
         from tokenspeed.runtime.models import kimi_k3
 
         built = self._build_moe_block(
@@ -375,8 +384,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 joint_moe_reduce=False,
             ),
             routed_hidden=60,
+            multicast_op=None,
         )
         down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
+        self.assertIsNone(down.get("multicast_down"))
         self.assertIsNone(down.get("column_group"))
 
     @_NVIDIA_ONLY
@@ -427,7 +438,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.models import kimi_k3
 
         config = SimpleNamespace(
-            num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
+            num_hidden_layers=93,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+            num_experts=896,
         )
         one = Mapping(rank=0, world_size=1, pp_size=1)
         self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)

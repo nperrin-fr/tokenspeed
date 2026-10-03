@@ -187,18 +187,15 @@ class Kimi3LatentProjection(ReplicatedLinear):
     weight shard directly for up-projection and multicast gather, or injects
     this rank's output columns into the shared-expert all-reduce.
 
-    With ``multicast_down`` the projection instead takes a column shard that
-    publishes each rank's block into every peer's mailbox, which keeps each
-    output element computed on one rank and so leaves the numerics untouched.
-    It covers the widths the op claims -- the decode graph's captures.
-
-    With ``column_group`` the projection splits the same output columns over
-    the group and one all-gather concatenates the blocks. It is taken only
-    where a mailbox exists -- where the fabric can map symmetric memory -- and
-    it narrows storage the same way ``shard_group`` does: without the fabric
-    the replica wins at every width, and with it the split wins from the
-    mailbox ceiling upward, captured or eager. Nothing here keys on
-    ``get_is_cuda_graph_phase``, which is False throughout prefill capture.
+    With ``multicast_down`` and its ``column_group`` the projection instead
+    stores one column block. Widths the mailbox claims -- the decode graph's
+    captures -- publish each rank's block into every peer's mailbox, which keeps
+    each output element computed on one rank and so leaves the numerics
+    untouched; wider batches project the block and one all-gather concatenates
+    the blocks. The two come together because the split only wins where the
+    fabric can map symmetric memory; without it the replica wins at every width.
+    Nothing here keys on ``get_is_cuda_graph_phase``, which is False throughout
+    prefill capture.
     """
 
     def __init__(
@@ -228,9 +225,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 f"group of {len(group)} ranks does not match the shard "
                 f"size {shard_size}"
             )
+        if (column_group is None) != (multicast_down is None):
+            raise ValueError("the column split and its mailbox come together")
         if multicast_down is not None:
-            if shard_group is not None:
-                raise ValueError("a column shard cannot also multicast")
             if multicast_down.rank != shard_rank:
                 raise ValueError(
                     f"multicast rank {multicast_down.rank} does not match the "
@@ -251,10 +248,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         self.shard_rank = shard_rank
         self.shard_size = shard_size if group is not None else 1
         self.output_size_full = output_size
-        # Narrow only where the replica is unreachable: where a mailbox exists.
-        self.narrowed = shard_group is not None or (
-            column_group is not None and multicast_down is not None
-        )
+        self.narrowed = group is not None
         super().__init__(
             input_size=input_size,
             output_size=(output_size // shard_size if self.narrowed else output_size),
@@ -292,15 +286,12 @@ class Kimi3LatentProjection(ReplicatedLinear):
         memory path it has never been measured on, and would rendezvous a
         second workspace sized to the full hidden width.
 
-        ``column_group`` asks the backend for that layout instead, and only
-        where storage narrowed: a full-width projection already holds every
-        column and has nothing to concatenate. That request reaches
-        ``all_gather_inner``, whose fused NVLink gather writes the final layout
-        in one pass. It reaches that kernel only on NVIDIA, with a 2-D bf16
-        tensor gathered on the last dim; anything else, and any group the
-        fabric cannot map, falls back to the NCCL backend's
-        allocate-gather-transpose, which loses to the replica at every width --
-        so a projection that cannot narrow never takes this route.
+        ``column_group`` asks the backend for that layout instead. That request
+        reaches ``all_gather_inner``, whose fused NVLink gather writes the final
+        layout in one pass. It reaches that kernel only on NVIDIA, with a 2-D
+        bf16 tensor gathered on the last dim; anything else falls back to the
+        NCCL backend's allocate-gather-transpose, which loses to the replica at
+        every width -- so the column split is only built with a mailbox.
 
         Returns:
             The full-width projection. **It may alias the backend's workspace**,
@@ -318,7 +309,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             )
             all_gather_single(stacked, local.contiguous(), self.shard_group)
             return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
-        if not self.narrowed or self.column_group is None:
+        if self.column_group is None:
             return local
         return all_gather(local.contiguous(), self.column_group, dim=-1)
 
@@ -329,40 +320,28 @@ class Kimi3LatentProjection(ReplicatedLinear):
         the column blocks are disjoint, so placing each rank's block into a
         buffer that is about to be summed makes the sum concatenate them.
 
-        ``self.weight`` is already this rank's rows rather than a slice of the
-        full width: both sharding routes narrow storage, and the dispatch only
-        reaches here once ``narrowed`` holds.
+        ``self.weight`` is already this rank's rows: both sharding routes narrow
+        storage.
         """
-        if self.shard_group is None and self.column_group is None:
+        if not self.narrowed:
             raise ValueError("project_shard requires a column-parallel projection")
-        return tokenspeed_kernel.kimi3_latent_projection(
-            hidden_states,
-            self.weight,
-            solution=self.solution,
-        )
+        return self._project_stored(hidden_states)
 
     @property
     def shard_slice(self) -> tuple[int, int]:
         """``(start, width)`` of this rank's column block in the full width."""
-        if self.shard_group is None and self.column_group is None:
+        if not self.narrowed:
             raise ValueError("shard_slice requires a column-parallel projection")
         width = self.output_size_full // self.shard_size
         return self.shard_rank * width, width
 
-    def _project_replicated(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _project_stored(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project through whatever this rank stores, gathering nothing."""
         return tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
         )
-
-    def _multicast_block(self) -> torch.Tensor:
-        """This rank's rows for the mailbox, whatever the storage layout."""
-        if self.narrowed:
-            return self.weight
-        rows = self.multicast_down.shard_dim
-        return self.weight[self.shard_rank * rows : (self.shard_rank + 1) * rows]
 
     def prepare_nvfp4_output(self, output_scale: torch.Tensor) -> None:
         """Prepare fused NVFP4 output using the expert's loaded encoding scale.
@@ -384,14 +363,12 @@ class Kimi3LatentProjection(ReplicatedLinear):
             return (
                 self.multicast_down(
                     hidden_states,
-                    self._multicast_block(),
+                    self.weight,
                     output_scale=self._nvfp4_output_scale,
                 ),
                 None,
             )
-        if self.narrowed and self.column_group is not None:
-            return self._gather_shards(self.project_shard(hidden_states)), None
-        return self._gather_shards(self._project_replicated(hidden_states)), None
+        return self._gather_shards(self._project_stored(hidden_states)), None
 
     def forward_add3(
         self,

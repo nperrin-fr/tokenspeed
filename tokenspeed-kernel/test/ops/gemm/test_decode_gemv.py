@@ -54,13 +54,13 @@ def test_registry_fallback_selection():
 
 @pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
 def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
-    from tokenspeed_kernel.ops.gemm import kimi3, triton_gemv
+    from tokenspeed_kernel.ops.gemm import kimi3
 
     x = torch.empty(32, 7168, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
     output = torch.empty(32, n, device="meta", dtype=torch.bfloat16)
     monkeypatch.setattr(kimi3, "use_decode_gemv", lambda *_: True)
-    monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
+    monkeypatch.setattr(kimi3, "decode_gemv", lambda *_: output)
     if projection == "kda":
         assert kimi3.kimi3_qkvfab_projection(x, weight) is output
     else:
@@ -108,7 +108,7 @@ def test_forced_torch_solution_is_not_routed():
     y = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
 
     with patch(
-        "tokenspeed_kernel.ops.gemm.triton_gemv.decode_gemv",
+        "tokenspeed_kernel.ops.gemm.kimi3.decode_gemv",
         side_effect=AssertionError("forced torch path must not route"),
     ):
         kimi3.kimi3_latent_projection(x, latent_w, solution="torch")

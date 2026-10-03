@@ -406,6 +406,7 @@ class AttnResTests(unittest.TestCase):
                     is_block_write_layer=is_block_write_layer,
                     block_write_idx=1,
                     prev_valid_blocks=1,
+                    mlp_valid_blocks=1 + int(is_block_write_layer),
                     self_attention_res_proj=object(),
                     self_attention_res_norm=object(),
                     input_layernorm=object(),
@@ -485,6 +486,7 @@ class AttnResTests(unittest.TestCase):
                     is_block_write_layer=writes_block,
                     block_write_idx=4,
                     prev_valid_blocks=4,
+                    mlp_valid_blocks=4 + int(writes_block),
                     self_attention_res_proj=object(),
                     self_attention_res_norm=norm,
                     input_layernorm=norm,
@@ -545,6 +547,7 @@ class AttnResTests(unittest.TestCase):
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
+            mlp_valid_blocks=1,
             _mlp_wp=weight,
             _mlp_slot=3,
             self_attention_res_proj=SimpleNamespace(weight=weight.reshape(1, -1)),
@@ -590,6 +593,7 @@ class AttnResTests(unittest.TestCase):
             is_block_write_layer=False,
             block_write_idx=1,
             prev_valid_blocks=1,
+            mlp_valid_blocks=1,
             _dflash_attnres_capture_fallback=False,
             _mlp_wp=weight,
             _mlp_slot=3,
@@ -672,6 +676,7 @@ class AttnResTests(unittest.TestCase):
             _fused_attnres_graph_available=mock.Mock(return_value=False),
             _mix_into_attention=mock.Mock(return_value=(h, prefix)),
             prev_valid_blocks=1,
+            mlp_valid_blocks=1,
             is_block_write_layer=False,
             _mlp_slot=3,
             _mlp_split=False,
@@ -733,6 +738,101 @@ class AttnResTests(unittest.TestCase):
                     events, ["partial", "attention", "scope_exit", "reduce"]
                 )
                 reduce.assert_called_once()
+
+    def test_forward_fuses_or_launches_the_next_layer_partials(self):
+        """The attention takes the hoisted pair when it can; else the sweep runs it."""
+
+        class Fork:
+            @contextmanager
+            def scope(self, *, enable):
+                yield self
+
+            @contextmanager
+            def branch(self):
+                yield
+
+        h = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(16, _HIDDEN, dtype=torch.bfloat16)
+        block_residual = torch.zeros(2, 16, _HIDDEN, dtype=torch.bfloat16)
+        attn_scratch, mlp_scratch = object(), object()
+        next_layer = SimpleNamespace(
+            _attn_wp=object(),
+            _mlp_wp=object(),
+            _mlp_slot=7,
+            self_attention_res_norm=SimpleNamespace(variance_epsilon=_EPS),
+            mlp_res_norm=SimpleNamespace(variance_epsilon=_EPS),
+        )
+        for hoist, fusible in ((True, True), (True, False), (False, False)):
+            with self.subTest(hoist=hoist, fusible=fusible):
+                attention = mock.Mock(return_value=object())
+                attention.can_fuse_attnres_partials = mock.Mock(return_value=fusible)
+                layer = SimpleNamespace(
+                    _fused_attnres_graph_available=mock.Mock(return_value=False),
+                    _mix_into_attention=mock.Mock(return_value=(h, prefix)),
+                    mlp_valid_blocks=1,
+                    _mlp_slot=3,
+                    _mlp_split=True,
+                    _next_attn_mix=(next_layer, 1),
+                    _hoist_next_mlp=hoist,
+                    _mlp_wp=object(),
+                    mlp_res_proj=SimpleNamespace(weight=mock.Mock()),
+                    mlp_res_norm=SimpleNamespace(
+                        weight=object(), variance_epsilon=_EPS
+                    ),
+                    post_attention_layernorm=SimpleNamespace(weight=object()),
+                    self_attn=attention,
+                    comm_manager=object(),
+                    k3_comm=SimpleNamespace(attn_ar_fusion_ok=False),
+                    attn_fork=Fork(),
+                    _reduce_attn_accumulate=mock.Mock(return_value=(prefix, prefix)),
+                    is_moe_layer=False,
+                    mlp=mock.Mock(return_value=torch.zeros_like(prefix)),
+                )
+                with (
+                    mock.patch.object(
+                        kimi_k3, "get_is_capture_mode", return_value=False
+                    ),
+                    mock.patch.object(
+                        kimi_k3,
+                        "_sliced_scratch",
+                        side_effect=lambda _, slot, n: (
+                            attn_scratch if slot == 1 else mlp_scratch
+                        ),
+                    ),
+                    mock.patch.object(kimi_k3, "attnres_partial") as partial,
+                    mock.patch.object(kimi_k3, "attnres_partial_dual") as dual,
+                ):
+                    kimi_k3.KimiLinearDecoderLayer.forward(
+                        layer, object(), object(), object(), block_residual
+                    )
+
+                fused = attention.call_args.kwargs["attnres_partial_args"]
+                if not hoist:
+                    attention.can_fuse_attnres_partials.assert_not_called()
+                    self.assertIsNone(fused)
+                    dual.assert_not_called()
+                    args = partial.call_args.args
+                    self.assertEqual(args[0].shape[0], 1)
+                    self.assertEqual(
+                        args[1:], (next_layer._attn_wp, _EPS, attn_scratch)
+                    )
+                    continue
+                expected = (
+                    next_layer._mlp_wp,
+                    next_layer._attn_wp,
+                    _EPS,
+                    mlp_scratch,
+                    attn_scratch,
+                )
+                partial.assert_not_called()
+                if fusible:
+                    dual.assert_not_called()
+                    self.assertEqual(fused[0].shape[0], 1)
+                    self.assertEqual(fused[1:], expected)
+                else:
+                    self.assertIsNone(fused)
+                    self.assertEqual(dual.call_args.args[0].shape[0], 1)
+                    self.assertEqual(dual.call_args.args[1:], expected)
 
     def test_fused_to_fallback_populates_next_split_partial(self):
         hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)
