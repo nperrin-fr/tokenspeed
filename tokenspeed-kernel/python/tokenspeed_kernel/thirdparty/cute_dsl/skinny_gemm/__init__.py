@@ -59,6 +59,8 @@ class ShapeDynamicSkinnyGemm:
         ] = {}
         self._compile_lock = threading.Lock()
         self._available: bool | None = None
+        # Placeholder scales for the unscaled 16-bit kernels, one per device.
+        self._unit_scales: dict[int, torch.Tensor] = {}
 
     def is_available(self) -> bool:
         """Whether CuTe DSL is importable, memoized."""
@@ -68,9 +70,18 @@ class ShapeDynamicSkinnyGemm:
 
     @staticmethod
     def _cutlass_dtype(dtype: torch.dtype):
-        from cutlass import BFloat16, Float16
+        from cutlass import BFloat16, Float8E4M3FN, Float16
 
-        return BFloat16 if dtype == torch.bfloat16 else Float16
+        return {
+            torch.bfloat16: BFloat16,
+            torch.float16: Float16,
+            torch.float8_e4m3fn: Float8E4M3FN,
+        }[dtype]
+
+    @staticmethod
+    def _output_dtype(dtype: torch.dtype) -> torch.dtype:
+        """FP8 inputs write BF16; 16-bit inputs keep their own dtype."""
+        return torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
 
     @staticmethod
     def _stream(device: torch.device):
@@ -90,6 +101,7 @@ class ShapeDynamicSkinnyGemm:
         has_residual2: bool,
         device: torch.device,
     ) -> None:
+        import cutlass
         import cutlass.cute as cute
         from quack.compile_utils import make_fake_tensor
         from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm._kernel import (
@@ -97,6 +109,7 @@ class ShapeDynamicSkinnyGemm:
         )
 
         element_type = self._cutlass_dtype(dtype)
+        output_type = self._cutlass_dtype(self._output_dtype(dtype))
         n = cute.sym_int(divisibility=config.outputs_per_block)
         k = (
             config.static_k
@@ -107,11 +120,14 @@ class ShapeDynamicSkinnyGemm:
             element_type, (config.num_rows, k), divisibility=config.vector_width
         )
         b = make_fake_tensor(element_type, (n, k), divisibility=config.vector_width)
-        c = make_fake_tensor(element_type, (config.num_rows, n), divisibility=1)
-        residual = make_fake_tensor(element_type, (config.num_rows, n), divisibility=1)
-        residual2 = make_fake_tensor(element_type, (config.num_rows, n), divisibility=1)
+        c = make_fake_tensor(output_type, (config.num_rows, n), divisibility=1)
+        residual = make_fake_tensor(output_type, (config.num_rows, n), divisibility=1)
+        residual2 = make_fake_tensor(output_type, (config.num_rows, n), divisibility=1)
+        scale = make_fake_tensor(cutlass.Float32, (1,), divisibility=1)
         kernel = CuteSkinnyGemm(
             element_type=element_type,
+            output_type=output_type,
+            has_scale=dtype == torch.float8_e4m3fn,
             num_rows=config.num_rows,
             block_size=config.block_size,
             outputs_per_block=config.outputs_per_block,
@@ -130,6 +146,8 @@ class ShapeDynamicSkinnyGemm:
                 residual,
                 residual2,
                 c,
+                scale,
+                scale,
                 self._stream(device),
                 options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
             )
@@ -193,15 +211,76 @@ class ShapeDynamicSkinnyGemm:
                     )
         if out is None:
             out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        unit = self._unit_scale(a.device)
         self._compiled[cache_key](
             a,
             b,
             out if residual is None else residual,
             out if residual2 is None else residual2,
             out,
+            unit,
+            unit,
             self._stream(a.device),
         )
         return out
+
+    def mm_fp8(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        config: SkinnyGemmConfig,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute ``(a @ b.T) * a_scale * b_scale`` in BF16 from FP8 operands.
+
+        Args:
+            a: ``[M, K]`` contiguous FP8 E4M3 activations, ``1 <= M <= 16``.
+            b: ``[N, K]`` contiguous FP8 E4M3 weight.
+            a_scale: One-element FP32 dequant scale of ``a``.
+            b_scale: One-element FP32 dequant scale of ``b``.
+            config: the specialization to run; ``num_rows`` must equal M.
+            out: optional contiguous ``[M, N]`` BF16 destination.
+
+        Returns:
+            ``[M, N]`` BF16 result.
+        """
+        m, k = a.shape
+        n = b.shape[0]
+        if not self.supports(config, m, n, k):
+            raise ValueError(f"config {config} cannot run M={m} N={n} K={k}")
+        if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+            raise ValueError("a and b must be FP8 E4M3")
+        if not a.is_contiguous() or not b.is_contiguous():
+            raise ValueError("a and b must be contiguous")
+        for scale in (a_scale, b_scale):
+            if scale.numel() != 1 or scale.dtype != torch.float32:
+                raise ValueError("scales must be one-element FP32 tensors")
+        cache_key = (a.device.index or 0, a.dtype, config, False, False)
+        if cache_key not in self._compiled:
+            with self._compile_lock:
+                if cache_key not in self._compiled:
+                    self._compile(a.dtype, config, False, False, a.device)
+        if out is None:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+        self._compiled[cache_key](
+            a,
+            b,
+            out,
+            out,
+            out,
+            a_scale.reshape(1),
+            b_scale.reshape(1),
+            self._stream(a.device),
+        )
+        return out
+
+    def _unit_scale(self, device: torch.device) -> torch.Tensor:
+        index = device.index or 0
+        if index not in self._unit_scales:
+            self._unit_scales[index] = torch.ones(1, dtype=torch.float32, device=device)
+        return self._unit_scales[index]
 
 
 shape_dynamic_skinny_gemm = ShapeDynamicSkinnyGemm()
