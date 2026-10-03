@@ -59,9 +59,10 @@ narrowed row count is rank-local, so the split graph is disabled there.
 from __future__ import annotations
 
 import bisect
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeVar, runtime_checkable
 
 import torch
 import tqdm
@@ -94,6 +95,8 @@ from tokenspeed.runtime.utils.common import (
 
 logger = get_colorful_logger(__name__)
 
+_T = TypeVar("_T")
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -119,8 +122,8 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     forward is padded up to a bucket fitting its tokens and any dummy scan slots.
     Forwards above the largest bucket run eager.
 
-    Returns an empty list (graph disabled) when ``disable_prefill_graph`` is set or
-    ``prefill_graph_max_tokens <= 0``. The largest bucket is clamped to the
+    Returns an empty list (graph disabled) when ``prefill_graph_max_tokens`` is 0,
+    the executor config's one off switch. The largest bucket is clamped to the
     chunked-prefill size: the scheduler's per-forward token budget
     (``max_scheduled_tokens`` = chunked-prefill size) covers extends AND any fused
     decode rows -- with mixed batching, decodes are scheduled first and each
@@ -148,15 +151,14 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     faster startup on dev boots; sizes are clamped to the largest bucket.
 
     Args:
-        config: The model-executor config carrying ``disable_prefill_graph``,
-            ``prefill_graph_max_tokens``, ``prefill_graph_capture_sizes`` and
-            ``chunked_prefill_size``.
+        config: The model-executor config carrying ``prefill_graph_max_tokens``,
+            ``prefill_graph_capture_sizes`` and ``chunked_prefill_size``.
 
     Returns:
         Sorted ascending list of token-bucket sizes (possibly empty).
     """
-    max_tokens = int(config.prefill_graph_max_tokens or 0)
-    if config.disable_prefill_graph or max_tokens <= 0:
+    max_tokens = config.prefill_graph_max_tokens
+    if max_tokens <= 0:
         return []
     chunk = int(config.chunked_prefill_size or 0)
     if chunk > 0:
@@ -403,7 +405,8 @@ class PrefillGraph:
         config: ModelExecutorConfig,
         drafter=None,
         num_warmup: int = 3,
-        graph_supported: bool = True,
+        *,
+        graph_supported: bool,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
         # Multimodal seam: models whose multimodal path is embeds-only expose
@@ -430,7 +433,6 @@ class PrefillGraph:
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
             config.enforce_eager
-            or config.disable_prefill_graph
             # Backend-declared restriction (cuda_graph_support), resolved by
             # ModelExecutor over the backend tree at startup.
             or not graph_supported
@@ -451,7 +453,7 @@ class PrefillGraph:
             self._narrowing is not None
             and config.data_parallel_size > 1
             and not config.enforce_eager
-            and not config.disable_prefill_graph
+            and self.capture_buckets
         ):
             logger.info(
                 "Prefill CUDA graphs disabled: the narrowing prefill model's "
@@ -546,7 +548,6 @@ class PrefillGraph:
         entries: int | None,
         observer: MemoryDeltaObserver,
     ) -> None:
-        rank = self.config.global_rank
         # Off the plan: a bucket it omits is one nothing here can capture.
         series = "prefill" if self._narrowing is None else "prefill:encoder"
         ladder = self.capture_ladders(entries)[series]
@@ -560,15 +561,7 @@ class PrefillGraph:
                 buckets.append(bucket)
             else:
                 inline_counts.setdefault(bucket, []).append(bs)
-        capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
-        for bucket in capture_range:
-            if rank == 0:
-                avail_mem = get_available_gpu_memory(
-                    self.config.device, self.config.gpu_id, empty_cache=False
-                )
-                capture_range.set_description(
-                    f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
-                )
+        for bucket in self._capture_progress(buckets, "prefill buckets", "bucket"):
             minimum_bs = dummy_batch_size(bucket, self.config.context_len)
             self._ctx = self.make_dummy_batch(bucket, minimum_bs)
             self._land_input_embeds(
@@ -663,15 +656,7 @@ class PrefillGraph:
         # Off the plan, for the same reason the bucket ladder is.
         ladder = self.capture_ladders(entries)["prefill:decoder"]
         buckets = [ladder.widths[i] for i in ladder.sampled]
-        capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
-        for rows in capture_range:
-            if rank == 0:
-                avail_mem = get_available_gpu_memory(
-                    self.config.device, self.config.gpu_id, empty_cache=False
-                )
-                capture_range.set_description(
-                    f"Capturing prefill decoder buckets ({rows=} {avail_mem=:.2f} GB)"
-                )
+        for rows in self._capture_progress(buckets, "prefill decoder buckets", "rows"):
             bs = -(-rows // per_request)
             self._ctx = self.make_dummy_batch(rows, bs)
             self._land_input_embeds(
@@ -806,15 +791,12 @@ class PrefillGraph:
         for _ in range(self.num_warmup):
             spec = _output_spec(CapturedForward(*self._run_inner(bucket)))
         self._reserve_outputs(spec)
-        torch.cuda.synchronize()
-        stream = decode_wrapper.stream if decode_wrapper is not None else None
-        cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+        cap, output = self._record(
+            lambda: self._land_output(CapturedForward(*self._run_inner(bucket))),
+            decode_wrapper,
+            observer,
+            self._handoff_storage,
         )
-        with observer, cap:
-            output = self._land_output(CapturedForward(*self._run_inner(bucket)))
-        if self._pool is None:
-            self._pool = cap.pool  # share the pool across all subsequent buckets
         cap.replay()  # capture records kernels without executing; smoke-test replay
         return cap, output
 
@@ -827,17 +809,12 @@ class PrefillGraph:
         """Warm up and capture the encoder stage for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
             self._run_encoder(bucket)
-        torch.cuda.synchronize()
-        stream = decode_wrapper.stream if decode_wrapper is not None else None
-        cap = BreakableCapture(
-            pool=self._pool,
-            stream=stream,
-            handoff_storage=self._encoder_handoff_storage,
+        cap, state = self._record(
+            lambda: self._run_encoder(bucket),
+            decode_wrapper,
+            observer,
+            self._encoder_handoff_storage,
         )
-        with observer, cap:
-            state = self._run_encoder(bucket)
-        if self._pool is None:
-            self._pool = cap.pool
         cap.replay()
         return CapturedEncoder(cap, state)
 
@@ -855,28 +832,64 @@ class PrefillGraph:
         the decoder consumes per-forward backend state its predecessor
         produces and later layers overwrite (V4.1's index selection chain).
         """
+
+        def run() -> CapturedForward:
+            return CapturedForward(*self._narrowing.decoder_forward(statics, self._ctx))
+
         spec = None
         for _ in range(self.num_warmup):
             rearm()
-            spec = _output_spec(
-                CapturedForward(*self._narrowing.decoder_forward(statics, self._ctx))
-            )
+            spec = _output_spec(run())
         self._reserve_outputs(spec)
-        torch.cuda.synchronize()
         rearm()
-        stream = decode_wrapper.stream if decode_wrapper is not None else None
-        cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+        cap, output = self._record(
+            lambda: self._land_output(run()),
+            decode_wrapper,
+            observer,
+            self._handoff_storage,
         )
-        with observer, cap:
-            output = self._land_output(
-                CapturedForward(*self._narrowing.decoder_forward(statics, self._ctx))
-            )
-        if self._pool is None:
-            self._pool = cap.pool
         rearm()
         cap.replay()
         return CapturedDecoder(cap, statics, output)
+
+    def _record(
+        self,
+        forward: Callable[[], _T],
+        decode_wrapper: ForwardStepRunner | None,
+        observer: AbstractContextManager[None],
+        handoff_storage: dict[HandoffSlot, torch.Tensor],
+    ) -> tuple[BreakableCapture, _T]:
+        """Capture one warmed-up ``forward`` into the shared pool on the decode stream.
+
+        ``observer`` wraps the capture alone; the first capture allocates the
+        pool every later one shares.
+        """
+        torch.cuda.synchronize()
+        stream = decode_wrapper.stream if decode_wrapper is not None else None
+        cap = BreakableCapture(
+            pool=self._pool, stream=stream, handoff_storage=handoff_storage
+        )
+        with observer, cap:
+            result = forward()
+        if self._pool is None:
+            self._pool = cap.pool
+        return cap, result
+
+    def _capture_progress(
+        self, widths: list[int], ladder: str, unit: str
+    ) -> Iterator[int]:
+        """Yield ``widths``; rank 0 shows a bar with the free memory before each."""
+        rank0 = self.config.global_rank == 0
+        bar = tqdm.tqdm(widths, disable=not rank0)
+        for width in bar:
+            if rank0:
+                avail_mem = get_available_gpu_memory(
+                    self.config.device, self.config.gpu_id, empty_cache=False
+                )
+                bar.set_description(
+                    f"Capturing {ladder} ({unit}={width} {avail_mem=:.2f} GB)"
+                )
+            yield width
 
     def _reserve_outputs(self, spec: list[OutputSpec] | None) -> None:
         """Allocate the shared output buffers once, before the first capture.

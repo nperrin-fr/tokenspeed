@@ -582,6 +582,7 @@ def test_capture_lifecycle_preserves_main_order(
 
     executor = SimpleNamespace(
         captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
+        config=SimpleNamespace(enable_cudagraph_gc=False),
         device="cpu",
         forward_step=step,
         prefill_graph=SimpleNamespace(

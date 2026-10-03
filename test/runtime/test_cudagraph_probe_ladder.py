@@ -79,7 +79,6 @@ def _decode_runner(capture_bs, variants=None):
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.capture_bs = list(capture_bs)
     runner.global_rank = 1
-    runner.enable_cudagraph_gc = False
     runner.disable = False
     runner.max_tokens_per_req = 1
     runner.graphs = {}
@@ -358,7 +357,7 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         "replay",
     ]
 
-    # The same order at every other capture site.
+    # The same order at every other capture site; prefill's three share one.
     root = pathlib.Path(prefill_graph.__file__).parent
     found = {}
     for path in (
@@ -373,7 +372,7 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
                     found[path.name] = found.get(path.name, 0) + 1
                     assert spelled[0] == "observer", (path.name, node.lineno)
     assert found == {
-        "prefill_graph.py": 3,
+        "prefill_graph.py": 1,
         "forward_step.py": 1,
         "deepseek_v4_dspark.py": 1,
     }

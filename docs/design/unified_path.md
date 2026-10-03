@@ -314,9 +314,11 @@ Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
 capture must declare it, or the boot dies). Resolution is device-side at startup and
 class-attribute-driven, so every DP rank derives the same answer
-(event-loop.md). `disable_prefill_graph` in the config carries user intent
-only. `decode_graph=False` still requires `refresh_decode_metadata` and
-`init_cuda_graph_state` — eager decode runs the same unified path.
+(event-loop.md). The config's `prefill_graph_max_tokens` carries server
+arguments only: 0 when `--disable-prefill-graph`, `--prefill-graph-max-tokens 0`
+or DeepEP turns the graph off. `decode_graph=False` still requires
+`refresh_decode_metadata` and `init_cuda_graph_state` — eager decode runs the
+same unified path.
 
 ### One output layout per forward
 

@@ -28,6 +28,52 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
+def _executor_config_args(**overrides) -> dict:
+    """Every ModelExecutorConfig field for a single-rank, non-speculative CPU run."""
+    args = dict(
+        max_req_pool_size=5,
+        output_length=1,
+        enforce_eager=False,
+        prefix_granularity=128,
+        max_num_seqs=4,
+        chunked_prefill_size=4096,
+        vocab_size=32,
+        context_len=4096,
+        physical_context_len=4096,
+        device="cpu",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2, 4],
+        disable_cuda_graph_padding=False,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        prefill_graph_capture_batch_sizes=None,
+        enable_nan_detection=False,
+        disable_autotune=False,
+        enable_cudagraph_gc=False,
+        data_parallel_size=1,
+        world_size=1,
+        world_group=None,
+        pp_size=1,
+        pp_rank=0,
+        pp_group=None,
+        spec_algo=None,
+        spec_num_steps=None,
+        spec_num_tokens=None,
+        overlap_schedule_depth=0,
+        dp_sampling=False,
+        dp_sampling_min_bs=None,
+        grammar_backend="xgrammar",
+        disable_capturable_grammar=False,
+        prefill_graph_max_tokens=0,
+        prefill_graph_capture_sizes=None,
+    )
+    args.update(overrides)
+    return args
+
+
 class PrefillCaptureArgsTest(unittest.TestCase):
     def setUp(self):
         from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -136,26 +182,8 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             resolve_prefill_capture_batch_sizes,
         )
 
-        config_args = dict(
-            max_req_pool_size=5,
-            output_length=1,
-            enforce_eager=False,
-            prefix_granularity=128,
-            max_num_seqs=4,
-            chunked_prefill_size=4096,
-            vocab_size=32,
-            context_len=4096,
-            physical_context_len=4096,
-            device="cpu",
-            gpu_id=0,
-            global_rank=0,
-            cudagraph_capture_sizes=[1, 2, 4],
-            disable_cuda_graph_padding=False,
-            max_cudagraph_capture_size=4,
-            model_is_mrope=False,
-            autotune_cache_key=None,
-            prefill_only=False,
-        )
+        config_args = _executor_config_args()
+        del config_args["prefill_graph_capture_batch_sizes"]
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
 
@@ -828,7 +856,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         config = SimpleNamespace(
             enforce_eager=False,
-            disable_prefill_graph=False,
             data_parallel_size=1,
         )
         pool = _fake_pool(runtime_contract=object())
@@ -845,6 +872,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                graph_supported=True,
             )
 
         self.assertFalse(graph.disable)
@@ -864,6 +892,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                graph_supported=True,
             )
         self.assertTrue(graph.disable)
 
@@ -1021,7 +1050,6 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             )
             config = SimpleNamespace(
                 enforce_eager=False,
-                disable_prefill_graph=False,
                 data_parallel_size=1,
                 max_num_seqs=3,
             )
@@ -1037,6 +1065,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    graph_supported=True,
                 )
             self.assertFalse(graph.disable)
             self.assertIs(graph._narrowing, inner if expected_buckets else None)
@@ -1062,7 +1091,6 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             )
             config = SimpleNamespace(
                 enforce_eager=False,
-                disable_prefill_graph=False,
                 data_parallel_size=2,
                 max_num_seqs=8,
             )
@@ -1078,6 +1106,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    graph_supported=True,
                 )
             self.assertEqual(graph.disable, expected_disable)
             self.assertEqual(graph.decoder_buckets, [])
@@ -1230,26 +1259,11 @@ class PrefillRoleGraphsTest(unittest.TestCase):
 
     def _config(self, *, prefill_only: bool, enforce_eager: bool = False):
         return self.ModelExecutorConfig(
-            max_req_pool_size=5,
-            output_length=1,
-            enforce_eager=enforce_eager,
-            prefix_granularity=128,
-            max_num_seqs=4,
-            chunked_prefill_size=4096,
-            vocab_size=32,
-            context_len=4096,
-            physical_context_len=4096,
-            device="cpu",
-            gpu_id=0,
-            global_rank=0,
-            cudagraph_capture_sizes=[1, 2, 4],
-            disable_cuda_graph_padding=False,
-            max_cudagraph_capture_size=4,
-            model_is_mrope=False,
-            autotune_cache_key=None,
-            prefill_only=prefill_only,
-            prefill_graph_capture_batch_sizes=None,
-            prefill_graph_max_tokens=256,
+            **_executor_config_args(
+                enforce_eager=enforce_eager,
+                prefill_only=prefill_only,
+                prefill_graph_max_tokens=256,
+            )
         )
 
     def _decode_runner(self, config):
@@ -1282,6 +1296,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
                 token_to_kv_pool=_fake_pool(runtime_contract=object()),
                 input_buffers=object(),
                 config=config,
+                graph_supported=True,
             )
 
     def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(

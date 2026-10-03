@@ -52,7 +52,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner, freeze_gc
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
@@ -146,11 +146,12 @@ def _draft_idle_global_num_tokens_for_step(
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
 
-    Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
-    extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
-    receive counts come back to the host, and a host sync cannot be captured.
+    Returns 0 (graph off) under ``--disable-prefill-graph`` and when the MoE
+    all-to-all backend is DeepEP: an extend-shaped forward takes DeepEP's normal
+    dispatch, whose per-expert receive counts come back to the host, and a host
+    sync cannot be captured.
     """
-    if server_args.all2all_backend == "deepep":
+    if server_args.disable_prefill_graph or server_args.all2all_backend == "deepep":
         return 0
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
@@ -241,43 +242,42 @@ class ModelExecutorConfig:
     prefill_only: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
-    enable_nan_detection: bool = False
-    disable_autotune: bool = False
-    enable_cudagraph_gc: bool = False
+    enable_nan_detection: bool
+    disable_autotune: bool
+    enable_cudagraph_gc: bool
 
     # ====== DP =========
-    data_parallel_size: int = 1
-    world_size: int = 1
-    world_group: list[int] | None = None
+    data_parallel_size: int
+    world_size: int
+    world_group: list[int] | None
 
     # ====== PP (prefill chunk pipeline) =========
-    pp_size: int = 1
-    pp_rank: int = 0
-    pp_group: tuple[int, ...] | None = None
+    pp_size: int
+    pp_rank: int
+    pp_group: tuple[int, ...] | None
 
     # ====== SPEC =========
-    spec_algo: str | None = None
-    spec_num_steps: int | None = None
+    spec_algo: str | None
+    spec_num_steps: int | None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
-    spec_num_tokens: int | None = None
-    overlap_schedule_depth: int = 0
-    dp_sampling: bool = False
-    dp_sampling_min_bs: int | None = None
+    spec_num_tokens: int | None
+    overlap_schedule_depth: int
+    dp_sampling: bool
+    dp_sampling_min_bs: int | None
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
     # (currently only "xgrammar" is implemented).
-    grammar_backend: str = "xgrammar"
+    grammar_backend: str
     # Force the synchronous eager grammar fallback even on CUDA. For
     # parity-testing the captured-grammar path.
-    disable_capturable_grammar: bool = False
+    disable_capturable_grammar: bool
 
     # ====== PREFILL CUDA GRAPH (breakable) =========
-    disable_prefill_graph: bool = False
-    # > 0 enables the prefill graph and caps its largest bucket; serving resolves it on.
-    prefill_graph_max_tokens: int = 0
+    # 0 keeps the prefill graph off; otherwise it caps the largest bucket.
+    prefill_graph_max_tokens: int
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
-    prefill_graph_capture_sizes: list[int] | None = None
+    prefill_graph_capture_sizes: list[int] | None
 
     @staticmethod
     def from_server_args(
@@ -287,7 +287,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         prefix_granularity: int,
-        overlap_schedule_depth: int = 0,
+        overlap_schedule_depth: int,
     ) -> ModelExecutorConfig:
         output_length = (
             server_args.speculative_num_draft_tokens
@@ -317,11 +317,6 @@ class ModelExecutorConfig:
                 f"{physical_context_len - derived_context_len!s} to stay in bounds.",
             )
 
-        # User intent only; backend-imposed graph restrictions are declared on
-        # the backend classes (cuda_graph_support) and resolved in
-        # ModelExecutor.__init__ once the backend instances exist.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph)
-
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
@@ -343,7 +338,7 @@ class ModelExecutorConfig:
             autotune_cache_key=_autotune_cache_key(server_args, model_config),
             enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
-            disable_prefill_graph=disable_prefill_graph,
+            # Server arguments only; backends declare theirs via cuda_graph_support.
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
@@ -705,17 +700,18 @@ class ModelExecutor:
         """
         workspace_pool(self.device).freeze()
 
-        if not self.forward_step.disable:
-            self.forward_step.capture(entries=entries, observer=observer)
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(
-                self.forward_step, entries=entries, observer=observer
-            )
-            # Only a drafter that declared the ladder gets a window to fill.
-            if self.captures_drafter_prefill_graph:
-                self.drafter.capture_prefill_graph(
-                    self.forward_step.stream, observer.measure("prefill:drafter")
+        with freeze_gc(self.config.enable_cudagraph_gc):
+            if not self.forward_step.disable:
+                self.forward_step.capture(entries=entries, observer=observer)
+            if not self.prefill_graph.disable:
+                self.prefill_graph.capture(
+                    self.forward_step, entries=entries, observer=observer
                 )
+                # Only a drafter that declared the ladder gets a window to fill.
+                if self.captures_drafter_prefill_graph:
+                    self.drafter.capture_prefill_graph(
+                        self.forward_step.stream, observer.measure("prefill:drafter")
+                    )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:

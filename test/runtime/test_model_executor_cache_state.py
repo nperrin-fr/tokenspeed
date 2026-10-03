@@ -174,42 +174,51 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     ]
 
 
-def test_cudagraph_gc_flag_reaches_the_capture_context():
+def test_cudagraph_gc_flag_reaches_every_capture(monkeypatch):
     """The operator flag must survive ServerArgs -> config -> capture.
 
     Freezing the collector for the duration of capture is the default; the
-    flag is the escape hatch. It previously never arrived -- the wrapper read
-    it off a config that never carried it -- so capture never froze and the
-    flag moved nothing in either direction. Pin the whole path, not the
-    default: read the value the capture context would actually see.
+    flag is the escape hatch. Decode and prefill capture share the one capture
+    step, so both must see the same policy: read the freeze count each capture
+    actually observes.
     """
     import dataclasses
     import gc
 
-    from tokenspeed.runtime.execution.forward_step import (
-        ForwardStepRunner,
-        freeze_gc,
+    from tokenspeed.runtime.execution import model_executor
+    from tokenspeed.runtime.execution.model_executor import (
+        ModelExecutor,
+        ModelExecutorConfig,
     )
-    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
 
     fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
     assert "enable_cudagraph_gc" in fields, "config must carry the flag"
+    monkeypatch.setattr(
+        model_executor, "workspace_pool", lambda _: SimpleNamespace(freeze=lambda: None)
+    )
 
     for flag in (False, True):
-        config = SimpleNamespace(enable_cudagraph_gc=flag)
-        wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
-        # Only the flag plumbing is under test; __init__ needs a live model.
-        wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
-        assert wrapper.enable_cudagraph_gc is flag
+        seen = {}
 
+        def record(stage):
+            return lambda *_args, **_kwargs: seen.update({stage: gc.get_freeze_count()})
+
+        executor = SimpleNamespace(
+            device="cpu",
+            config=SimpleNamespace(enable_cudagraph_gc=flag),
+            forward_step=SimpleNamespace(disable=False, capture=record("decode")),
+            prefill_graph=SimpleNamespace(disable=False, capture=record("prefill")),
+            captures_drafter_prefill_graph=False,
+        )
         # get_freeze_count() is process-global and other code freezes too, so
         # compare against the count on entry rather than against zero.
         before = gc.get_freeze_count()
         canary = [object() for _ in range(64)]
-        with freeze_gc(wrapper.enable_cudagraph_gc):
-            during = gc.get_freeze_count()
+        ModelExecutor.capture_graphs(executor, entries=None, observer=None)
         after = gc.get_freeze_count()
-        assert (during > before) is (not flag), (flag, before, during)
+        assert set(seen) == {"decode", "prefill"}, seen
+        for stage, during in seen.items():
+            assert (during > before) is (not flag), (flag, stage, before, during)
         assert after <= before, (before, after)
         assert len(canary) == 64
 

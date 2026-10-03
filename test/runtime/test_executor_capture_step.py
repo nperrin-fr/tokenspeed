@@ -165,6 +165,7 @@ def test_the_step_freezes_then_captures_decode_then_prefill(monkeypatch):
     monkeypatch.setattr(model_executor, "workspace_pool", lambda _: calls.workspace)
     executor = SimpleNamespace(
         device="cuda:0",
+        config=SimpleNamespace(enable_cudagraph_gc=False),
         forward_step=SimpleNamespace(disable=False, capture=calls.decode, stream="s"),
         prefill_graph=SimpleNamespace(disable=False, capture=calls.prefill),
         captures_drafter_prefill_graph=True,

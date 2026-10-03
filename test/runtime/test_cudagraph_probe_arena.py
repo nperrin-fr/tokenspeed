@@ -202,7 +202,6 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
     widest = max(
         get_prefill_token_buckets(
             SimpleNamespace(
-                disable_prefill_graph=False,
                 prefill_graph_max_tokens=tokens,
                 prefill_graph_capture_sizes=None,
                 chunked_prefill_size=tokens,
@@ -226,6 +225,7 @@ def test_the_boot_floor_reads_both_knobs(
 ) -> None:
     server_args = SimpleNamespace(
         all2all_backend="none",
+        disable_prefill_graph=False,
         prefill_graph_max_tokens=ceiling,
         chunked_prefill_size=8192,
         max_total_tokens=None,

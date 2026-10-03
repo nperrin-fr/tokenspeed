@@ -681,7 +681,6 @@ class TestPrefillTokenBuckets(unittest.TestCase):
     def _cfg(**overrides):
         base = dict(
             prefill_graph_max_tokens=2048,
-            disable_prefill_graph=False,
             chunked_prefill_size=2048,
             prefill_graph_capture_sizes=None,
         )
@@ -695,9 +694,6 @@ class TestPrefillTokenBuckets(unittest.TestCase):
 
         self.assertEqual(
             get_prefill_token_buckets(self._cfg(prefill_graph_max_tokens=0)), []
-        )
-        self.assertEqual(
-            get_prefill_token_buckets(self._cfg(disable_prefill_graph=True)), []
         )
 
     def test_clamped_to_chunk(self):
@@ -750,6 +746,7 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
     @staticmethod
     def _args(**overrides):
         base = dict(
+            disable_prefill_graph=False,
             prefill_graph_max_tokens=None,
             chunked_prefill_size=8192,
             max_total_tokens=None,
@@ -790,6 +787,23 @@ class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
                         )
                     ),
                     1024,
+                )
+
+    def test_disable_flag_resolves_to_zero(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # The one off switch the executor config carries, even over an explicit cap.
+        for cap in (None, 1024):
+            with self.subTest(prefill_graph_max_tokens=cap):
+                self.assertEqual(
+                    _resolve_prefill_graph_max_tokens(
+                        self._args(
+                            disable_prefill_graph=True, prefill_graph_max_tokens=cap
+                        )
+                    ),
+                    0,
                 )
 
     def test_deepep_disables_the_graph(self):

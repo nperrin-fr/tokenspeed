@@ -192,6 +192,7 @@ class BreakableCapture:
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
+        self._gc_was_enabled = False
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[HandoffKey, torch.Tensor] = {}
         self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (

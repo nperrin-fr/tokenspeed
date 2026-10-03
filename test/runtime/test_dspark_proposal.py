@@ -103,6 +103,7 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     monkeypatch.setattr(model_executor, "workspace_pool", Mock())
     # A real instance, so the gate resolves the production property.
     executor = model_executor.ModelExecutor.__new__(model_executor.ModelExecutor)
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.device = "cuda"
     executor.forward_step = Mock(disable=decode_disabled)
     executor.prefill_graph = Mock(disable=prefill_disabled)

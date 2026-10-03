@@ -188,6 +188,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
 ):
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.device = "cuda"
     executor.forward_step = SimpleNamespace(
         disable=False,

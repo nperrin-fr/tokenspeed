@@ -471,6 +471,7 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
         capture_prefill_graph=lambda _stream, observer: seen.append(observer),
     )
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.device = "cuda"
     executor.drafter = drafter
     executor.forward_step = SimpleNamespace(
