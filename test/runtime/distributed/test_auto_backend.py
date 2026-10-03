@@ -18,6 +18,13 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
+@pytest.fixture(autouse=True)
+def one_host(monkeypatch):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_host_map", [0] * 16)
+
+
 @pytest.fixture
 def backend(monkeypatch):
     instance = AutoBackend()
@@ -404,7 +411,6 @@ def test_trtllm_arming_failures_propagate(monkeypatch):
     monkeypatch.setattr(
         process_group_manager, "get_process_group", lambda kind, group: "device"
     )
-    monkeypatch.setattr(kernel_trtllm, "group_spans_nodes", lambda group: False)
     monkeypatch.setattr(
         kernel_trtllm,
         "ensure_workspace_initialized",

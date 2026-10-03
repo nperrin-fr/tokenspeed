@@ -28,12 +28,12 @@ process group on one host. Peer indexing and scratch layouts specialize for
 four peers; other group sizes are rejected, with no implicit NCCL fallback.
 """
 
-import socket
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
+from tokenspeed_kernel.ops.communication.fabric import host_identity
 from tokenspeed_kernel.registry import register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -56,7 +56,7 @@ class CudaLamportA2AState:
 
         contracts = [None] * group.size()
         dist.all_gather_object(
-            contracts, (socket.gethostname(), max_rows, channels, blocks), group=group
+            contracts, (host_identity(), max_rows, channels, blocks), group=group
         )
         if any(contract != contracts[0] for contract in contracts):
             raise ValueError(

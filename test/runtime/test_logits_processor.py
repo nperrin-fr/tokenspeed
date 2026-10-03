@@ -183,7 +183,8 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
         tp_group=(0, 1),
     )
 
-    assert getattr(processor, initializer_name)(SimpleNamespace()) is None
+    lm_head = SimpleNamespace(weight=torch.ones((4, 2), dtype=torch.bfloat16))
+    assert getattr(processor, initializer_name)(lm_head) is None
 
 
 def _set_fabric(monkeypatch, supported: bool) -> None:
@@ -195,12 +196,8 @@ def _set_fabric(monkeypatch, supported: bool) -> None:
         "current_platform",
         lambda: SimpleNamespace(is_nvidia=True),
     )
-    # The topology is what makes these groups host-spread; without it the tests
-    # would name a property their own setup never established.
-    monkeypatch.setitem(
-        global_server_args_dict, "mapping", SimpleNamespace(nprocs_per_node=4)
-    )
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    # Four ranks a host is what makes these groups host-spread.
+    monkeypatch.setattr(fabric, "_host_map", [rank // 4 for rank in range(8)])
     monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
 
@@ -243,13 +240,26 @@ def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
     probe, and a group the fabric cannot map hangs in the rendezvous.
     """
     _set_fabric(monkeypatch, False)
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    probed = []
+    monkeypatch.setattr(
+        fabric, "group_has_fabric", lambda ranks: probed.append(tuple(ranks)) or False
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("a group without fabric must not gather"),
+    )
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=64),
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
     )
-    assert not processor._tp_group_multicast_reachable()
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+    assert processor._init_all_gather_state(lm_head) is None
+    assert probed == [(0, 4)]
 
 
 def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch):
@@ -266,13 +276,19 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
         "group_has_fabric",
         lambda ranks: False,
     )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("a group without fabric must not gather"),
+    )
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=64),
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
     )
-    assert not processor._tp_group_multicast_reachable()
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+    assert processor._init_all_gather_state(lm_head) is None
 
 
 def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkeypatch):
@@ -422,6 +438,33 @@ def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
         is fp32_state
     )
     assert len(created) == 2
+
+
+def test_a_padded_vocab_declines_before_any_collective(monkeypatch):
+    """The sampler and the drafters share this gate, so a pad column never wins."""
+    monkeypatch.setattr(
+        logits_processor_module,
+        "try_create_dist_argmax_state",
+        lambda **kwargs: pytest.fail("a padded vocab must not reach the constructor"),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda *args, **kwargs: pytest.fail("a padded vocab must not vote"),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8000),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
+
+    state = processor.acquire_dist_argmax_state(
+        lm_head, max_M=8, skip_ping_pong=False, dtype=torch.bfloat16
+    )
+
+    assert state is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

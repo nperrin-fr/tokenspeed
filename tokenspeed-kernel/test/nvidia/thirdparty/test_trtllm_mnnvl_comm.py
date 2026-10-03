@@ -35,6 +35,10 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.fabric import (
+    gather_fabric_map,
+    group_spans_hosts,
+)
 
 H, L, EPS = 7168, 3584, 1e-6
 MAXTOK = 32
@@ -55,6 +59,7 @@ def _setup():
     torch.cuda.set_device(lrank)
     if not dist.is_initialized():
         dist.init_process_group("nccl")
+        gather_fabric_map()
     # dist.group.WORLD workspaces need the GLOBAL rank: LOCAL_RANK repeats on
     # every node, so using it multi-node hands two ranks the same workspace ID.
     return dist.get_rank(), torch.device("cuda", lrank)
@@ -64,11 +69,7 @@ def _spans_nodes() -> bool:
     """True when the world spans hosts. Cross-node CUDA-IPC workspace creation
     fails AND poisons the CUDA context ('invalid resource handle' on the next
     allocation), so it must be skipped outright rather than caught."""
-    import socket
-
-    names = [None] * dist.get_world_size()
-    dist.all_gather_object(names, socket.gethostname())
-    return len(set(names)) > 1
+    return group_spans_hosts(range(dist.get_world_size()))
 
 
 _workspaces: dict = {}

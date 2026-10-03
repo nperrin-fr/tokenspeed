@@ -23,6 +23,7 @@
 import dataclasses
 
 import torch
+from tokenspeed_kernel.ops.communication.fabric import group_multicast_reachable
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
 from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
@@ -40,6 +41,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_backend.auto import force_deterministic_rsag
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -102,12 +104,6 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
-
-
-def _force_deterministic_rsag() -> bool:
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    return bool(global_server_args_dict.get("force_deterministic_rsag", False))
 
 
 @dataclasses.dataclass
@@ -339,44 +335,15 @@ class LogitsProcessor(nn.Module):
             num_tokens_per_req=n,
         )
 
-    def _tp_group_multicast_reachable(self) -> bool:
-        """Whether the gather's symmetric buffer can map multicast here.
-
-        Topology now only admits: an NVLink domain can span hosts, so a
-        host-spread group is asked of the fabric rather than refused outright,
-        and without fabric the rendezvous hangs rather than failing over. The
-        rank count cannot stand in for the topology test -- a strided group can
-        be smaller than one host's device count while living on two.
-
-        The world fabric map is gathered during distributed initialization, so
-        the group verdict is a local lookup with no dispatch-time collective.
-        """
-        if self.tp_group is None:
-            return False
-
-        from tokenspeed_kernel.ops.communication.fabric import (
-            group_has_fabric,
-        )
-
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        mapping = global_server_args_dict.get("mapping")
-        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
-        spans_hosts = bool(nprocs_per_node) and (
-            len({rank // nprocs_per_node for rank in self.tp_group}) > 1
-        )
-        if not spans_hosts:
-            return True
-        return group_has_fabric(self.tp_group)
-
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia or _force_deterministic_rsag():
+        if not current_platform().is_nvidia or force_deterministic_rsag():
             return None
 
         if (
             self.tp_size == 1
             or self.skip_all_gather
-            or not self._tp_group_multicast_reachable()
+            or self.tp_group is None
+            or not group_multicast_reachable(self.tp_group)
         ):
             return None
 
@@ -421,9 +388,10 @@ class LogitsProcessor(nn.Module):
 
         Shared by the sampler and the drafters. Construction rendezvouses and
         barriers, so a rank deciding alone would strand the others: platform
-        eligibility and the build outcome are both reduced with MIN. Callers
-        apply their own config-uniform gates first, which may return early
-        because those cost no collective work.
+        eligibility and the build outcome are both reduced with MIN. The
+        config-uniform gates -- deterministic collectives, group size, an
+        unpadded vocab and the shard's shape -- run first and cost no
+        collective work.
 
         Args:
             lm_head: The vocab-parallel head whose shard the argmax reduces.
@@ -435,10 +403,19 @@ class LogitsProcessor(nn.Module):
         Returns:
             The state, or None when this group must use the gather path.
         """
+        if force_deterministic_rsag() or not 2 <= self.tp_size <= 32:
+            return None  # the kernel's cross-rank reduce is a single warp shuffle
+        vocab_per_rank = lm_head.weight.size(0)
+        # A padded vocab could let the sharded argmax pick a pad column.
+        if vocab_per_rank * self.tp_size != self.config.vocab_size:
+            return None
+        if not supports_dist_argmax_shape(vocab_per_rank, dtype, self.tp_size):
+            return None
+
         device = lm_head.weight.device
         key = (
             self.tp_group,
-            lm_head.weight.size(0),
+            vocab_per_rank,
             max_M,
             skip_ping_pong,
             dtype,
@@ -469,21 +446,8 @@ class LogitsProcessor(nn.Module):
         return state
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if _force_deterministic_rsag():
-            return None
-        if not 2 <= self.tp_size <= 32:
-            return None  # the kernel's cross-rank reduce is a single warp shuffle
         if self.skip_all_gather or self.dp_sampling_enabled:
             return None
-
-        vocab_per_rank = lm_head.weight.size(0)
-        if vocab_per_rank * self.tp_size != self.config.vocab_size:
-            return None  # padded vocab: sharded argmax could pick a pad column
-        if not supports_dist_argmax_shape(
-            vocab_per_rank, lm_head.weight.dtype, self.tp_size
-        ):
-            return None
-
         return self.acquire_dist_argmax_state(
             lm_head,
             max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,

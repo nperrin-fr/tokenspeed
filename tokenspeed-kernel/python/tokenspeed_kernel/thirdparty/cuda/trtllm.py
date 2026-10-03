@@ -604,16 +604,6 @@ def trtllm_allreduce_fusion(
     latent_width: Optional[int] = None,
 ) -> None:
     launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
-    if use_oneshot is None:
-        if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
-            use_oneshot = workspace_ptrs.resolve_use_oneshot(
-                token_num, None, hidden_dim
-            )
-        else:
-            use_oneshot = _ar_should_use_oneshot(
-                token_num, hidden_dim, allreduce_in.dtype, world_size
-            )
-
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
         use_oneshot = workspace_ptrs.resolve_use_oneshot(
             token_num, use_oneshot, hidden_dim
@@ -670,6 +660,10 @@ def trtllm_allreduce_fusion(
         )
         return
 
+    if use_oneshot is None:
+        use_oneshot = _ar_should_use_oneshot(
+            token_num, hidden_dim, allreduce_in.dtype, world_size
+        )
     if not use_oneshot:
         assert not residual_reduce_scattered, "Currently not supported!"
         assert token_num > world_size, "sequence length should be larger than tp_size"

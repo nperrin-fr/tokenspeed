@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
 
 from tokenspeed.runtime.distributed.comm_backend import get_global_backend
 from tokenspeed.runtime.distributed.dp_sampling_comm import (
@@ -40,6 +41,7 @@ def _worker_main(rank, world_size, port, test_fn, error_dict, args):
 
         group = tuple(range(world_size))
         pg_manager.init_process_group(group)
+        gather_fabric_map()
 
         test_fn(rank=rank, world_size=world_size, device=device, group=group, **args)
 

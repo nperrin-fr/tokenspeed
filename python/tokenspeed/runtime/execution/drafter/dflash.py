@@ -23,9 +23,6 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    supports_dist_argmax_shape as _supports_dist_argmax_shape,
-)
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
@@ -45,10 +42,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.layers.logits_processor import (
-    LogitsMetadata,
-    _force_deterministic_rsag,
-)
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
@@ -278,34 +272,18 @@ class DFlash(BaseDrafter):
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
 
-    def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
-        """Ask for a drafting state, once the head's shard is a fit for one."""
-        head = self.lm_head
-        shard = int(head.shard_indices.num_org_elements)
-        tp_size = int(self.logits_processor.tp_size)
-        if (
-            _force_deterministic_rsag()
-            or not 2 <= tp_size <= 32
-            or int(head.num_embeddings) != int(head.org_vocab_size)
-            or shard * tp_size != int(head.org_vocab_size)
-            or not _supports_dist_argmax_shape(shard, dtype, tp_size)
-        ):
-            return None
-        return self.logits_processor.acquire_dist_argmax_state(
-            head,
-            max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
-            # Back-to-back walk rounds carry no cross-rank sync between them,
-            # which skip_ping_pong would require.
-            skip_ping_pong=False,
-            dtype=dtype,
-        )
-
-    def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
+    def _ensure_dist_argmax_state(self, dtype: torch.dtype):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
             if torch.cuda.is_current_stream_capturing():
                 return None  # rendezvous is collective; leave it to warmup
-            self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
+            self._dist_argmax_state = self.logits_processor.acquire_dist_argmax_state(
+                self.lm_head,
+                max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+                # Walk rounds carry no cross-rank sync, which skip_ping_pong requires.
+                skip_ping_pong=False,
+                dtype=dtype,
+            )
         return self._dist_argmax_state
 
     def _greedy_gather_capacity(self) -> int:
@@ -407,7 +385,7 @@ class DFlash(BaseDrafter):
         chunk_len = int(hidden_states.shape[0])
         # The collective probe must sit outside every rank-local branch: a rank
         # with an empty org shard skipping it would strand the rest.
-        dist_state = self._ensure_dist_argmax_state(weight.dtype, weight.device)
+        dist_state = self._ensure_dist_argmax_state(weight.dtype)
         if num_org > 0:
             if base_logits is None:
                 base_logits = torch.matmul(hidden_states, weight[:num_org].T)

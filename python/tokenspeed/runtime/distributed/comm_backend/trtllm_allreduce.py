@@ -83,13 +83,13 @@ class TrtllmAllReduceBackend(CommBackend):
 
         device_group = pg_manager.get_process_group("nccl", group)
 
+        from tokenspeed_kernel.ops.communication.fabric import group_spans_hosts
         from tokenspeed_kernel.ops.communication.trtllm import (
             MNNVL_TWOSHOT_MAX_TOKEN,
             ensure_workspace_initialized,
-            group_spans_nodes,
         )
 
-        if group_spans_nodes(device_group):
+        if group_spans_hosts(group):
             # Cross-node arms mnnvl only; size it for the two-shot range.
             max_token_num = max(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
 

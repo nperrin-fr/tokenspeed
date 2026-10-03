@@ -45,7 +45,6 @@ __all__ = [
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
     "trtllm_workspace_allreduce",
-    "group_spans_nodes",
     "armed_workspace_hidden_dim",
     "ensure_workspace_initialized",
     "MNNVL_TWOSHOT_MAX_TOKEN",
@@ -65,7 +64,6 @@ allreduce_residual_rmsnorm = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
-group_spans_nodes = error_fn
 allreduce_residual_attnres_combine = error_fn
 allreduce_lane_latent_norm = error_fn
 reducescatter_residual_rmsnorm = error_fn
@@ -73,7 +71,10 @@ trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
 
 if current_platform().is_nvidia:
-    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+    from tokenspeed_kernel.ops.communication.fabric import (
+        group_multicast_reachable,
+        group_spans_hosts,
+    )
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
         MNNVL_PREFER_IPC_BYTES,
@@ -91,16 +92,16 @@ if current_platform().is_nvidia:
         trtllm_reducescatter_fusion,
     )
 
-    def _mnnvl_locally_available(world_size: int) -> bool:
+    def _mnnvl_locally_available(ranks: list[int]) -> bool:
         """Non-collective capability probe for the MNNVL one-shot AR path.
 
         Checks the compiled kernel symbol, torch symmetric-memory support, NVLS
-        multicast availability, and -- for groups wider than this host -- that
-        fabric-handle memory really works. Purely local: safe to call before any
-        collective.
+        multicast availability, and that multicast can map the group's ranks
+        (fabric on every rank once they span hosts). Reads only local state and
+        the gathered fabric map: safe to call before any collective.
         """
         # The kernel's own world-size list; a copied literal once gated out world 16.
-        if world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
+        if len(ranks) not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return False
         try:
             if torch.cuda.get_device_capability()[0] < 9:
@@ -113,11 +114,8 @@ if current_platform().is_nvidia:
                 DeviceType.CUDA, torch.cuda.current_device()
             ):
                 return False
-            # Without IMEX a multi-host rendezvous hangs instead of failing: probe it.
-            if (
-                world_size > torch.cuda.device_count()
-                and not fabric_allocation_supported(torch.cuda.current_device())
-            ):
+            # Without IMEX a multi-host rendezvous hangs instead of failing.
+            if not group_multicast_reachable(ranks):
                 return False
             return hasattr(_load_trtllm_comm_module(), "trtllm_mnnvl_allreduce_fusion")
         except Exception as exc:  # noqa: BLE001 - capability probe must not raise
@@ -140,7 +138,7 @@ if current_platform().is_nvidia:
         """
         device = torch.device("cuda", torch.cuda.current_device())
         ok = torch.tensor(
-            [1 if _mnnvl_locally_available(world_size) else 0],
+            [1 if _mnnvl_locally_available(dist.get_process_group_ranks(group)) else 0],
             dtype=torch.int32,
             device=device,
         )
@@ -169,43 +167,6 @@ if current_platform().is_nvidia:
             f"buffer={workspace.buffer_size_bytes!s} bytes",
         )
         return workspace
-
-    def _group_spans_nodes(group) -> bool:
-        """True when the process group spans hosts.
-
-        CUDA-IPC handles cannot cross a node boundary, and a failed creation
-        attempt does not merely fail -- it leaves a sticky CUDA context error
-        that kills the next allocation. So this must be decided before trying,
-        not caught afterwards.
-        """
-        import socket
-
-        try:
-            world = (
-                dist.get_world_size(group)
-                if group is not None
-                else dist.get_world_size()
-            )
-            names = [None] * world
-            dist.all_gather_object(names, socket.gethostname(), group=group)
-            return len(set(names)) > 1
-        except Exception:  # noqa: BLE001 -- no distributed context: single node
-            return False
-
-    def group_spans_nodes(group: dist.ProcessGroup) -> bool:
-        """Whether the group's ranks live on more than one host.
-
-        Args:
-            group: process group to inspect; collective (hostname gather).
-
-        Returns:
-            True when at least two distinct hosts are present.
-        """
-        return _group_spans_nodes(group)
-
-    def _skip_ipc_workspace(group) -> bool:
-        """Whether to skip arming the CUDA-IPC workspace for *group*: IPC is node-local."""
-        return _group_spans_nodes(group)
 
     class TrtllmFusionWorkspaceManager:
         def __init__(self):
@@ -262,11 +223,10 @@ if current_platform().is_nvidia:
             group: dist.ProcessGroup,
             use_fp32_lamport: bool,
         ) -> None:
-            # IPC handles cannot span nodes, and trying leaves a sticky CUDA error.
             # Recorded first: a failed arm must still destroy on the right group.
             self.group = group
-            _skip_ipc = _skip_ipc_workspace(group)
-            if _skip_ipc:
+            # IPC handles cannot span nodes, and trying leaves a sticky CUDA error.
+            if group_spans_hosts(dist.get_process_group_ranks(group)):
                 self.ipc_handles, self.workspace_tensor = None, None
             else:
                 # allreduce_fusion, allgather_fusion, reducescatter_fusion all use the same workspace to create entry
@@ -462,6 +422,29 @@ if current_platform().is_nvidia:
             manager.graph_consumed = True
         return workspace
 
+    def _lamport_width_matches(
+        manager: TrtllmFusionWorkspaceManager, dtype: torch.dtype
+    ) -> bool:
+        """A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol."""
+        return (dtype == torch.float32) == manager.use_fp32_lamport
+
+    def _ipc_workspace(
+        manager: TrtllmFusionWorkspaceManager, dtype: torch.dtype, op: str
+    ) -> torch.Tensor:
+        """The IPC lamport workspace AG/RS run on; it is None cross-node even with mnnvl."""
+        if manager.workspace_tensor is None:
+            raise RuntimeError(
+                f"trtllm {op} fusion requires the IPC lamport workspace, which is "
+                "unavailable on this group (cross-node, or IPC explicitly "
+                "skipped). Use the unfused path for this collective."
+            )
+        if not _lamport_width_matches(manager, dtype):
+            raise RuntimeError(
+                f"trtllm {op} fusion: payload width does not match "
+                "the armed lamport sentinel"
+            )
+        return _mark_captured(manager, manager.workspace_tensor)
+
     def _ar_fusion_workspace(
         manager: TrtllmFusionWorkspaceManager,
         token_num: int,
@@ -496,9 +479,8 @@ if current_platform().is_nvidia:
         prefer_ipc = payload_bytes >= MNNVL_PREFER_IPC_BYTES or (
             pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm
         )
-        # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
-        ipc_ok = manager.workspace_tensor is not None and (
-            (dtype == torch.float32) == manager.use_fp32_lamport
+        ipc_ok = manager.workspace_tensor is not None and _lamport_width_matches(
+            manager, dtype
         )
         if ipc_ok and prefer_ipc:
             return _mark_captured(manager, manager.workspace_tensor)
@@ -527,6 +509,44 @@ if current_platform().is_nvidia:
             )
             return None
         return _mark_captured(manager, manager.workspace_tensor)
+
+    def _ar_workspace_and_oneshot(
+        manager: TrtllmFusionWorkspaceManager,
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        pattern_code: int,
+        use_oneshot: bool | None,
+        residual_reduce_scattered: bool,
+    ):
+        """Pick the AR workspace, then the strategy it runs.
+
+        mnnvl resolves against the one-shot lane it was armed with; IPC keeps
+        the traffic heuristic. ``use_oneshot`` None asks for that default.
+        """
+        requested = (
+            use_oneshot
+            if use_oneshot is not None
+            else _ar_should_use_oneshot(
+                token_num, hidden_dim, dtype, manager.world_size
+            )
+        )
+        mnnvl = manager.mnnvl_workspace
+        resolved = (
+            requested
+            if mnnvl is None
+            else mnnvl.resolve_use_oneshot(token_num, use_oneshot, hidden_dim)
+        )
+        workspace = _ar_fusion_workspace(
+            manager,
+            token_num,
+            hidden_dim,
+            dtype,
+            pattern_code,
+            resolved,
+            residual_reduce_scattered,
+        )
+        return workspace, resolved if workspace is mnnvl else requested
 
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:
         token_list_in_group = []
@@ -638,8 +658,7 @@ if current_platform().is_nvidia:
 
         tensor_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
         token_num, hidden_dim = tensor_2d.shape
-        # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
-        if (tensor_2d.dtype == torch.float32) != manager.use_fp32_lamport:
+        if not _lamport_width_matches(manager, tensor_2d.dtype):
             return None
         # The device kernels read 16-byte vectors along the hidden lane.
         if hidden_dim % (16 // tensor_2d.dtype.itemsize) != 0:
@@ -651,30 +670,24 @@ if current_platform().is_nvidia:
         # The device kernels support exactly these fan-ins at every size.
         if world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return None
-        requested_oneshot = _ar_should_use_oneshot(
-            token_num, hidden_dim, tensor_2d.dtype, world_size
-        )
-        resolved_oneshot = requested_oneshot
-        if manager.mnnvl_workspace is not None:
-            resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
-                token_num, None, hidden_dim
-            )
-        workspace = _ar_fusion_workspace(
+        workspace, use_oneshot = _ar_workspace_and_oneshot(
             manager,
             token_num,
             hidden_dim,
             tensor_2d.dtype,
             AllReduceFusionPattern.kAllReduce,
-            resolved_oneshot,
+            None,
+            False,
         )
         if workspace is None:
             return None
-        # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
-        if workspace is not manager.mnnvl_workspace:
-            resolved_oneshot = requested_oneshot
-            # The IPC two-shot kernel asserts token_num > world_size.
-            if not resolved_oneshot and token_num <= world_size:
-                return None
+        # The IPC two-shot kernel asserts token_num > world_size.
+        if (
+            workspace is not manager.mnnvl_workspace
+            and not use_oneshot
+            and token_num <= world_size
+        ):
+            return None
         if not tensor_2d.is_contiguous():
             tensor_2d = tensor_2d.contiguous()
 
@@ -686,7 +699,7 @@ if current_platform().is_nvidia:
             token_num=token_num,
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
-            use_oneshot=resolved_oneshot,
+            use_oneshot=use_oneshot,
             trigger_completion_at_end=True,
             fp32_acc=False,
             pattern_code=AllReduceFusionPattern.kAllReduce,
@@ -776,31 +789,15 @@ if current_platform().is_nvidia:
         if residual_reduce_scattered or has_partial_norm_out:
             use_oneshot = True
 
-        requested_oneshot = (
-            use_oneshot
-            if use_oneshot is not None
-            else _ar_should_use_oneshot(
-                token_num, hidden_dim, input_tensor.dtype, world_size
-            )
-        )
-        manager = _manager_for_group(group)
-        resolved_oneshot = requested_oneshot
-        if manager.mnnvl_workspace is not None:
-            resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
-                token_num, use_oneshot, hidden_dim
-            )
-        workspace = _ar_fusion_workspace(
-            manager,
+        workspace, use_oneshot = _ar_workspace_and_oneshot(
+            _manager_for_group(group),
             token_num,
             hidden_dim,
             input_tensor.dtype,
             pattern_code,
-            resolved_oneshot,
+            use_oneshot,
             residual_reduce_scattered,
         )
-        # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
-        if workspace is not manager.mnnvl_workspace:
-            resolved_oneshot = requested_oneshot
         if workspace is None:
             # Cross-node group, pattern/shape the mnnvl kernel cannot serve
             # (block-quant or partial-out epilogue, oversized call). Degrade to
@@ -834,7 +831,7 @@ if current_platform().is_nvidia:
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
-            use_oneshot=resolved_oneshot,
+            use_oneshot=use_oneshot,
             trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=(pattern_code),
@@ -1104,28 +1101,16 @@ if current_platform().is_nvidia:
         else:
             quant_out = None
             scale_out = None
-        # AG/RS run on IPC only, which is None cross-node even with mnnvl armed.
-        manager = _manager_for_group(group)
-        if manager.workspace_tensor is None:
-            raise RuntimeError(
-                "trtllm reducescatter fusion requires the IPC lamport workspace, which is "
-                "unavailable on this group (cross-node, or IPC explicitly "
-                "skipped). Use the unfused path for this collective."
-            )
-        # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
-        if (input_tensor.dtype == torch.float32) != manager.use_fp32_lamport:
-            raise RuntimeError(
-                "trtllm reducescatter fusion: payload width does not match "
-                "the armed lamport sentinel"
-            )
-
+        workspace = _ipc_workspace(
+            _manager_for_group(group), input_tensor.dtype, "reducescatter"
+        )
         trtllm_reducescatter_fusion(
             reducescatter_in=input_tensor,
             world_size=world_size,
             world_rank=rank,
             token_num=token_num,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_mark_captured(manager, manager.workspace_tensor),
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             trigger_completion_at_end=trigger_completion_at_end,
             num_token_current_rank=token_count,
@@ -1235,27 +1220,13 @@ if current_platform().is_nvidia:
             else AllGatherFusionPattern.kAllGatherfusedRMS
         )
 
-        # AG/RS run on IPC only, which is None cross-node even with mnnvl armed.
-        manager = _manager_for_group(group)
-        if manager.workspace_tensor is None:
-            raise RuntimeError(
-                "trtllm allgather fusion requires the IPC lamport workspace, which is "
-                "unavailable on this group (cross-node, or IPC explicitly "
-                "skipped). Use the unfused path for this collective."
-            )
-        # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
-        if (qkv.dtype == torch.float32) != manager.use_fp32_lamport:
-            raise RuntimeError(
-                "trtllm allgather fusion: payload width does not match "
-                "the armed lamport sentinel"
-            )
-
+        workspace = _ipc_workspace(_manager_for_group(group), qkv.dtype, "allgather")
         trtllm_allgather_fusion(
             allgather_in=qkv,
             world_size=world_size,
             world_rank=rank,
             hidden_dim=hidden_dim,
-            workspace_ptrs=_mark_captured(manager, manager.workspace_tensor),
+            workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
             trigger_completion_at_end=trigger_completion_at_end,
             num_token_current_rank=num_token_current_rank,

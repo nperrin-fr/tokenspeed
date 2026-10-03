@@ -38,46 +38,62 @@ def _probe():
     return trtllm_mod, trtllm_mod._mnnvl_locally_available
 
 
+def _two_hosts(monkeypatch, has_fabric):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_host_map", [rank // 8 for rank in range(16)])
+    monkeypatch.setattr(fabric, "group_has_fabric", has_fabric)
+
+
 def test_cross_host_group_requires_fabric(monkeypatch):
-    """A group wider than the host's GPUs needs working fabric memory.
+    """A group spanning hosts needs working fabric memory on every rank.
 
     Without it, symm_mem.rendezvous() hangs instead of failing, so the gate
     must reject the workspace up front.
     """
-    trtllm_mod, probe = _probe()
-    monkeypatch.setattr(trtllm_mod, "fabric_allocation_supported", lambda _: False)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    _, probe = _probe()
+    _two_hosts(monkeypatch, lambda ranks: False)
 
-    assert probe(16) is False
+    assert probe(list(range(16))) is False
 
 
 def test_cross_host_group_allowed_with_fabric(monkeypatch):
-    trtllm_mod, probe = _probe()
-    monkeypatch.setattr(trtllm_mod, "fabric_allocation_supported", lambda _: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    _, probe = _probe()
+    _two_hosts(monkeypatch, lambda ranks: True)
 
     # Still subject to the other capability checks, so only assert that the
     # cross-host rule alone no longer vetoes the group.
-    assert probe(16) == probe(8)
+    assert probe(list(range(16))) == probe(list(range(8)))
+
+
+def test_a_strided_pair_across_hosts_is_still_probed(monkeypatch):
+    """Two ranks on two hosts is fewer ranks than one host holds."""
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    _, probe = _probe()
+    probed = []
+    _two_hosts(monkeypatch, lambda ranks: probed.append(list(ranks)) or False)
+    monkeypatch.setattr(_SymmetricMemory, "has_multicast_support", lambda *a: True)
+
+    assert probe([0, 8]) is False
+    assert probed == [[0, 8]]
 
 
 def test_intra_host_group_ignores_fabric(monkeypatch):
     """Groups inside one host ride NVLS multicast, so fabric must not gate them."""
-    trtllm_mod, probe = _probe()
-    monkeypatch.setattr(
-        trtllm_mod,
-        "fabric_allocation_supported",
-        lambda _: pytest.fail("fabric probe must not run for intra-host groups"),
+    _, probe = _probe()
+    _two_hosts(
+        monkeypatch,
+        lambda ranks: pytest.fail("fabric probe must not run for intra-host groups"),
     )
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
-    probe(8)
+    probe(list(range(8)))
 
 
 def test_unsupported_world_size_rejected():
     _, probe = _probe()
 
-    assert probe(3) is False
+    assert probe([0, 1, 2]) is False
 
 
 def test_the_oneshot_cap_follows_the_call_width_not_the_armed_lane():
@@ -139,3 +155,40 @@ def test_every_resolution_passes_the_call_width():
                 sites += 1
                 assert len(node.args) == 3, f"{path}:{node.lineno} omits the width"
     assert sites >= 5, f"expected every resolution site to be checked, saw {sites}"
+
+
+@pytest.mark.parametrize("on_mnnvl", [True, False])
+def test_each_workspace_runs_its_own_oneshot_rule(monkeypatch, on_mnnvl):
+    """mnnvl resolves against its armed lane; IPC keeps the traffic heuristic."""
+    from types import SimpleNamespace
+
+    trtllm_mod, _ = _probe()
+    mnnvl = SimpleNamespace(resolve_use_oneshot=lambda tokens, requested, width: False)
+    manager = SimpleNamespace(world_size=8, mnnvl_workspace=mnnvl)
+    ipc = object()
+    picked = mnnvl if on_mnnvl else ipc
+    monkeypatch.setattr(trtllm_mod, "_ar_fusion_workspace", lambda *args: picked)
+    monkeypatch.setattr(trtllm_mod, "_ar_should_use_oneshot", lambda *args: True)
+
+    workspace, use_oneshot = trtllm_mod._ar_workspace_and_oneshot(
+        manager, 4, 7168, torch.bfloat16, 0, None, False
+    )
+
+    assert workspace is picked
+    assert use_oneshot is (not on_mnnvl)
+
+
+def test_ipc_only_collectives_refuse_a_missing_or_mismatched_workspace(monkeypatch):
+    from types import SimpleNamespace
+
+    trtllm_mod, _ = _probe()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    ipc = torch.empty(1)
+    armed = SimpleNamespace(workspace_tensor=ipc, use_fp32_lamport=False)
+
+    assert trtllm_mod._ipc_workspace(armed, torch.bfloat16, "allgather") is ipc
+    with pytest.raises(RuntimeError, match="payload width"):
+        trtllm_mod._ipc_workspace(armed, torch.float32, "allgather")
+    missing = SimpleNamespace(workspace_tensor=None, use_fp32_lamport=False)
+    with pytest.raises(RuntimeError, match="reducescatter fusion requires the IPC"):
+        trtllm_mod._ipc_workspace(missing, torch.bfloat16, "reducescatter")

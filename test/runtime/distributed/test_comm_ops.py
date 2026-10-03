@@ -26,23 +26,17 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 class TestAutoBackendTopology:
     @pytest.fixture
     def backend(self, monkeypatch):
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-        from tokenspeed.runtime.utils.env import global_server_args_dict
+        import tokenspeed_kernel.ops.communication.fabric as fabric
 
-        monkeypatch.setitem(
-            global_server_args_dict,
-            "mapping",
-            SimpleNamespace(nprocs_per_node=4),
-        )
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        monkeypatch.setattr(fabric, "_host_map", [rank // 4 for rank in range(16)])
         backend = AutoBackend.__new__(AutoBackend)
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._triton_ar = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
-        # A host-spread group's rsag routing keys on the fabric probe, so pin
-        # both the probe and the local device count the tests assume.
-        monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
         return backend
 
     @staticmethod
@@ -51,10 +45,13 @@ class TestAutoBackendTopology:
 
         monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
 
-    def test_group_spans_nodes(self, backend):
-        assert not backend._group_spans_nodes((0, 1, 2, 3))
-        assert not backend._group_spans_nodes((4, 5, 6, 7))
-        assert backend._group_spans_nodes((0, 1, 4, 5))
+    def test_group_spans_hosts(self, backend):
+        from tokenspeed_kernel.ops.communication.fabric import group_spans_hosts
+
+        assert not group_spans_hosts((0, 1, 2, 3))
+        assert not group_spans_hosts((4, 5, 6, 7))
+        assert group_spans_hosts((0, 1, 4, 5))
+        assert group_spans_hosts((0, 4))
 
     @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
     def test_host_spread_token_ops_without_fabric_use_nccl(
@@ -272,6 +269,16 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
         fabric.group_has_fabric((0, 1))
 
 
+def test_a_missing_host_map_raises_for_arming_and_declines_for_gates(monkeypatch):
+    """Arming IPC on a guessed single host maps it across hosts; a gate just declines."""
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_host_map", None)
+    with pytest.raises(RuntimeError, match="never gathered"):
+        fabric.group_spans_hosts((0, 1))
+    assert fabric.group_multicast_reachable((0, 1)) is False
+
+
 def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
     import tokenspeed_kernel.ops.communication.fabric as fabric
 
@@ -380,6 +387,8 @@ def _setup_runtime_globals(rank, world_size):
     AutoBackend's 2-D last-dim all_gather and all token-aware ops route through
     TritonRSAGBackend, which sizes its persistent buffers from these globals.
     """
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -389,6 +398,7 @@ def _setup_runtime_globals(rank, world_size):
     global_server_args_dict["max_prefill_tokens"] = 8192
     global_server_args_dict["max_model_len"] = 4096
     global_server_args_dict["force_deterministic_rsag"] = True
+    gather_fabric_map()
 
 
 def _run(world_size, test_fn):

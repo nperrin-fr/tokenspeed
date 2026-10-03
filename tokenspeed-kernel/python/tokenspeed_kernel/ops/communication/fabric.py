@@ -46,6 +46,9 @@ __all__ = [
     "gather_fabric_map",
     "group_has_fabric",
     "group_host_span",
+    "group_multicast_reachable",
+    "group_spans_hosts",
+    "host_identity",
 ]
 
 logger = logging.getLogger(__name__)
@@ -186,7 +189,7 @@ def fabric_allocation_supported(device_index: int) -> bool:
     return cached
 
 
-def _host_identity() -> int:
+def host_identity() -> int:
     """An id every rank on one host computes identically, and no other host does.
 
     The boot id is the host's, not the container's: a launcher that gives each
@@ -212,17 +215,18 @@ def _host_identity() -> int:
 def gather_fabric_map() -> list[bool]:
     """Gather and cache every world rank's fabric-allocation verdict and host.
 
-    Fabric handles are an NVIDIA concept, so off NVIDIA the answer is no for
-    every rank and is filled in without a collective. Deciding that here rather
-    than at the call site keeps the collective out of a lazy path: a caller
-    that skipped this on the wrong platform would otherwise trigger the gather
-    from a gate, which is the dispatch-time collective this map exists to
-    remove.
+    Fabric handles are an NVIDIA concept, so off NVIDIA the fabric answer is no
+    for every rank. Hosts are still gathered on AMD, whose node-local fast paths
+    key on the host span; elsewhere every rank is its own host and the map is
+    filled in without a collective. Deciding that here rather than at the call
+    site keeps the collective out of a lazy path: a caller that skipped this on
+    the wrong platform would otherwise trigger the gather from a gate, which is
+    the dispatch-time collective this map exists to remove.
 
     That branch is the one thing here the ranks do not agree on by
-    construction. ``is_nvidia`` is detected locally, so a job mixing CUDA and
-    non-CUDA ranks would have some enter the all_gather and others return, and
-    the ones that entered would wait out the NCCL timeout. The caller it
+    construction. The vendor is detected locally, so a job mixing GPU and
+    other ranks would have some enter the all_gather and others return, and
+    the ones that entered would wait out the collective timeout. The caller it
     replaced read a server argument, which was uniform; this reads the machine.
     """
     global _fabric_map, _host_map
@@ -231,15 +235,17 @@ def gather_fabric_map() -> list[bool]:
         return _fabric_map
 
     world_size = torch.distributed.get_world_size()
-    if not current_platform().is_nvidia:
-        # No fabric to map, so every rank is its own host and every span declines.
+    platform = current_platform()
+    if not (platform.is_nvidia or platform.is_amd):
+        # No device collective to map hosts with, so every rank is its own host.
         _fabric_map = [False] * world_size
         _host_map = list(range(world_size))
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
+    fabric = platform.is_nvidia and fabric_allocation_supported(device.index)
     local = torch.tensor(
-        [int(fabric_allocation_supported(device.index)), _host_identity()],
+        [int(fabric), host_identity()],
         dtype=torch.int64,
         device=device,
     )
@@ -287,3 +293,35 @@ def group_host_span(ranks: Sequence[int]) -> int | None:
     if _host_map is None:
         return None
     return len({_host_map[rank] for rank in ranks})
+
+
+def group_spans_hosts(ranks: Sequence[int]) -> bool:
+    """Whether ``ranks`` live on more than one host.
+
+    Raises if the map has not been gathered: callers arm node-local resources
+    such as CUDA IPC from this answer, and a guess of one host maps IPC across
+    hosts.
+    """
+    span = group_host_span(ranks)
+    if span is None:
+        raise RuntimeError(
+            "fabric map was never gathered; call gather_fabric_map() at "
+            "distributed initialization before any host-span decision"
+        )
+    return span > 1
+
+
+def group_multicast_reachable(ranks: Sequence[int]) -> bool:
+    """Whether NVLS multicast can map across ``ranks``.
+
+    A node-local group always can; a group spanning hosts only when every rank
+    has fabric. Importing symmetric memory is not enough: a cross-host group
+    without fabric or IMEX still reports multicast locally and then hangs in the
+    rendezvous instead of falling back. Placement comes from the gathered host
+    map, never from the rank count or the visible device count, and a map never
+    gathered declines rather than guessing.
+    """
+    span = group_host_span(ranks)
+    if span is None:
+        return False
+    return span <= 1 or group_has_fabric(ranks)

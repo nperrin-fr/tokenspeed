@@ -53,6 +53,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_backend.auto import force_deterministic_rsag
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
     all_reduce,
@@ -289,17 +290,18 @@ class K3AttnComm:
             allreduce_residual_attnres_combine_supported,
         )
 
-        return not global_server_args_dict.get(
-            "force_deterministic_rsag", False
-        ) and allreduce_residual_attnres_combine_supported(
-            partial,
-            residual,
-            score_weight,
-            output_weight,
-            scratch,
-            rank=self.mapping.attn.tp_rank,
-            group=_get_process_group(self.mapping.attn.tp_group),
-            local_world_size=self.mapping.nprocs_per_node,
+        return (
+            not force_deterministic_rsag()
+            and allreduce_residual_attnres_combine_supported(
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=self.mapping.attn.tp_rank,
+                group=_get_process_group(self.mapping.attn.tp_group),
+                local_world_size=self.mapping.nprocs_per_node,
+            )
         )
 
     def attn_reduce(
