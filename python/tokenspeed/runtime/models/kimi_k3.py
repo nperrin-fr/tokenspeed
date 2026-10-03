@@ -63,13 +63,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import fp8_linear
-from tokenspeed_kernel.ops.activation.triton import (
-    attnres_combine,
-    attnres_partial,
-    attnres_partial_dual,
-    rmsnorm_gated_sigmoid,
-    sigmoid_mul,
-)
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid, sigmoid_mul
 from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
@@ -93,6 +87,11 @@ from tokenspeed_kernel.ops.moe import (
 from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
+from tokenspeed_kernel.ops.residual.triton import (
+    attnres_combine,
+    attnres_partial,
+    attnres_partial_dual,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 

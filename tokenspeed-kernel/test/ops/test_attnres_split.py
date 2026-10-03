@@ -6,7 +6,7 @@ The split factors the online-softmax candidate mix into a blocks-side partial
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.activation.triton import (
+from tokenspeed_kernel.ops.residual.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,

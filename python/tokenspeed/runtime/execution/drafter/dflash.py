@@ -140,6 +140,12 @@ class DFlash(BaseDrafter):
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
         self.attention_kind = getattr(self.model, "attention_kind", "qwen_mha")
+        # Bound by wire_target once the target model is loaded.
+        self.target_model: torch.nn.Module | None = None
+        self.target_language_model: torch.nn.Module | None = None
+        self.embed_tokens: torch.nn.Module | None = None
+        self.lm_head: torch.nn.Module | None = None
+        self.logits_processor: torch.nn.Module | None = None
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}

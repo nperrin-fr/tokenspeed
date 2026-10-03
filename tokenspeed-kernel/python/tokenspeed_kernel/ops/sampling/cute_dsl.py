@@ -921,16 +921,17 @@ class DistArgmaxState:
     round_id_gpu: torch.Tensor
     warps_done_gpu: torch.Tensor
     use_redux: bool
-    skip_ping_pong: bool = False
+    skip_ping_pong: bool
 
 
 def _build_dist_argmax_state(
     group: _dist.ProcessGroup,
     rank_in_group: int,
     max_M: int,
-    dtype: torch.dtype = torch.bfloat16,
-    device: torch.device | None = None,
-    skip_ping_pong: bool = False,
+    dtype: torch.dtype,
+    device: torch.device | None,
+    *,
+    skip_ping_pong: bool,
 ) -> DistArgmaxState | None:
     assert dtype in (
         torch.bfloat16,
@@ -988,9 +989,10 @@ def try_create_dist_argmax_state(
     group: _dist.ProcessGroup,
     rank_in_group: int,
     max_M: int,
-    dtype: torch.dtype = torch.bfloat16,
-    device: torch.device | None = None,
-    skip_ping_pong: bool = False,
+    dtype: torch.dtype,
+    device: torch.device | None,
+    *,
+    skip_ping_pong: bool,
 ) -> DistArgmaxState | None:
     """Build the cross-rank argmax state, or report that NVLS is missing.
 
@@ -1003,7 +1005,7 @@ def try_create_dist_argmax_state(
         rank_in_group: This process's rank within ``group``.
         max_M: Largest row count any call will pass.
         dtype: Value dtype of the logits; bf16, fp16 or fp32.
-        device: CUDA device for the symmetric-memory slots; defaults to the
+        device: CUDA device for the symmetric-memory slots, or None for the
             current device.
         skip_ping_pong: Pin the slot band instead of alternating. Only safe
             when the caller synchronizes across ranks between calls.
@@ -1013,7 +1015,7 @@ def try_create_dist_argmax_state(
         verdict follows from the group's fabric, so every rank agrees on it.
     """
     return _build_dist_argmax_state(
-        group, rank_in_group, max_M, dtype, device, skip_ping_pong
+        group, rank_in_group, max_M, dtype, device, skip_ping_pong=skip_ping_pong
     )
 
 

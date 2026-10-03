@@ -919,10 +919,6 @@ def _check_all_reduce_symmetric_outputs(
 
 
 def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
-    from tokenspeed_kernel.ops.activation.triton import (
-        attnres_combine,
-        attnres_partial,
-    )
     from tokenspeed_kernel.ops.communication.iris import (
         IRIS_ALL_REDUCE_KERNEL_CONFIG,
         iris_all_reduce,
@@ -930,6 +926,10 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
     from tokenspeed_kernel.ops.communication.triton import (
         allreduce_residual_attnres_combine,
         allreduce_residual_attnres_combine_supported,
+    )
+    from tokenspeed_kernel.ops.residual.triton import (
+        attnres_combine,
+        attnres_partial,
     )
 
     config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres

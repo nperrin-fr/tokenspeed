@@ -322,7 +322,7 @@ def linear_attnres_partials(
         and score_weight_b.is_contiguous()
     )
     if triton_partial_eligible:
-        from tokenspeed_kernel.ops.activation.triton import attnres_partial_dual
+        from tokenspeed_kernel.ops.residual.triton import attnres_partial_dual
 
         attnres_partial_dual(
             blocks,

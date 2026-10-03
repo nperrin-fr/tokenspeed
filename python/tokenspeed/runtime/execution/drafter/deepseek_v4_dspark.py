@@ -125,6 +125,9 @@ class DeepseekV4DSpark(BaseDrafter):
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
         self.idle_forward_steps = 1
         self._prefill_graph: torch.cuda.CUDAGraph | None = None
+        # Bound by wire_target once the target model is loaded.
+        self.target_model: torch.nn.Module | None = None
+        self.lm_head: torch.nn.Module | None = None
         self._init_buffers()
 
     @staticmethod

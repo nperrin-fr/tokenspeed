@@ -98,6 +98,9 @@ class DeepseekV41DSpark(BaseDrafter):
 
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
+        # Bound by wire_target once the target model is loaded.
+        self.target_model: torch.nn.Module | None = None
+        self.lm_head: torch.nn.Module | None = None
         self.model = self.draft_model.model
         self.block_size = int(self.model.block_size)
         validate_block_widths(

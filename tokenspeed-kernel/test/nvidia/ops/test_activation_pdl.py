@@ -27,15 +27,17 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.activation.triton import (
     add3,
-    attnres_combine,
-    attnres_partial,
-    attnres_partial_dual,
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
     sigmoid_mul,
     silu_and_mul,
     situ_and_mul,
     swiglu_oai,
+)
+from tokenspeed_kernel.ops.residual.triton import (
+    attnres_combine,
+    attnres_partial,
+    attnres_partial_dual,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
