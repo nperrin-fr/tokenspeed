@@ -44,17 +44,22 @@ def _compiles() -> int:
 def warp_splitk(monkeypatch):
     """Pin FI's choice to warp split-K with one tactic for every M, as after tuning."""
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import autotune_tactics
 
-    tactic = astuple(autotune_tactics(fi.BF16_GEMM_MAX_M, N, K)[0])
+    warp_splitk = pytest.importorskip(
+        "flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk"
+    )
+    tactic = astuple(warp_splitk.autotune_tactics(fi.BF16_GEMM_MAX_M, N, K)[0])
     rows = []
 
     def choose_one(tuner, custom_op, runners, tuning_config, inputs, **kwargs):
         assert custom_op == "bf16_gemm"
         rows.append(inputs[0].shape[0])
         runner = next(
-            r for r in runners if type(r).__name__ == "CuteDSLWarpSplitKBf16Runner"
+            (r for r in runners if type(r).__name__ == "CuteDSLWarpSplitKBf16Runner"),
+            None,
         )
+        if runner is None:
+            pytest.skip("this FlashInfer build omits the warp split-K runner")
         return runner, tactic
 
     monkeypatch.setattr(AutoTuner, "choose_one", choose_one)

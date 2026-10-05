@@ -796,6 +796,12 @@ def test_executor_construction_does_not_capture_or_tune():
     ]
 
 
+@pytest.fixture
+def eager_stream(monkeypatch):
+    """The adapter asks whether a capture is running; these CPU tensors never capture."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
 _JOINT_BF16_DISPATCH = (
     "flashinfer_bf16_gemm",
     "_bf16_rows",
@@ -816,7 +822,9 @@ _JOINT_BF16_DISPATCH = (
         (32, 2112, ["tgv"]),
     ],
 )
-def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expected):
+def test_bf16_joint_adapter_uses_one_fi_dispatch(
+    eager_stream, pdl, provided_out, n, k, expected
+):
     calls = []
     workspace = object()
 
@@ -1012,7 +1020,7 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
     )
 
 
-def test_joint_adapter_propagates_fi_failure():
+def test_joint_adapter_propagates_fi_failure(eager_stream):
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
@@ -1090,7 +1098,7 @@ def _joint_bf16_api(sealed, compiled, calls):
     [(1, (1, 32), 1), (19, (1, 32), 32), (32, (1, 32), 32), (3, (1, 32), None)],
 )
 def test_sealed_joint_bf16_runs_only_startup_kernels(
-    m, compiled_rows, runs, provided_out
+    eager_stream, m, compiled_rows, runs, provided_out
 ):
     """Once sealed, M runs its own kernel, else pads to its compiled FI bucket."""
     calls = []
@@ -1111,7 +1119,7 @@ def test_sealed_joint_bf16_runs_only_startup_kernels(
     assert compiled == {(None, rows, 24, 128) for rows in compiled_rows}
 
 
-def test_unsealed_joint_bf16_compiles_the_exact_rows():
+def test_unsealed_joint_bf16_compiles_the_exact_rows(eager_stream):
     calls = []
     compiled = set()
     api = _joint_bf16_api(False, compiled, calls)
@@ -1122,7 +1130,7 @@ def test_unsealed_joint_bf16_compiles_the_exact_rows():
     assert calls == [19] and compiled == {(None, 19, 24, 128)}
 
 
-def test_seal_compiles_each_missing_bucket_once_for_live_projections():
+def test_seal_compiles_each_missing_bucket_once_for_live_projections(eager_stream):
     calls = []
     compiled = set()
     api = _joint_bf16_api(False, compiled, calls)
