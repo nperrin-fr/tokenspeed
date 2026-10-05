@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import seal_bf16_gemms
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.execution.types import (
@@ -1316,6 +1317,8 @@ def build_device_side(
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    # Serving must not compile: the joint BF16 GEMM keeps to the kernels startup ran.
+    seal_bf16_gemms()
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
     start_expert_load_window(executor)

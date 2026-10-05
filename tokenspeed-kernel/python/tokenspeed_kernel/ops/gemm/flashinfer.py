@@ -753,6 +753,9 @@ _mm_bf16 = error_fn
 _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
 BF16_GEMM_MAX_M = 32
+# (device, M, N, K) already run outside capture: FI compiles one kernel per exact M.
+_bf16_compiled: set[tuple[int, int, int, int]] = set()
+_bf16_sealed = False
 
 if platform.is_nvidia and platform.arch_version in _CUTE_DSL_SM100_ARCHS:
     try:
@@ -811,6 +814,7 @@ def flashinfer_joint_bf16_supported(
     """Check the common contract and whether at least one backend is eligible.
 
     Discovery may use large M; execution enforces the separate M <= 32 scope.
+    Once sealed, it also requires a kernel startup already compiled for this M.
     """
     return (
         _fi_gemm is not None
@@ -836,6 +840,11 @@ def flashinfer_joint_bf16_supported(
                 and out.is_contiguous()
                 and out.data_ptr() % 32 == 0
             )
+        )
+        and (
+            not _bf16_sealed
+            or (x.device.index, x.shape[0], weight.shape[0], weight.shape[1])
+            in _bf16_compiled
         )
     )
 
@@ -881,6 +890,10 @@ def flashinfer_bf16_gemm(
         workspace_buffer=workspace,
         runner_names=_bf16_gemm_runner_names(weight.shape[1]),
     )
+    if not torch.cuda.is_current_stream_capturing():
+        _bf16_compiled.add(
+            (x.device.index, x.shape[0], weight.shape[0], weight.shape[1])
+        )
     return out
 
 
@@ -895,3 +908,13 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
         with torch.no_grad():
             sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
             flashinfer_bf16_gemm(sample, weight, None)
+
+
+def seal_bf16_gemms() -> None:
+    """End startup: serving runs only joint BF16 GEMM kernels already compiled.
+
+    FI compiles per exact M, which stalls every running request for seconds.
+    After this, a row count startup never ran takes the caller's other GEMM.
+    """
+    global _bf16_sealed
+    _bf16_sealed = True

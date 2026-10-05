@@ -795,6 +795,19 @@ def test_executor_construction_does_not_capture_or_tune():
     ]
 
 
+@pytest.fixture
+def eager_stream(monkeypatch):
+    """The adapter asks whether a capture is running; these CPU tensors never capture."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
+_JOINT_BF16_ADAPTER = (
+    "flashinfer_bf16_gemm",
+    "_canonical_bf16_view",
+    "_bf16_gemm_runner_names",
+)
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("provided_out", [False, True])
 @pytest.mark.parametrize(
@@ -806,7 +819,9 @@ def test_executor_construction_does_not_capture_or_tune():
         (32, 2112, ["tgv"]),
     ],
 )
-def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expected):
+def test_bf16_joint_adapter_uses_one_fi_dispatch(
+    eager_stream, pdl, provided_out, n, k, expected
+):
     calls = []
     workspace = object()
 
@@ -817,10 +832,11 @@ def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expect
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
+        _JOINT_BF16_ADAPTER,
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
+            _bf16_compiled=set(),
             pdl_enabled=lambda: pdl,
             flashinfer_joint_bf16_supported=lambda *args: True,
             _fi_gemm=SimpleNamespace(
@@ -902,7 +918,12 @@ def test_joint_bf16_support_contract(invalid):
         KERNEL / "ops/gemm/flashinfer.py",
         None,
         ("flashinfer_joint_bf16_supported", "_bf16_gemm_runner_names"),
-        dict(torch=torch, _fi_gemm=object(), has_flashinfer_cute_dsl_bf16=lambda: True),
+        dict(
+            torch=torch,
+            _fi_gemm=object(),
+            has_flashinfer_cute_dsl_bf16=lambda: True,
+            _bf16_sealed=False,
+        ),
     )
     assert api.flashinfer_joint_bf16_supported(x, w, out) == (invalid is None)
 
@@ -987,14 +1008,15 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
     )
 
 
-def test_joint_adapter_propagates_fi_failure():
+def test_joint_adapter_propagates_fi_failure(eager_stream):
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
+        _JOINT_BF16_ADAPTER,
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
+            _bf16_compiled=set(),
             pdl_enabled=lambda: False,
             flashinfer_joint_bf16_supported=lambda *args: True,
             _fi_gemm=SimpleNamespace(
@@ -1026,6 +1048,96 @@ def test_projection_discovery_precedes_auto_dispatch(name):
     )
     assert isinstance(auto.body[0], ast.Expr)
     assert auto.body[0].value.func.id == "autotune_bf16_gemm"
+
+
+@pytest.mark.parametrize(
+    "sealed,compiled_rows,m,expected",
+    [
+        (False, (), 19, True),
+        (True, (), 19, False),
+        (True, (19,), 19, True),
+        (True, (32,), 19, False),
+    ],
+)
+def test_sealed_support_admits_only_rows_startup_ran(
+    sealed, compiled_rows, m, expected
+):
+    """A row count startup never ran takes the caller's other GEMM instead of compiling."""
+    device = SimpleNamespace(index=0)
+
+    def tensor(shape):
+        return SimpleNamespace(
+            is_cuda=True,
+            device=device,
+            ndim=2,
+            dtype=torch.bfloat16,
+            shape=shape,
+            is_contiguous=lambda: True,
+            data_ptr=lambda: 32,
+        )
+
+    api = _functions(
+        KERNEL / "ops/gemm/flashinfer.py",
+        None,
+        ("flashinfer_joint_bf16_supported", "_bf16_gemm_runner_names"),
+        dict(
+            torch=torch,
+            _fi_gemm=object(),
+            has_flashinfer_cute_dsl_bf16=lambda: True,
+            _bf16_sealed=sealed,
+            _bf16_compiled={(0, rows, 24, 128) for rows in compiled_rows},
+        ),
+    )
+    assert (
+        api.flashinfer_joint_bf16_supported(tensor((m, 128)), tensor((24, 128)), None)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_joint_adapter_records_the_rows_it_ran_outside_capture(monkeypatch, capturing):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    compiled = set()
+    api = _functions(
+        KERNEL / "ops/gemm/flashinfer.py",
+        None,
+        _JOINT_BF16_ADAPTER,
+        dict(
+            torch=torch,
+            BF16_GEMM_MAX_M=32,
+            _bf16_compiled=compiled,
+            pdl_enabled=lambda: False,
+            flashinfer_joint_bf16_supported=lambda *args: True,
+            _fi_gemm=SimpleNamespace(
+                DEFAULT_WORKSPACE_SIZE=4096,
+                _get_cache_buf=Mock(return_value=object()),
+                bf16_gemm_sm100=lambda **kwargs: kwargs["out"].copy_(
+                    kwargs["a"] @ kwargs["b"]
+                ),
+            ),
+        ),
+    )
+    x = torch.randn(19, 128, dtype=torch.bfloat16)
+    w = torch.randn(24, 128, dtype=torch.bfloat16)
+    torch.testing.assert_close(api.flashinfer_bf16_gemm(x, w, None), x @ w.T)
+    # A capture replays the kernel its eager warmup compiled; it compiles nothing.
+    assert compiled == (set() if capturing else {(None, 19, 24, 128)})
+
+
+def test_startup_seals_the_joint_bf16_gemm_after_capture():
+    """Capture warmup compiles its row counts first; serving never compiles."""
+    tree = ast.parse((RUNTIME / "execution/device.py").read_text())
+    build = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "build_device_side"
+    )
+    first: dict[str, int] = {}
+    for call in ast.walk(build):
+        if isinstance(call, ast.Call):
+            name = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+            first[name] = min(first.get(name, call.lineno), call.lineno)
+    assert first["autotune"] < first["capture_graphs"] < first["seal_bf16_gemms"]
 
 
 @pytest.mark.parametrize("m", [33, 48, 64, 128])
@@ -1080,7 +1192,12 @@ def test_joint_bf16_restores_previously_routed_shapes(n, k):
         KERNEL / "ops/gemm/flashinfer.py",
         None,
         ("flashinfer_joint_bf16_supported", "_bf16_gemm_runner_names"),
-        dict(torch=torch, _fi_gemm=object(), has_flashinfer_cute_dsl_bf16=lambda: True),
+        dict(
+            torch=torch,
+            _fi_gemm=object(),
+            has_flashinfer_cute_dsl_bf16=lambda: True,
+            _bf16_sealed=False,
+        ),
     )
     # Discovery must not reject the N/K just because the actual warmup is large.
     for m in (1, 3, 31, 32, 128):
