@@ -32,7 +32,7 @@ The scheduler records these phases:
 | `kernels.autotune` | Startup tactic selection |
 | `graph.probe_rebind` | Optional partial capture probe, release and KV rebind |
 | `graph.capture` | Final serving graph capture |
-| `kernels.precompile` | The tuned BF16 projections' FlashInfer M buckets capture did not compile; serving compiles none |
+| `kernels.seal` | The tuned BF16 projections' FlashInfer M buckets capture did not compile; serving compiles none |
 
 Detailed weight phases currently cover the default loader. Other loaders still
 have the enclosing target/draft span. `weights.read_copy` includes any lazy

@@ -819,6 +819,7 @@ def flashinfer_joint_bf16_supported(
     """Check the common contract and whether at least one backend is eligible.
 
     Discovery may use large M; execution enforces the separate M <= 32 scope.
+    Once sealed, it also requires a kernel compiled during startup for this M.
     """
     return (
         _fi_gemm is not None
@@ -845,6 +846,7 @@ def flashinfer_joint_bf16_supported(
                 and out.data_ptr() % 32 == 0
             )
         )
+        and _bf16_rows(x, weight) is not None
     )
 
 
@@ -872,29 +874,15 @@ def _bf16_rows(x: torch.Tensor, weight: torch.Tensor) -> int | None:
     return None
 
 
-def flashinfer_bf16_gemm_ready(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether the joint GEMM can run ``x`` without compiling while serving.
-
-    Args:
-        x: ``[M, K]`` BF16 activations, ``M <= BF16_GEMM_MAX_M``.
-        weight: ``[N, K]`` BF16 weight.
-
-    Returns:
-        Always True before ``seal_bf16_gemms``; afterwards True only when a
-        kernel compiled during startup serves M directly or padded.
-    """
-    return _bf16_rows(x, weight) is not None
-
-
 def flashinfer_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Compute BF16 x[M,K] @ weight[N,K].T using FI's joint runner/tactic search.
 
-    The caller checks the contract and ``flashinfer_bf16_gemm_ready``, and warms
-    the actual shape before capture. Only M <= 32 enters this search. Larger
-    calls keep the original GEMM. Once sealed, an M without its own compiled
-    kernel runs zero-padded to the compiled FI bucket above it.
+    The caller checks the contract and warms the actual shape before capture.
+    Only M <= 32 enters this search. Larger calls keep the original GEMM. Once
+    sealed, an M without its own compiled kernel runs zero-padded to the
+    compiled FI bucket above it.
     """
     if (
         not flashinfer_joint_bf16_supported(x, weight, out)
@@ -902,8 +890,6 @@ def flashinfer_bf16_gemm(
     ):
         raise ValueError("Unsupported input to joint FlashInfer BF16 GEMM")
     rows = _bf16_rows(x, weight)
-    if rows is None:
-        raise ValueError("No joint FlashInfer BF16 GEMM compiled at startup fits")
     if rows == x.shape[0]:
         return _run_bf16_gemm(x, weight, out)
     padded = x.new_zeros((rows, x.shape[1]))
@@ -955,15 +941,18 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
             flashinfer_bf16_gemm(sample, weight, None)
 
 
-def precompile_bf16_gemms() -> int:
-    """Compile FI's M buckets for each projection the startup tuning window met.
+def seal_bf16_gemms() -> int:
+    """End startup: compile the FI M buckets still missing, then compile no more.
 
-    FI compiles the joint GEMM per exact M, so a bucket first met while serving
-    would stall every running request for seconds.
+    FI compiles the joint GEMM per exact M, and capture warmup only compiles the
+    captured row counts. Every projection the startup tuning window met gets
+    each bucket (1, 2, 4, ..., 32), so any later M runs on a compiled kernel,
+    padded if need be; shapes without one take the caller's other GEMM.
 
     Returns:
-        The number of (projection, M bucket) kernels run.
+        The number of (projection, M bucket) kernels compiled here.
     """
+    global _bf16_sealed
     run = 0
     with torch.no_grad():
         for (device, n, k), ref in _bf16_projections.items():
@@ -974,10 +963,5 @@ def precompile_bf16_gemms() -> int:
                 if (device, rows, n, k) not in _bf16_compiled:
                     _run_bf16_gemm(weight.new_zeros((rows, k)), weight, None)
                     run += 1
-    return run
-
-
-def seal_bf16_gemms() -> None:
-    """End startup: from here the joint GEMM runs only kernels compiled so far."""
-    global _bf16_sealed
     _bf16_sealed = True
+    return run

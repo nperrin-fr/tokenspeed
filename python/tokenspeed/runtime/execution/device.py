@@ -81,10 +81,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-from tokenspeed_kernel.ops.gemm.flashinfer import (
-    precompile_bf16_gemms,
-    seal_bf16_gemms,
-)
+from tokenspeed_kernel.ops.gemm.flashinfer import seal_bf16_gemms
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.execution.types import (
@@ -1320,11 +1317,9 @@ def build_device_side(
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    # Capture warmup compiles the captured row counts; fill the FI buckets it missed.
-    with startup_phase("kernels.precompile"):
-        logger.info(f"Precompiled {precompile_bf16_gemms()} joint BF16 GEMM M buckets")
-    # Serving must not compile: the joint BF16 GEMM keeps to startup's kernels.
-    seal_bf16_gemms()
+    # Serving must not compile: fill the joint BF16 GEMM buckets capture missed.
+    with startup_phase("kernels.seal"):
+        logger.info(f"Compiled {seal_bf16_gemms()} missing joint BF16 GEMM M buckets")
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
     start_expert_load_window(executor)
