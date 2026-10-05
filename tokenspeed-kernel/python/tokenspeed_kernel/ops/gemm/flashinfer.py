@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import weakref
 from collections.abc import Callable
 from typing import get_args
 
@@ -753,6 +754,13 @@ _mm_bf16 = error_fn
 _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
 BF16_GEMM_MAX_M = 32
+# FI's own M buckets within that scope, compiled at startup for each projection.
+_BF16_PRECOMPILE_ROWS = tuple(1 << i for i in range(BF16_GEMM_MAX_M.bit_length()))
+# (device, N, K) of each projection the startup tuning window met.
+_bf16_projections: dict[tuple[int, int, int], weakref.ReferenceType[torch.Tensor]] = {}
+# (device, M, N, K) already run outside capture: FI compiles one kernel per exact M.
+_bf16_compiled: set[tuple[int, int, int, int]] = set()
+_bf16_sealed = False
 
 if platform.is_nvidia and platform.arch_version in _CUTE_DSL_SM100_ARCHS:
     try:
@@ -848,20 +856,65 @@ def _canonical_bf16_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _bf16_rows(x: torch.Tensor, weight: torch.Tensor) -> int | None:
+    """Rows to run ``x`` at: its own count until sealed, then a compiled count.
+
+    Once sealed, an M without its own kernel takes the compiled FI bucket above
+    it, the bucket whose tactic FI selects for that M anyway.
+    """
+    m = x.shape[0]
+    if not _bf16_sealed:
+        return m
+    device, n, k = x.device.index, weight.shape[0], weight.shape[1]
+    for rows in (m, 1 << (m - 1).bit_length()):
+        if (device, rows, n, k) in _bf16_compiled:
+            return rows
+    return None
+
+
+def flashinfer_bf16_gemm_ready(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether the joint GEMM can run ``x`` without compiling while serving.
+
+    Args:
+        x: ``[M, K]`` BF16 activations, ``M <= BF16_GEMM_MAX_M``.
+        weight: ``[N, K]`` BF16 weight.
+
+    Returns:
+        Always True before ``seal_bf16_gemms``; afterwards True only when a
+        kernel compiled during startup serves M directly or padded.
+    """
+    return _bf16_rows(x, weight) is not None
+
+
 def flashinfer_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Compute BF16 x[M,K] @ weight[N,K].T using FI's joint runner/tactic search.
 
-    The caller checks the contract and warms the actual shape before capture.
-    Only M <= 32 enters this search. Larger calls keep the original GEMM.
-    No TokenSpeed backend choice or second cache is maintained.
+    The caller checks the contract and ``flashinfer_bf16_gemm_ready``, and warms
+    the actual shape before capture. Only M <= 32 enters this search. Larger
+    calls keep the original GEMM. Once sealed, an M without its own compiled
+    kernel runs zero-padded to the compiled FI bucket above it.
     """
     if (
         not flashinfer_joint_bf16_supported(x, weight, out)
         or x.shape[0] > BF16_GEMM_MAX_M
     ):
         raise ValueError("Unsupported input to joint FlashInfer BF16 GEMM")
+    rows = _bf16_rows(x, weight)
+    if rows is None:
+        raise ValueError("No joint FlashInfer BF16 GEMM compiled at startup fits")
+    if rows == x.shape[0]:
+        return _run_bf16_gemm(x, weight, out)
+    padded = x.new_zeros((rows, x.shape[1]))
+    padded[: x.shape[0]] = x
+    result = _run_bf16_gemm(padded, weight, None)[: x.shape[0]]
+    return result if out is None else out.copy_(result)
+
+
+def _run_bf16_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
     if out is None:
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     workspace = _fi_gemm._get_cache_buf(
@@ -881,6 +934,10 @@ def flashinfer_bf16_gemm(
         workspace_buffer=workspace,
         runner_names=_bf16_gemm_runner_names(weight.shape[1]),
     )
+    if not torch.cuda.is_current_stream_capturing():
+        _bf16_compiled.add(
+            (x.device.index, x.shape[0], weight.shape[0], weight.shape[1])
+        )
     return out
 
 
@@ -892,6 +949,35 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
     exposes FI native profiles 1/2/4/8/16/32 without a large-M fallback profile.
     """
     if is_autotuning() and flashinfer_joint_bf16_supported(x, weight, None):
+        _bf16_projections[(weight.device.index, *weight.shape)] = weakref.ref(weight)
         with torch.no_grad():
             sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
             flashinfer_bf16_gemm(sample, weight, None)
+
+
+def precompile_bf16_gemms() -> int:
+    """Compile FI's M buckets for each projection the startup tuning window met.
+
+    FI compiles the joint GEMM per exact M, so a bucket first met while serving
+    would stall every running request for seconds.
+
+    Returns:
+        The number of (projection, M bucket) kernels run.
+    """
+    run = 0
+    with torch.no_grad():
+        for (device, n, k), ref in _bf16_projections.items():
+            weight = ref()
+            if weight is None:
+                continue
+            for rows in _BF16_PRECOMPILE_ROWS:
+                if (device, rows, n, k) not in _bf16_compiled:
+                    _run_bf16_gemm(weight.new_zeros((rows, k)), weight, None)
+                    run += 1
+    return run
+
+
+def seal_bf16_gemms() -> None:
+    """End startup: from here the joint GEMM runs only kernels compiled so far."""
+    global _bf16_sealed
+    _bf16_sealed = True

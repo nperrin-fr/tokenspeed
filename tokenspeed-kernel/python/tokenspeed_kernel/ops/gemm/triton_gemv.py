@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     BF16_GEMM_MAX_M,
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
+    flashinfer_bf16_gemm_ready,
     flashinfer_joint_bf16_supported,
 )
 from tokenspeed_kernel.platform import (
@@ -311,6 +312,7 @@ def decode_gemv(
     if (
         flashinfer_joint_bf16_supported(x, weight, out)
         and x.shape[0] <= BF16_GEMM_MAX_M
+        and flashinfer_bf16_gemm_ready(x, weight)
     ):
         return flashinfer_bf16_gemm(x, weight, out)
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:

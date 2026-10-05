@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     BF16_GEMM_MAX_M,
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
+    flashinfer_bf16_gemm_ready,
     flashinfer_joint_bf16_supported,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_fp8_blockscale,
@@ -1347,6 +1348,7 @@ def mm(
             bias is None
             and M <= BF16_GEMM_MAX_M
             and flashinfer_joint_bf16_supported(A, B, out)
+            and flashinfer_bf16_gemm_ready(A, B)
         ):
             shape_params = {"M": M, "N": N, "K": K}
             ShapeCapture.get().record(

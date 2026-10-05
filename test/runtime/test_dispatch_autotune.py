@@ -33,6 +33,7 @@ import logging
 import sys
 import threading
 import time
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -795,6 +796,16 @@ def test_executor_construction_does_not_capture_or_tune():
     ]
 
 
+_JOINT_BF16_DISPATCH = (
+    "flashinfer_bf16_gemm",
+    "flashinfer_bf16_gemm_ready",
+    "_bf16_rows",
+    "_run_bf16_gemm",
+    "_canonical_bf16_view",
+    "_bf16_gemm_runner_names",
+)
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("provided_out", [False, True])
 @pytest.mark.parametrize(
@@ -817,10 +828,12 @@ def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expect
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
+        _JOINT_BF16_DISPATCH,
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
+            _bf16_sealed=False,
+            _bf16_compiled=set(),
             pdl_enabled=lambda: pdl,
             flashinfer_joint_bf16_supported=lambda *args: True,
             _fi_gemm=SimpleNamespace(
@@ -847,14 +860,17 @@ def test_bf16_joint_adapter_uses_one_fi_dispatch(pdl, provided_out, n, k, expect
 @pytest.mark.parametrize("supported", [False, True])
 def test_bf16_discovery_uses_one_native_joint_call(tuning, supported):
     probe = Mock()
+    projections = {}
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
         ("autotune_bf16_gemm",),
         dict(
             torch=torch,
+            weakref=weakref,
             is_autotuning=lambda: tuning,
             BF16_GEMM_MAX_M=32,
+            _bf16_projections=projections,
             flashinfer_joint_bf16_supported=lambda *args: supported,
             flashinfer_bf16_gemm=probe,
         ),
@@ -868,8 +884,10 @@ def test_bf16_discovery_uses_one_native_joint_call(tuning, supported):
         sample, weight, out = probe.call_args.args
         assert sample.shape == (32, 128) and sample.data_ptr() != x.data_ptr()
         assert weight is w and out is None
+        assert projections[(None, 32, 128)]() is w
     else:
         probe.assert_not_called()
+        assert not projections
 
 
 @pytest.mark.parametrize(
@@ -911,8 +929,9 @@ def test_joint_bf16_support_contract(invalid):
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("override", [None, "explicit", "context", "environment"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("ready", [False, True])
 def test_mm_joint_dispatch_respects_overrides_and_contract(
-    rows, bias, override, out_dtype
+    rows, bias, override, out_dtype, ready
 ):
     probe = Mock()
     joint = Mock(side_effect=lambda a, b, out: torch.mm(a, b.T, out=out))
@@ -928,6 +947,7 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         autotune_bf16_gemm=probe,
         flashinfer_bf16_gemm=joint,
         flashinfer_joint_bf16_supported=lambda *args: True,
+        flashinfer_bf16_gemm_ready=lambda *args: ready,
         BF16_GEMM_MAX_M=32,
         resolve_kernel_override=lambda family, mode, explicit: override,
         pdl_enabled=lambda: False,
@@ -942,7 +962,10 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         kernel_scope=scope,
     )
     api = _functions(
-        KERNEL / "ops/gemm/__init__.py", None, ("mm", "_validate_gemm_out"), ns
+        KERNEL / "ops/gemm/__init__.py",
+        None,
+        ("mm", "_validate_gemm_out", "_as_2d_tensor_scale"),
+        ns,
     )
     x = torch.randn(rows, 4, dtype=torch.bfloat16)
     w = torch.randn(8, 4, dtype=torch.bfloat16)
@@ -969,7 +992,11 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
     # Rank-local bias must not make ranks skip collective tactic profiling.
     assert probe.call_count == int(override is None and out_dtype == torch.bfloat16)
     assert joint.call_count == int(
-        override is None and not bias and out_dtype == torch.bfloat16 and rows <= 32
+        override is None
+        and not bias
+        and out_dtype == torch.bfloat16
+        and rows <= 32
+        and ready
     )
     kernel_name = "flashinfer_bf16_gemm" if joint.called else "test_mm"
     record.assert_called_once_with(
@@ -991,10 +1018,12 @@ def test_joint_adapter_propagates_fi_failure():
     api = _functions(
         KERNEL / "ops/gemm/flashinfer.py",
         None,
-        ("flashinfer_bf16_gemm", "_bf16_gemm_runner_names"),
+        _JOINT_BF16_DISPATCH,
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
+            _bf16_sealed=False,
+            _bf16_compiled=set(),
             pdl_enabled=lambda: False,
             flashinfer_joint_bf16_supported=lambda *args: True,
             _fi_gemm=SimpleNamespace(
@@ -1026,6 +1055,139 @@ def test_projection_discovery_precedes_auto_dispatch(name):
     )
     assert isinstance(auto.body[0], ast.Expr)
     assert auto.body[0].value.func.id == "autotune_bf16_gemm"
+
+
+def _joint_bf16_api(sealed, compiled, calls):
+    def dispatch(**kwargs):
+        calls.append(kwargs["a"].shape[0])
+        kwargs["out"].copy_(kwargs["a"] @ kwargs["b"])
+
+    return _functions(
+        KERNEL / "ops/gemm/flashinfer.py",
+        None,
+        _JOINT_BF16_DISPATCH + ("precompile_bf16_gemms", "autotune_bf16_gemm"),
+        dict(
+            torch=torch,
+            weakref=weakref,
+            BF16_GEMM_MAX_M=32,
+            _BF16_PRECOMPILE_ROWS=(1, 2, 4, 8, 16, 32),
+            _bf16_sealed=sealed,
+            _bf16_compiled=compiled,
+            _bf16_projections={},
+            is_autotuning=lambda: True,
+            pdl_enabled=lambda: False,
+            flashinfer_joint_bf16_supported=lambda *args: True,
+            _fi_gemm=SimpleNamespace(
+                DEFAULT_WORKSPACE_SIZE=4096,
+                _get_cache_buf=Mock(return_value=object()),
+                bf16_gemm_sm100=dispatch,
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("provided_out", [False, True])
+@pytest.mark.parametrize(
+    "m,compiled_rows,runs",
+    [(1, (1, 32), 1), (19, (1, 32), 32), (32, (1, 32), 32), (3, (1, 32), None)],
+)
+def test_sealed_joint_bf16_runs_only_startup_kernels(
+    m, compiled_rows, runs, provided_out
+):
+    """Once sealed, M runs its own kernel, else pads to its compiled FI bucket."""
+    calls = []
+    compiled = {(None, rows, 24, 128) for rows in compiled_rows}
+    api = _joint_bf16_api(True, compiled, calls)
+    x = torch.randn(m, 128, dtype=torch.bfloat16)
+    w = torch.randn(24, 128, dtype=torch.bfloat16)
+    out = torch.empty(m, 24, dtype=torch.bfloat16) if provided_out else None
+    assert api.flashinfer_bf16_gemm_ready(x, w) is (runs is not None)
+    if runs is None:
+        with pytest.raises(ValueError, match="compiled at startup"):
+            api.flashinfer_bf16_gemm(x, w, out)
+        assert not calls
+        return
+    result = api.flashinfer_bf16_gemm(x, w, out)
+    assert calls == [runs]
+    assert result.shape == (m, 24)
+    assert not provided_out or result is out
+    torch.testing.assert_close(result, x @ w.T)
+    # Padded rows never become compiled shapes of their own.
+    assert compiled == {(None, rows, 24, 128) for rows in compiled_rows}
+
+
+def test_unsealed_joint_bf16_compiles_the_exact_rows():
+    calls = []
+    compiled = set()
+    api = _joint_bf16_api(False, compiled, calls)
+    x = torch.randn(19, 128, dtype=torch.bfloat16)
+    w = torch.randn(24, 128, dtype=torch.bfloat16)
+    assert api.flashinfer_bf16_gemm_ready(x, w)
+    api.flashinfer_bf16_gemm(x, w, None)
+    assert calls == [19] and compiled == {(None, 19, 24, 128)}
+
+
+def test_precompile_runs_each_fi_bucket_once_for_live_projections():
+    calls = []
+    compiled = set()
+    api = _joint_bf16_api(False, compiled, calls)
+    w = torch.randn(24, 128, dtype=torch.bfloat16)
+    gone = torch.randn(40, 128, dtype=torch.bfloat16)
+    api.autotune_bf16_gemm(torch.zeros(1, 128, dtype=torch.bfloat16), w)
+    api.autotune_bf16_gemm(torch.zeros(1, 128, dtype=torch.bfloat16), gone)
+    del gone
+    calls.clear()
+    # Discovery already ran M=32; a released weight has nothing to serve.
+    assert api.precompile_bf16_gemms() == 5
+    assert calls == [1, 2, 4, 8, 16]
+    assert api.precompile_bf16_gemms() == 0
+    assert {(None, rows, 24, 128) for rows in (1, 2, 4, 8, 16, 32)} <= compiled
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_decode_gemv_takes_the_joint_gemm_only_without_compiling(ready):
+    joint = Mock(side_effect=lambda x, w, out: x @ w.T)
+    fallback = Mock(side_effect=lambda x, w, out: x @ w.T)
+    api = _functions(
+        KERNEL / "ops/gemm/triton_gemv.py",
+        None,
+        ("decode_gemv",),
+        dict(
+            torch=torch,
+            autotune_bf16_gemm=Mock(),
+            flashinfer_joint_bf16_supported=lambda *args: True,
+            flashinfer_bf16_gemm_ready=lambda *args: ready,
+            flashinfer_bf16_gemm=joint,
+            BF16_GEMM_MAX_M=32,
+            torch_decode_gemv=fallback,
+            _select=lambda *args: fallback,
+        ),
+    )
+    x = torch.randn(19, 128, dtype=torch.bfloat16)
+    w = torch.randn(24, 128, dtype=torch.bfloat16)
+    torch.testing.assert_close(api.decode_gemv(x, w), x @ w.T)
+    assert joint.called is ready and fallback.called is not ready
+
+
+def test_startup_fills_the_buckets_capture_missed_then_seals():
+    """Eager steps find every bucket compiled; serving never compiles."""
+    tree = ast.parse((RUNTIME / "execution/device.py").read_text())
+    build = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "build_device_side"
+    )
+    first: dict[str, int] = {}
+    for call in ast.walk(build):
+        if isinstance(call, ast.Call):
+            name = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+            first[name] = min(first.get(name, call.lineno), call.lineno)
+    assert (
+        first["autotune"]
+        < first["capture_graphs"]
+        < first["precompile_bf16_gemms"]
+        < first["seal_bf16_gemms"]
+    )
 
 
 @pytest.mark.parametrize("m", [33, 48, 64, 128])
